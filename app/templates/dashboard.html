@@ -1,0 +1,139 @@
+{% extends "base.html" %}
+
+{% block content %}
+
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% for category, message in messages %}
+    <div class="flash flash-{{ 'error' if category == 'error' else 'success' }}">{{ message }}</div>
+  {% endfor %}
+{% endwith %}
+
+<!-- Ollama Status -->
+<div id="ollama-status" class="card mb-6">
+    <h2>Ollama Status</h2>
+    <div style="padding:0; overflow:hidden; border-radius:var(--radius-sm) !important;">
+        <div style="overflow-x:auto;">
+            <table class="data-table card-light">
+                <thead>
+                    <tr>
+                        <th style="width:120px;">Property</th>
+                        <th>Value</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Status</td>
+                        <td>
+                            {% if ollama_status %}
+                                <span class="badge badge-active" style="background:none; border:none;">ACTIVE</span>
+                            {% else %}
+                                <span class="badge badge-disabled" style="background:none; border:none;">INACTIVE</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    <tr>
+                        <td>Endpoint</td>
+                        <td>{{ ollama_url }}:{{ ollama_port }}</td>
+                    </tr>
+                    <tr>
+                        <td>Models</td>
+                        <td>
+                            {% if ollama_models %}
+                            <div style="display:flex; flex-wrap:wrap; gap:6px;">
+                                {% for model in ollama_models %}
+                                <span style="font-size:.75rem; font-weight:700; padding:3px 10px;
+                                             background:rgba(255,255,255,.08); border:1px solid rgba(255,255,255,.15);
+                                             border-radius:100px; color:rgba(255,255,255,.75);">{{ model }}</span>
+                                {% endfor %}
+                            </div>
+                            {% else %}
+                            <span style="font-size:.8125rem; font-weight:700; color:rgba(255,255,255,.35);">
+                                {% if ollama_status %}No models found.{% else %}Unavailable — Ollama is not reachable.{% endif %}
+                            </span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- User Management -->
+<div class="card mb-6">
+    <h2>Registered Users</h2>
+    <p style="font-size:.8125rem; color:rgba(255,255,255,.45); margin-bottom:14px;">
+        New users are disabled by default. Click the status button to activate them.
+    </p>
+    <div >
+        <table id="users-table" class="data-table card-light">
+            <thead>
+                <tr>
+                    <th>Email</th>
+                    <th style="min-width: 100px;max-width: 200px;">Status</th>
+                    <th>Rate / min</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+            {% for u in users %}
+            <tr>
+                <td>{{ u.email }}</td>
+                <td>
+                    <form action="/toggle/{{u.id}}" method="post" style="display:inline;">
+                        <button type="submit" class="badge {% if u.status=='active' %}badge-active{% else %}badge-disabled{% endif %}" style="cursor:pointer; ">
+                            {{ 'ACTIVE' if u.status=='active' else 'DISABLED' }}
+                        </button>
+                    </form>
+                </td>
+                <td>
+                    <form action="/admin/update-rate-limit/{{u.id}}" method="post" style="display:inline;">
+                        <input type="number" name="rate_limit" value="{{ u.rate_limit }}" min="1" max="1000" style="width:60px; padding:3px;">
+                        <button type="submit" class="btn btn-small">Update</button>
+                    </form>
+                </td>
+                <td>
+                    <div style="display:flex; gap:6px; flex-wrap:wrap;">
+                        <form action="/admin/reset/{{u.id}}" method="post" style="display:inline;">
+                            <button type="submit" class="btn btn-warning">New API Key</button>
+                        </form>
+                        <a href="/export/{{u.id}}" class="btn btn-primary">Export CSV</a>
+                        <a href="/confirm-delete/{{u.id}}" class="btn btn-danger">Delete</a>
+                    </div>
+                </td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<!----------------------------------------------------------------------------
+  Register New User Card
+  ---------------------------------------------------------------------------->
+<div class="card" style="margin-top:24px;">
+  <h2>Register New User</h2>
+  <form action="/register" method="post" class="space-y-3">
+      <div>
+          <label>Email</label>
+          <input type="email" name="email" placeholder="user@example.com">
+      </div>
+      <button class="btn btn-primary" type="submit">Register User</button>
+  </form>
+</div>
+
+<!-- Reset System -->
+<div id="reset-system-card" class="card" style="margin-top:24px; border-color:rgba(220,38,38,.45); ">
+    <h2 style="color:#fca5a5;">Reset System</h2>
+    <p style="font-size:.8125rem; color:rgba(255,255,255,.45); margin-bottom:14px;">
+        Permanently deletes all audit logs and clears all rate-limit counters. Users and settings are not affected.
+    </p>
+    <form action="/admin/reset-system" method="post"
+          onsubmit="return confirm('This will permanently delete all logs and reset all rate-limit counters. This cannot be undone. Continue?');">
+        <input type="hidden" name="next" value="admin_panel">
+        <button type="submit" class="btn btn-danger">Reset System</button>
+    </form>
+</div>
+
+{% endblock %}

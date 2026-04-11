@@ -1,0 +1,31 @@
+services:
+
+  gateway42:
+    build: .
+    ports:
+      - "7000:7000"
+    environment:
+      OLLAMA_GATEWAY_SECRET_KEY: "change-me-to-a-long-random-string"
+      ADMIN_PASSWORD: "change-me"
+      ADMIN_EMAIL: "admin@example.com"
+      # host.docker.internal resolves to the host machine on macOS and Windows.
+      # The extra_hosts entry below maps it on Linux as well.
+      OLLAMA_URL: "http://host.docker.internal:11434/api/chat"
+      DEFAULT_RATE_LIMIT: "10"
+      SESSION_TIMEOUT: "3600"
+      MAX_MESSAGE_LENGTH: "10000"
+      LOG_LEVEL: "INFO"
+      OLLAMA_GATEWAY_DB_PATH: "/gateway/db/gateway.db"
+      LOG_FILE: "/gateway/logs/gateway.log"
+    extra_hosts:
+      # Makes host.docker.internal resolve to the host on Linux.
+      # No-op on macOS / Windows where Docker already provides this.
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - gateway42-db:/gateway/db
+      - gateway42-logs:/gateway/logs
+    restart: unless-stopped
+
+volumes:
+  gateway42-db:
+  gateway42-logs:

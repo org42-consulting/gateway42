@@ -1,0 +1,244 @@
+{% extends "base.html" %}
+
+{% block content %}
+
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% for category, message in messages %}
+    <div class="flash flash-{{ 'error' if category == 'error' else 'success' }}">{{ message }}</div>
+  {% endfor %}
+{% endwith %}
+
+
+<div id="ollama-settings" class="card">
+    <h2>Ollama Settings</h2>
+    <form action="/admin/ollama-settings" method="post" class="space-y-3">
+        <div>
+            <label>Ollama Base URL</label>
+            <input type="text" name="ollama_url" value="{{ ollama_url }}" placeholder="e.g., http://127.0.0.1">
+        </div>
+        <div>
+            <label>Port Number</label>
+            <input type="number" name="port" value="{{ ollama_port }}" placeholder="e.g., 11434">
+        </div>
+        <div style="display:flex; gap:10px; padding-top:4px;">
+            <button class="btn btn-primary" type="submit">Save Settings</button>
+            <a href="/admin/ollama-test" class="btn btn-ghost">Test Connectivity</a>
+        </div>
+    </form>
+</div>
+
+
+<!----------------------------------------------------------------------------
+  Model Management Card
+  ---------------------------------------------------------------------------->
+<style>.card-inactive { opacity:.45; pointer-events:none; }</style>
+<div class="card {% if not ollama_status %}card-inactive{% endif %}" style="margin-top:24px;">
+    <h2>Model Management</h2>
+
+    {% if ollama_model_details %}
+    <div style="padding:0; overflow:hidden; border-radius:var(--radius-sm) !important; margin-bottom:20px;">
+        <div style="overflow-x:auto;">
+            <table class="data-table card-light">
+                <thead>
+                    <tr>
+                        <th>Model</th>
+                        <th style="width:90px;">Size</th>
+                        <th style="width:80px;"></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for m in ollama_model_details %}
+                    <tr>
+                        <td>{{ m.name }}</td>
+                        <td style="color:rgba(255,255,255,.45); font-size:.75rem;">{{ m.size }}</td>
+                        <td>
+                            <form action="/admin/ollama-delete-model" method="post"
+                                  onsubmit="return confirm('Delete {{ m.name }}? This cannot be undone.');">
+                                <input type="hidden" name="model" value="{{ m.name }}">
+                                <button type="submit" class="btn btn-danger btn-small">Delete</button>
+                            </form>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% else %}
+    <p style="font-size:.8125rem; color:rgba(255,255,255,.35); margin-bottom:16px;">No models installed.</p>
+    {% endif %}
+
+    <label>Download Model</label>
+      <p style="font-size:.8125rem; color:rgba(255,255,255,.45); ">
+      Visit <a class="link" href="https://ollama.com/models" target="_blank">https://ollama.com/models</a> to find available models and their names. <br/>
+      Enter the model name below to download it directly to your Ollama instance.
+    </p>
+    <div style="display:flex; gap:10px; margin-top:6px;">
+        <input type="text" id="pull-model-name" placeholder="e.g., llama3.2:latest" style="max-width:320px;">
+        <button class="btn btn-primary" id="pull-btn" type="button" onclick="startPull()">Pull</button>
+    </div>
+    <div id="pull-status" style="display:none; margin-top:16px; padding:12px 14px;
+         background:rgba(255,255,255,.04); border:1px solid rgba(255,255,255,.08);
+         border-radius:var(--radius-sm);">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+            <span id="pull-status-text" style="font-size:.8125rem; color:rgba(255,255,255,.65);"></span>
+            <span id="pull-pct" style="font-size:.75rem; font-weight:700; color:var(--ai-electric);"></span>
+        </div>
+        <div style="height:6px; background:rgba(255,255,255,.08); border-radius:3px; overflow:hidden;">
+            <div id="pull-progress-fill" style="height:100%; background:var(--ai-electric);
+                 border-radius:3px; width:0%; transition:width .3s ease;"></div>
+        </div>
+        <div id="pull-bytes" style="font-size:.75rem; color:rgba(255,255,255,.3); margin-top:6px;"></div>
+    </div>
+</div>
+
+{% block scripts %}
+<script>
+function startPull() {
+    const name = document.getElementById('pull-model-name').value.trim();
+    if (!name) return;
+
+    const btn        = document.getElementById('pull-btn');
+    const status     = document.getElementById('pull-status');
+    const statusText = document.getElementById('pull-status-text');
+    const fill       = document.getElementById('pull-progress-fill');
+    const pct        = document.getElementById('pull-pct');
+    const bytesEl    = document.getElementById('pull-bytes');
+
+    btn.disabled = true;
+    btn.textContent = 'Pulling…';
+    status.style.display = 'block';
+    statusText.style.color = 'rgba(255,255,255,.65)';
+    statusText.textContent = 'Starting…';
+    fill.style.width = '0%';
+    pct.textContent = '';
+    bytesEl.textContent = '';
+
+    // Track progress per layer digest so overall % is accurate
+    const layers = {};
+
+    function fmt(b) {
+        if (b >= 1e9) return (b / 1e9).toFixed(1) + ' GB';
+        if (b >= 1e6) return Math.round(b / 1e6) + ' MB';
+        return Math.round(b / 1e3) + ' KB';
+    }
+
+    function updateBar() {
+        let totalB = 0, completedB = 0;
+        for (const v of Object.values(layers)) {
+            totalB += v.total;
+            completedB += v.completed;
+        }
+        if (totalB > 0) {
+            const p = Math.round((completedB / totalB) * 100);
+            fill.style.width = p + '%';
+            pct.textContent = p + '%';
+            bytesEl.textContent = fmt(completedB) + ' / ' + fmt(totalB);
+        }
+    }
+
+    function done(success) {
+        btn.disabled = false;
+        btn.textContent = 'Pull';
+        if (success) {
+            statusText.textContent = name + ' pulled successfully.';
+            statusText.style.color = '#4ade80';
+            fill.style.width = '100%';
+            pct.textContent = '100%';
+            bytesEl.textContent = '';
+        }
+    }
+
+    const es = new EventSource('/admin/ollama-pull-stream?model=' + encodeURIComponent(name));
+
+    es.onmessage = (e) => {
+        if (e.data === '[DONE]') { es.close(); return; }
+        let d;
+        try { d = JSON.parse(e.data); } catch (_) { return; }
+
+        if (d.error) {
+            statusText.textContent = 'Error: ' + d.error;
+            statusText.style.color = '#f87171';
+            es.close();
+            done(false);
+            return;
+        }
+        if (d.status) {
+            statusText.style.color = 'rgba(255,255,255,.65)';
+            statusText.textContent = d.status;
+        }
+        if (d.digest && d.total !== undefined) {
+            layers[d.digest] = { total: d.total || 0, completed: d.completed || 0 };
+            updateBar();
+        }
+        if (d.status === 'success') {
+            es.close();
+            done(true);
+        }
+    };
+
+    es.onerror = () => {
+        es.close();
+        statusText.textContent = 'Connection error.';
+        statusText.style.color = '#f87171';
+        done(false);
+    };
+}
+</script>
+{% endblock %}
+
+
+<!----------------------------------------------------------------------------
+  Change Admin Password Card
+  ---------------------------------------------------------------------------->
+<div class="card" style="margin-top:24px;">
+    <h2>Change Admin Password</h2>
+    <form action="/admin/change-password" method="post" class="space-y-3">
+        <div>
+            <label>Current Password</label>
+            <input type="password" name="current" placeholder="Current password">
+        </div>
+        <div>
+            <label>New Password</label>
+            <input type="password" name="new" placeholder="New password">
+        </div>
+        <div>
+            <label>Confirm New Password</label>
+            <input type="password" name="confirm" placeholder="Confirm new password">
+        </div>
+        <button class="btn btn-primary" type="submit">Update Password</button>
+    </form>
+</div>
+
+<!----------------------------------------------------------------------------
+  Register New User Card
+  ---------------------------------------------------------------------------->
+<div class="card" style="margin-top:24px;">
+  <h2>Register New User</h2>
+  <form action="/register" method="post" class="space-y-3">
+      <div>
+          <label>Email</label>
+          <input type="email" name="email" placeholder="user@example.com">
+      </div>
+      <button class="btn btn-primary" type="submit">Register User</button>
+  </form>
+</div>
+
+
+<!----------------------------------------------------------------------------
+  Reset System Card
+  ---------------------------------------------------------------------------->
+<div class="card" style="margin-top:24px; border-color:rgba(220,38,38,.25);">
+    <h2 style="color:#fca5a5;">Reset System</h2>
+    <p style="font-size:.8125rem; color:rgba(255,255,255,.45); margin-bottom:14px;">
+        Permanently deletes all audit logs and clears all rate-limit counters. Users and settings are not affected.
+    </p>
+    <form action="/admin/reset-system" method="post"
+          onsubmit="return confirm('This will permanently delete all logs and reset all rate-limit counters. This cannot be undone. Continue?');">
+        <button type="submit" class="btn btn-danger">Reset System</button>
+    </form>
+</div>
+
+
+{% endblock %}

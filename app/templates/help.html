@@ -1,0 +1,575 @@
+{% extends "base.html" %}
+
+{% block content %}
+
+
+<style>
+    .help-section { margin-bottom: 32px; }
+    .help-section p, .help-section li {
+        font-size: .875rem;
+        color: rgba(255,255,255,.75);
+        line-height: 1.7;
+    }
+    .help-section ul, .help-section ol {
+        padding-left: 20px;
+        margin-top: 8px;
+    }
+    .help-section li { margin-bottom: 4px; }
+    .help-section h3 {
+        font-size: .9375rem;
+        font-weight: 700;
+        color: var(--ai-electric);
+        margin: 20px 0 8px;
+    }
+    .help-table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+    .help-table th {
+        text-align: left;
+        font-size: .75rem;
+        font-weight: 700;
+        color: rgba(255,255,255,.4);
+        text-transform: uppercase;
+        letter-spacing: .05em;
+        padding: 8px 12px;
+        border-bottom: 1px solid rgba(255,255,255,.08);
+    }
+    .help-table td {
+        font-size: .8125rem;
+        color: rgba(255,255,255,.75);
+        padding: 8px 12px;
+        border-bottom: 1px solid rgba(255,255,255,.05);
+        vertical-align: top;
+    }
+    .help-table tr:last-child td { border-bottom: none; }
+    .help-table td:first-child { white-space: nowrap; }
+    code {
+        font-family: 'Courier New', monospace;
+        font-size: .8125rem;
+        background: rgba(0,0,0,.3);
+        border: 1px solid rgba(255,255,255,.1);
+        border-radius: 4px;
+        padding: 1px 6px;
+        color: var(--ai-electric);
+    }
+    pre {
+        background: rgba(0,0,0,.35);
+        border: 1px solid rgba(255,255,255,.08);
+        border-radius: var(--radius-sm);
+        padding: 14px 16px;
+        font-size: .8125rem;
+        color: rgba(255,255,255,.8);
+        overflow-x: auto;
+        margin-top: 8px;
+        line-height: 1.6;
+    }
+    .pill {
+        display: inline-block;
+        font-size: .7rem;
+        font-weight: 700;
+        padding: 2px 8px;
+        border-radius: 100px;
+        vertical-align: middle;
+        margin-left: 4px;
+    }
+    .pill-get  { background: rgba(74,222,128,.15); color: #4ade80; border: 1px solid rgba(74,222,128,.3); }
+    .pill-post { background: rgba(251,191,36,.15);  color: #fbbf24; border: 1px solid rgba(251,191,36,.3); }
+</style>
+
+
+<!----------------------------------------------------------------------------
+  Overview
+  ---------------------------------------------------------------------------->
+<div class="card help-section">
+    <h2>Overview</h2>
+    <p>
+        Gateway42 is a secure, multi-user proxy gateway for <a class="link" href="https://ollama.com" target="_blank">Ollama</a>.
+        It sits between your users and a shared Ollama instance, providing:
+    </p>
+    <ul>
+        <li><strong>OpenAI-compatible API</strong> — clients built for the OpenAI API work with Gateway42 without modification.</li>
+        <li><strong>API key authentication</strong> — every user receives a unique key; only active users can send requests.</li>
+        <li><strong>Per-user rate limiting</strong> — configurable maximum requests per minute per user.</li>
+        <li><strong>Audit logging</strong> — every prompt and response is stored with a timestamp, user, and model name.</li>
+        <li><strong>Admin dashboard</strong> — manage users, configure Ollama, download or delete models, and review logs.</li>
+    </ul>
+</div>
+
+
+<!----------------------------------------------------------------------------
+  Dashboard
+  ---------------------------------------------------------------------------->
+<div class="card help-section" style="margin-top:24px;">
+    <h2>Dashboard</h2>
+    <p>The Dashboard is the main landing page after login. It shows two panels:</p>
+
+    <h3>Ollama Status</h3>
+    <p>
+        Displays whether the configured Ollama instance is reachable, its base URL and port, and the list
+        of currently installed models. This panel is refreshed every time the page loads. If Ollama is
+        unreachable, the status shows <strong>INACTIVE</strong> and the model list is unavailable.
+    </p>
+
+    <h3>Registered Users</h3>
+    <p>A table of every user account, with the following columns and actions:</p>
+    <table class="help-table">
+        <thead><tr><th>Column / Action</th><th>Description</th></tr></thead>
+        <tbody>
+            <tr><td>Email</td><td>The user's registered email address. Used as the username.</td></tr>
+            <tr><td>Status</td><td>
+                Clicking the status badge toggles the user between <strong>ACTIVE</strong> and <strong>DISABLED</strong>.
+                Only active users can make API requests. Newly registered users start as <strong>DISABLED</strong>.
+            </td></tr>
+            <tr><td>Rate / min</td><td>
+                The maximum number of API requests this user can make per minute. Edit the number inline and
+                click <em>Update</em> to save. Valid range: 1–1000.
+            </td></tr>
+            <tr><td>New API Key</td><td>
+                Generates a fresh API key for the user and immediately invalidates the old one. The new key
+                is displayed once — copy it before closing the page.
+            </td></tr>
+            <tr><td>Export CSV</td><td>
+                Downloads all audit log entries for this user as a CSV file. This export is also required
+                before the user can be deleted.
+            </td></tr>
+            <tr><td>Delete</td><td>
+                Permanently removes the user and all their log entries. You must export the user's CSV first.
+                A confirmation page is shown before the deletion is committed.
+            </td></tr>
+        </tbody>
+    </table>
+
+    <h3>Register New User</h3>
+    <p>
+        Enter an email address and click <em>Register User</em>. A unique API key is generated automatically
+        and displayed on the next page. The user starts in <strong>DISABLED</strong> status — activate them
+        manually once you have shared their API key securely.
+    </p>
+
+    <h3>Reset System</h3>
+    <p>
+        Permanently deletes <strong>all audit logs</strong> and <strong>all rate-limit counters</strong>.
+        User accounts and application settings are not affected. A confirmation dialog is shown first.
+        This action cannot be undone.
+    </p>
+</div>
+
+
+<!----------------------------------------------------------------------------
+  Settings
+  ---------------------------------------------------------------------------->
+<div class="card help-section" style="margin-top:24px;">
+    <h2>Settings</h2>
+
+    <h3>Ollama Settings</h3>
+    <p>
+        Configure the base URL and port of your Ollama instance. The gateway connects to
+        <code>{base_url}:{port}/api/chat</code> for completions and <code>/api/tags</code> for model discovery.
+    </p>
+    <ul>
+        <li><strong>Ollama Base URL</strong> — scheme and hostname, e.g. <code>http://127.0.0.1</code>.</li>
+        <li><strong>Port Number</strong> — typically <code>11434</code> (Ollama default). Valid range: 1–65535.</li>
+        <li><strong>Test Connectivity</strong> — sends a quick probe to Ollama and reports the version number.</li>
+        <li><strong>Save Settings</strong> — persists the URL and port to the database, overriding environment defaults.</li>
+    </ul>
+
+    <h3>Model Management</h3>
+    <p>
+        Displays all models currently installed on the Ollama instance, including their disk size.
+        This panel is greyed out when Ollama is unreachable.
+    </p>
+    <ul>
+        <li>
+            <strong>Delete</strong> — removes a model from the Ollama instance. A confirmation dialog is shown first.
+            This frees disk space but does not affect audit logs that referenced that model.
+        </li>
+        <li>
+            <strong>Download Model</strong> — enter a model name (e.g. <code>llama3.2:latest</code>) and click
+            <em>Pull</em>. A live progress bar tracks the download layer by layer, showing bytes transferred and
+            overall percentage. Model names are available at
+            <a class="link" href="https://ollama.com/models" target="_blank">ollama.com/models</a>.
+        </li>
+    </ul>
+
+    <h3>Change Admin Password</h3>
+    <p>
+        Updates the admin account password. Requirements: at least 8 characters, one uppercase letter,
+        one lowercase letter, and one digit. You must provide the current password to confirm the change.
+    </p>
+
+    <h3>Register New User</h3>
+    <p>Same as the Register New User panel on the Dashboard — provided here for convenience.</p>
+
+    <h3>Reset System</h3>
+    <p>Same as the Reset System action on the Dashboard — see above for details.</p>
+</div>
+
+
+<!----------------------------------------------------------------------------
+  Logs
+  ---------------------------------------------------------------------------->
+<div class="card help-section" style="margin-top:24px;">
+    <h2>Logs</h2>
+    <p>
+        Every API request processed by Gateway42 is recorded. The Logs page shows the most recent
+        200 entries by default.
+    </p>
+
+    <h3>Columns</h3>
+    <table class="help-table">
+        <thead><tr><th>Column</th><th>Description</th></tr></thead>
+        <tbody>
+            <tr><td>Time</td><td>UTC timestamp of the request (YYYY-MM-DD HH:MM:SS).</td></tr>
+            <tr><td>User</td><td>Email address of the user whose API key was used.</td></tr>
+            <tr><td>Model</td><td>The Ollama model name specified in the request. Shows <em>—</em> for older entries recorded before model tracking was added.</td></tr>
+            <tr><td>Prompt</td><td>The full message list sent to the model, truncated for display. Hover to see more.</td></tr>
+            <tr><td>Response</td><td>The model's reply, truncated for display. Streaming responses are recorded as <em>streamed</em>.</td></tr>
+        </tbody>
+    </table>
+
+    <h3>Search</h3>
+    <p>
+        The search field filters logs by prompt text, response text, or user email. Results update on
+        submission. Click <em>Clear</em> to reset the filter.
+    </p>
+
+    <h3>Auto-refresh</h3>
+    <p>
+        The auto-refresh dropdown polls the server in the background and updates the log table in place
+        without a full page reload. Options: Off, 5 s, 10 s (default), 30 s, 60 s.
+    </p>
+
+    <h3>Export CSV</h3>
+    <p>
+        Downloads <strong>all</strong> log entries (not just the current 200) as a CSV file with columns:
+        <code>log_id</code>, <code>email</code>, <code>model</code>, <code>prompt</code>, <code>response</code>, <code>timestamp</code>.
+    </p>
+
+    <h3>Reset System</h3>
+    <p>Same as the Reset System action on the Dashboard — clears all logs. Requires confirmation.</p>
+</div>
+
+
+<!----------------------------------------------------------------------------
+  API Usage
+  ---------------------------------------------------------------------------->
+<div class="card help-section" style="margin-top:24px;">
+    <h2>API Usage</h2>
+    <p>
+        Gateway42 exposes an OpenAI-compatible API. Any client or library that targets the OpenAI API
+        can be pointed at Gateway42 by changing the base URL and providing a Gateway42 API key.
+    </p>
+
+    <h3>Base URL</h3>
+    <p>Replace the OpenAI base URL with your Gateway42 host:</p>
+    <pre>http://&lt;your-host&gt;:7000/v1</pre>
+
+    <h3>Authentication</h3>
+    <p>Pass the user's API key as a Bearer token in the <code>Authorization</code> header:</p>
+    <pre>Authorization: Bearer &lt;api_key&gt;</pre>
+    <p>Requests with a missing, invalid, or deactivated key are rejected with <code>401 Unauthorized</code>.</p>
+
+    <h3>Endpoints</h3>
+    <table class="help-table">
+        <thead><tr><th>Endpoint</th><th>Method</th><th>Description</th></tr></thead>
+        <tbody>
+            <tr>
+                <td><code>/v1/models</code></td>
+                <td><span class="pill pill-get">GET</span></td>
+                <td>Returns the list of models installed on Ollama in OpenAI format.</td>
+            </tr>
+            <tr>
+                <td><code>/v1/chat/completions</code></td>
+                <td><span class="pill pill-post">POST</span></td>
+                <td>
+                    Chat completion endpoint. Accepts OpenAI-format request bodies.
+                    Set <code>"stream": true</code> for Server-Sent Events streaming.
+                </td>
+            </tr>
+            <tr>
+                <td><code>/health</code></td>
+                <td><span class="pill pill-get">GET</span></td>
+                <td>Returns <code>{"status": "ok"}</code>. No authentication required. Useful for uptime monitoring.</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>Example — cURL</h3>
+    <pre>curl http://&lt;host&gt;:7000/v1/chat/completions \
+  -H "Authorization: Bearer &lt;api_key&gt;" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama3.2:latest",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'</pre>
+
+    <h3>Example — Python (openai SDK)</h3>
+    <pre>from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://&lt;host&gt;:7000/v1",
+    api_key="&lt;api_key&gt;",
+)
+
+response = client.chat.completions.create(
+    model="llama3.2:latest",
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+print(response.choices[0].message.content)</pre>
+
+    <h3>Supported Parameters</h3>
+    <p>The following OpenAI request parameters are translated to Ollama equivalents:</p>
+    <table class="help-table">
+        <thead><tr><th>OpenAI parameter</th><th>Ollama parameter</th><th>Notes</th></tr></thead>
+        <tbody>
+            <tr><td><code>model</code></td><td><code>model</code></td><td>Must match an installed Ollama model name.</td></tr>
+            <tr><td><code>messages</code></td><td><code>messages</code></td><td>Full conversation history.</td></tr>
+            <tr><td><code>stream</code></td><td><code>stream</code></td><td>SSE streaming when <code>true</code>.</td></tr>
+            <tr><td><code>temperature</code></td><td><code>temperature</code></td><td></td></tr>
+            <tr><td><code>top_p</code></td><td><code>top_p</code></td><td></td></tr>
+            <tr><td><code>max_tokens</code></td><td><code>num_predict</code></td><td></td></tr>
+            <tr><td><code>seed</code></td><td><code>seed</code></td><td></td></tr>
+            <tr><td><code>stop</code></td><td><code>stop</code></td><td>String or list of strings.</td></tr>
+            <tr><td><code>presence_penalty</code></td><td><code>repeat_last_n</code></td><td></td></tr>
+            <tr><td><code>frequency_penalty</code></td><td><code>repeat_penalty</code></td><td>Mapped as <code>1.0 + value</code>.</td></tr>
+        </tbody>
+    </table>
+
+    <h3>Error Codes</h3>
+    <table class="help-table">
+        <thead><tr><th>HTTP Status</th><th>Meaning</th></tr></thead>
+        <tbody>
+            <tr><td><code>401</code></td><td>Missing, invalid, or deactivated API key.</td></tr>
+            <tr><td><code>429</code></td><td>Rate limit exceeded. Wait before retrying.</td></tr>
+            <tr><td><code>502</code></td><td>Gateway42 could not reach the Ollama instance.</td></tr>
+            <tr><td><code>500</code></td><td>Internal server error.</td></tr>
+        </tbody>
+    </table>
+</div>
+
+
+<!----------------------------------------------------------------------------
+  Rate Limiting
+  ---------------------------------------------------------------------------->
+<div class="card help-section" style="margin-top:24px;">
+    <h2>Rate Limiting</h2>
+    <p>
+        Gateway42 enforces a <strong>sliding window rate limit</strong> per user. The window is 60 seconds.
+        If a user sends more requests than their configured limit within any 60-second window, the gateway
+        rejects further requests with <code>429 Too Many Requests</code> until the window clears.
+    </p>
+    <ul>
+        <li>The default rate limit for new users is set by the <code>DEFAULT_RATE_LIMIT</code> environment variable (default: 10 req/min).</li>
+        <li>Each user's limit can be adjusted individually from the Dashboard.</li>
+        <li>Rate-limit counters are reset by the <em>Reset System</em> action or when a user is deleted.</li>
+    </ul>
+</div>
+
+
+<!----------------------------------------------------------------------------
+  Configuration
+  ---------------------------------------------------------------------------->
+<div class="card help-section" style="margin-top:24px;">
+    <h2>Configuration</h2>
+    <p>Gateway42 is configured via environment variables. The two marked <strong>required</strong> must be set or the application will refuse to start.</p>
+    <table class="help-table">
+        <thead><tr><th>Variable</th><th>Required</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+            <tr><td><code>OLLAMA_GATEWAY_SECRET_KEY</code></td><td>Yes</td><td>—</td><td>Secret key used to sign session cookies. Use a long, random string.</td></tr>
+            <tr><td><code>ADMIN_PASSWORD</code></td><td>Yes</td><td>—</td><td>Password for the admin login page.</td></tr>
+            <tr><td><code>OLLAMA_URL</code></td><td>No</td><td><code>http://127.0.0.1:11434/api/chat</code></td><td>Default Ollama endpoint. Can be overridden via the Settings page.</td></tr>
+            <tr><td><code>ADMIN_EMAIL</code></td><td>No</td><td><code>admin</code></td><td>Admin account identifier shown in logs.</td></tr>
+            <tr><td><code>OLLAMA_GATEWAY_DB_PATH</code></td><td>No</td><td><code>./db/gateway.db</code></td><td>Path to the SQLite database file.</td></tr>
+            <tr><td><code>DEFAULT_RATE_LIMIT</code></td><td>No</td><td><code>10</code></td><td>Default requests-per-minute for newly registered users.</td></tr>
+            <tr><td><code>SESSION_TIMEOUT</code></td><td>No</td><td><code>3600</code></td><td>Admin session lifetime in seconds.</td></tr>
+            <tr><td><code>MAX_MESSAGE_LENGTH</code></td><td>No</td><td><code>10000</code></td><td>Maximum characters stored per prompt or response in the audit log.</td></tr>
+            <tr><td><code>LOG_LEVEL</code></td><td>No</td><td><code>INFO</code></td><td>Python logging level (<code>DEBUG</code>, <code>INFO</code>, <code>WARNING</code>, <code>ERROR</code>).</td></tr>
+            <tr><td><code>LOG_FILE</code></td><td>No</td><td><code>./logs/gateway.log</code></td><td>Path to the application log file.</td></tr>
+            <tr><td><code>DEBUG</code></td><td>No</td><td><code>false</code></td><td>Set to <code>true</code> to enable Quart debug mode. Do not use in production.</td></tr>
+        </tbody>
+    </table>
+</div>
+
+<!----------------------------------------------------------------------------
+  Deployment — Docker
+  ---------------------------------------------------------------------------->
+<div class="card help-section" style="margin-top:24px;">
+    <h2>Running with Docker</h2>
+    <p>
+        Gateway42 ships with a <code>Dockerfile</code> and a <code>docker-compose.yml</code>.
+        It assumes Ollama is already running on the host machine at <code>localhost:11434</code>
+        (the default Ollama port). The container reaches the host via <code>host.docker.internal</code>.
+    </p>
+
+    <h3>Prerequisites</h3>
+    <ul>
+        <li><a class="link" href="https://docs.docker.com/get-docker/" target="_blank">Docker</a> 24 or later.</li>
+        <li><a class="link" href="https://docs.docker.com/compose/" target="_blank">Docker Compose</a> v2 (bundled with Docker Desktop).</li>
+        <li>Ollama installed and running on the host: <a class="link" href="https://ollama.com/download" target="_blank">ollama.com/download</a>.</li>
+    </ul>
+
+    <h3>How host networking works</h3>
+    <p>
+        Inside a Docker container, <code>localhost</code> refers to the container itself — not the machine
+        running Docker. Gateway42 uses <code>host.docker.internal</code> instead, which Docker resolves to
+        the host's IP address:
+    </p>
+    <ul>
+        <li><strong>macOS / Windows</strong> — Docker Desktop provides <code>host.docker.internal</code> automatically.</li>
+        <li><strong>Linux</strong> — the <code>extra_hosts: host.docker.internal:host-gateway</code> entry in
+            <code>docker-compose.yml</code> adds the same mapping. No extra setup needed.</li>
+    </ul>
+
+    <h3>Quick start</h3>
+    <pre># 1. Make sure Ollama is running on the host
+ollama serve   # or start it via the Ollama app
+
+# 2. Edit docker-compose.yml — set your secrets:
+#    OLLAMA_GATEWAY_SECRET_KEY — any long random string
+#    ADMIN_PASSWORD            — your chosen admin password
+
+# 3. Build and start
+docker compose up -d
+
+# 4. Open the admin UI
+open http://localhost:7000</pre>
+
+    <h3>Persistent data</h3>
+    <p>Two named Docker volumes are created automatically:</p>
+    <ul>
+        <li><code>gateway42-db</code> — SQLite database (users, logs, settings).</li>
+        <li><code>gateway42-logs</code> — application log files.</li>
+    </ul>
+    <p>Data survives container restarts and upgrades. To wipe everything: <code>docker compose down -v</code>.</p>
+
+    <h3>Run without Compose</h3>
+    <pre>docker build -t gateway42:latest .
+
+docker run -d \
+  -p 7000:7000 \
+  --add-host=host.docker.internal:host-gateway \
+  -e OLLAMA_GATEWAY_SECRET_KEY="your-secret" \
+  -e ADMIN_PASSWORD="your-password" \
+  -e OLLAMA_URL="http://host.docker.internal:11434/api/chat" \
+  -v gateway42-db:/gateway/db \
+  -v gateway42-logs:/gateway/logs \
+  --name gateway42 \
+  gateway42:latest</pre>
+    <p>
+        The <code>--add-host</code> flag is required on Linux. On macOS and Windows with Docker Desktop
+        it is optional but harmless.
+    </p>
+
+    <h3>Upgrading</h3>
+    <pre>docker compose build    # rebuild the gateway42 image
+docker compose up -d    # replace the running container</pre>
+    <p>The SQLite database schema is migrated automatically on startup — no manual steps required.</p>
+
+    <h3>Environment variables</h3>
+    <p>
+        Set variables directly in <code>docker-compose.yml</code>, or use a <code>.env</code> file
+        in the project root and reference them with <code>${VARIABLE_NAME}</code>:
+    </p>
+    <pre># .env
+OLLAMA_GATEWAY_SECRET_KEY=your-long-random-string
+ADMIN_PASSWORD=your-admin-password
+ADMIN_EMAIL=admin@example.com</pre>
+</div>
+
+
+<!----------------------------------------------------------------------------
+  Deployment — Kubernetes
+  ---------------------------------------------------------------------------->
+<div class="card help-section" style="margin-top:24px;">
+    <h2>Running on Kubernetes</h2>
+    <p>
+        Ready-to-use manifests are provided in the <code>k8s/</code> directory.
+        They deploy Gateway42 as a single-replica Deployment backed by PersistentVolumeClaims for the
+        database and logs.
+    </p>
+
+    <h3>Files</h3>
+    <table class="help-table">
+        <thead><tr><th>File</th><th>Purpose</th></tr></thead>
+        <tbody>
+            <tr><td><code>k8s/secret.yaml</code></td><td>Stores <code>OLLAMA_GATEWAY_SECRET_KEY</code> and <code>ADMIN_PASSWORD</code> as a Kubernetes Secret.</td></tr>
+            <tr><td><code>k8s/configmap.yaml</code></td><td>Non-sensitive configuration (Ollama URL, rate limits, log level, etc.).</td></tr>
+            <tr><td><code>k8s/pvc.yaml</code></td><td>PersistentVolumeClaims for the database (1 Gi) and logs (2 Gi).</td></tr>
+            <tr><td><code>k8s/deployment.yaml</code></td><td>The Deployment definition with health probes and resource limits.</td></tr>
+            <tr><td><code>k8s/service.yaml</code></td><td>ClusterIP Service on port 80 and an Ingress resource for external access.</td></tr>
+        </tbody>
+    </table>
+
+    <h3>Deploy</h3>
+    <pre># 1. Build and push the image to your registry
+docker build -t your-registry/gateway42:latest .
+docker push your-registry/gateway42:latest
+
+# 2. Update the image reference in k8s/deployment.yaml
+#    image: your-registry/gateway42:latest
+
+# 3. Set your secrets (edit k8s/secret.yaml before applying,
+#    or use kubectl create secret directly)
+kubectl create secret generic gateway42-secret \
+  --from-literal=OLLAMA_GATEWAY_SECRET_KEY="your-long-random-string" \
+  --from-literal=ADMIN_PASSWORD="your-admin-password"
+
+# 4. Apply all manifests
+kubectl apply -f k8s/configmap.yaml
+kubectl apply -f k8s/pvc.yaml
+kubectl apply -f k8s/deployment.yaml
+kubectl apply -f k8s/service.yaml
+
+# 5. Check rollout status
+kubectl rollout status deployment/gateway42</pre>
+
+    <h3>Access the UI</h3>
+    <p>
+        The Service is a <code>ClusterIP</code> on port 80. To access it from outside the cluster,
+        either:
+    </p>
+    <ul>
+        <li>Update <code>k8s/service.yaml</code> to use <code>type: LoadBalancer</code>, <strong>or</strong></li>
+        <li>Configure the Ingress in <code>k8s/service.yaml</code> with your domain and an ingress
+            controller (e.g. <a class="link" href="https://kubernetes.github.io/ingress-nginx/" target="_blank">nginx-ingress</a>), <strong>or</strong></li>
+        <li>Use port-forwarding for local access: <code>kubectl port-forward svc/gateway42 7000:80</code></li>
+    </ul>
+
+    <h3>Connecting to Ollama</h3>
+    <p>
+        The default <code>OLLAMA_URL</code> in <code>k8s/configmap.yaml</code> points to
+        <code>http://ollama:11434/api/chat</code>, which assumes Ollama is deployed as a Service named
+        <code>ollama</code> in the same namespace. Alternatives:
+    </p>
+    <ul>
+        <li><strong>Separate namespace:</strong> use the full DNS name <code>http://ollama.&lt;namespace&gt;.svc.cluster.local:11434/api/chat</code>.</li>
+        <li><strong>External Ollama:</strong> set <code>OLLAMA_URL</code> to the external IP or hostname.</li>
+        <li><strong>Runtime override:</strong> change the URL any time from the Settings page — it is saved to the database and takes effect immediately.</li>
+    </ul>
+
+    <h3>Scaling</h3>
+    <p>
+        Gateway42 uses a SQLite database, which supports only one writer at a time.
+        Running more than one replica is therefore not recommended without replacing the database backend.
+        For high-throughput deployments, keep <code>replicas: 1</code> and scale horizontally at the
+        Ollama level instead.
+    </p>
+
+    <h3>Health checks</h3>
+    <p>
+        The Deployment configures both a <strong>readiness probe</strong> and a <strong>liveness probe</strong>
+        against <code>GET /health</code>. Kubernetes will not route traffic to the pod until the readiness
+        probe succeeds, and will restart the pod if the liveness probe fails.
+    </p>
+
+    <h3>Resource limits</h3>
+    <p>Default resource requests and limits set in <code>k8s/deployment.yaml</code>:</p>
+    <table class="help-table">
+        <thead><tr><th></th><th>CPU</th><th>Memory</th></tr></thead>
+        <tbody>
+            <tr><td>Request</td><td>100m</td><td>128 Mi</td></tr>
+            <tr><td>Limit</td><td>500m</td><td>512 Mi</td></tr>
+        </tbody>
+    </table>
+    <p>Adjust these values in <code>k8s/deployment.yaml</code> to suit your cluster.</p>
+</div>
+
+{% endblock %}
