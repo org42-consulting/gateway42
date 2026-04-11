@@ -1,9 +1,10 @@
-# Gateway42 — Ollama LAN AI Gateway
+# Gateway42 — An opinionated gateway for Ollama
 
 **Authenticated, audited, rate-limited API gateway for local LLMs. On-prem. Privacy-first.**
 
 Gateway42 sits between your users and a shared [Ollama](https://ollama.com) instance, exposing an **OpenAI-compatible API** while adding authentication, per-user rate limiting, and full audit logging. Any client or library built for the OpenAI API works with Gateway42 without code changes — just swap the base URL and API key.
 
+<img width="1342" height="872" alt="Image" src="https://github.com/user-attachments/assets/c6c38d0e-e40b-445b-9b9e-e08fbe55a268" />
 
 ## Architecture
 
@@ -28,7 +29,7 @@ flowchart LR
 **The gateway must be installed on the same machine as Ollama.** Ollama listens only on `127.0.0.1:11434` and is never exposed over the LAN. All external access goes through the gateway.
 
 
-## What Gateway42 Adds
+## What Gateway42. adds
 
 | Capability         | Ollama  | Gateway42 |
 | ------------------ | ------- | --------- |
@@ -43,7 +44,7 @@ flowchart LR
 | Admin dashboard    | No      | Yes       |
 
 
-## Design Philosophy
+## Design philosophy
 
 - Ollama stays **localhost-only** — never exposed directly
 - All access is **authenticated** via API keys
@@ -52,10 +53,7 @@ flowchart LR
 - The admin UI exists for **governance only**, not inference
 
 
----
-
-
-## Quick Start (Docker)
+## Quick start (Docker)
 
 **Prerequisites:** Docker 24+, Docker Compose v2, [Ollama](https://ollama.com/download) running on the host.
 
@@ -108,17 +106,14 @@ docker compose up -d   # replace the running container
 
 The SQLite schema migrates automatically on startup — no manual steps needed.
 
-### Host Networking Note
+### Host networking note
 
 Inside a Docker container, `localhost` refers to the container itself. Gateway42 uses `host.docker.internal` to reach Ollama on the host:
 - **macOS / Windows** — Docker Desktop provides this automatically.
 - **Linux** — the `extra_hosts: host.docker.internal:host-gateway` entry in `docker-compose.yml` handles this. No extra setup needed.
 
 
----
-
-
-## Kubernetes Deployment
+## Kubernetes deployment
 
 Ready-to-use manifests are in the `k8s/` directory. They deploy Gateway42 as a single-replica Deployment backed by PersistentVolumeClaims.
 
@@ -169,10 +164,7 @@ kubectl rollout status deployment/gateway42
 | Limit | 500m | 512 Mi |
 
 
----
-
-
-## API Reference
+## API reference
 
 Gateway42 exposes an **OpenAI-compatible API**. Point any OpenAI client at Gateway42 by changing the base URL and providing a Gateway42 API key.
 
@@ -255,8 +247,9 @@ The following OpenAI parameters are translated to Ollama equivalents:
 | `502` | Gateway42 could not reach the Ollama instance |
 | `500` | Internal server error |
 
-
----
+### More help
+Gateway42. has a built-in help page providing much information.
+<img width="1342" height="865" alt="Image" src="https://github.com/user-attachments/assets/96734167-7790-40ae-baef-75d67c66b330" />
 
 
 ## Rate Limiting
@@ -271,16 +264,13 @@ Gateway42 enforces a **sliding window rate limit** per user (60-second window).
 - Default for new users is set by the `DEFAULT_RATE_LIMIT` environment variable
 
 
----
-
-
 ## Admin Dashboard
 
 Access at `http://<host>:7000`. Admin-only — not intended for end users.
 
 ### Default Admin Credentials
 
-- Username: `admin` (or the value of `ADMIN_EMAIL`)
+- No username
 - Password: set via `ADMIN_PASSWORD` environment variable
 - **Change your password after first login**
 
@@ -295,6 +285,7 @@ New users are registered with a unique API key and start in **DISABLED** status.
 | New API key | Generates a fresh key and immediately invalidates the old one. Displayed once — copy it before leaving the page. |
 | Export CSV | Downloads all audit log entries for this user. Required before deletion. |
 | Delete | Permanently removes the user and their log entries. CSV export must be done first. |
+<img width="1342" height="872" alt="Image" src="https://github.com/user-attachments/assets/c6c38d0e-e40b-445b-9b9e-e08fbe55a268" />
 
 ### Model Management (Settings page)
 
@@ -302,6 +293,8 @@ New users are registered with a unique API key and start in **DISABLED** status.
 - **Delete** a model to free disk space
 - **Download** a model by name (e.g. `llama3.2:latest`) with live progress tracking
 - Browse available models at [ollama.com/models](https://ollama.com/models)
+<img width="1341" height="770" alt="Image" src="https://github.com/user-attachments/assets/b1fa0ad6-a2e2-49d1-b05d-abdd631254a8" />
+
 
 ### Audit Logs
 
@@ -311,13 +304,13 @@ Every request is recorded with: timestamp, user, model, prompt, and response.
 - Search by prompt text, response text, or user email
 - Auto-refresh: Off / 5s / 10s / 30s / 60s
 - Export **all** log entries as CSV (`log_id`, `email`, `model`, `prompt`, `response`, `timestamp`)
+<img width="1358" height="455" alt="Image" src="https://github.com/user-attachments/assets/eee0c34e-ec79-42c4-936f-7668ed2792c5" />
+
 
 ### Reset System
 
 Permanently deletes all audit logs and rate-limit counters. User accounts and settings are not affected. This action cannot be undone.
 
-
----
 
 
 ## Configuration
@@ -348,9 +341,6 @@ ADMIN_EMAIL=admin@example.com
 ```
 
 
----
-
-
 ## Known Design Constraints
 
 This gateway intentionally does not handle:
@@ -363,18 +353,3 @@ This gateway intentionally does not handle:
 | Unbounded token use | Latency spikes |
 
 These are deliberate design boundaries, not bugs.
-
-
----
-
-
-## Audit & Compliance
-
-| Property | Detail |
-| -------- | ------ |
-| Storage | SQLite (WAL mode) — safe for concurrent reads |
-| Growth | Linear with usage |
-| Export | CSV, per-user or full log |
-| Deletion | CSV export required before user deletion |
-
-Suitable for: research validation, automation debugging, incident investigation, compliance review.
