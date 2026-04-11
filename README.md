@@ -1,539 +1,380 @@
-<img width="1505" height="467" alt="Banner" src="https://github.com/user-attachments/assets/05fae78d-d46c-4a22-b706-20ce77d6fb74" />
+# Gateway42 — Ollama LAN AI Gateway
 
----
-# Ollama LAN AI Gateway
+**Authenticated, audited, rate-limited API gateway for local LLMs. On-prem. Privacy-first.**
 
-**Authenticated, Audited, Rate-Limited API Gateway for Local LLMs (On-Prem, Privacy-First)**
+Gateway42 sits between your users and a shared [Ollama](https://ollama.com) instance, exposing an **OpenAI-compatible API** while adding authentication, per-user rate limiting, and full audit logging. Any client or library built for the OpenAI API works with Gateway42 without code changes — just swap the base URL and API key.
 
-![Status](https://img.shields.io/badge/status-active-success)
-![Deployment](https://img.shields.io/badge/deployment-on--premise-critical)
-![Privacy](https://img.shields.io/badge/privacy-local--only-important)
-![Python](https://img.shields.io/badge/python-3.10%2B-blue)
-![LLM](https://img.shields.io/badge/LLM-Ollama-black)
-![Auth](https://img.shields.io/badge/auth-user--based-green)
-![Rate Limit](https://img.shields.io/badge/rate--limit-enabled-yellow)
-![Audit Logs](https://img.shields.io/badge/audit-logged-blueviolet)
 
----
-
-## 1. Why This Project Exists (The Real Story)
-
-This project was built to solve a **real in-house operational problem**, not as a demo or abstraction exercise.
-
-As teams increasingly adopted AI/ML, Computer Vision, DevOps automation, and research workflows, the usage pattern evolved rapidly:
-
-- Local LLMs (via Ollama) for offline validation and privacy-sensitive work
-- Open WebUI for human interaction and exploration
-- Automation tools (n8n, scripts, CI jobs) that **cannot depend on GUIs**
-- Occasional use of cloud LLM APIs with privacy and cost constraints
-
-While Ollama is an excellent **local inference engine**, it is intentionally **not designed** for:
-
-- Multi-user access
-- Authentication or user isolation
-- Rate limiting
-- Audit logging
-- Automation safety
-- Governance or accountability
-
-At one point, a single automation pipeline overwhelmed the local inference host.
-There was **no visibility** into:
-- Who sent the requests
-- Which pipeline caused the issue
-- How frequently the system was being used
-- Whether misuse or misconfiguration occurred
-
-The system recovered-but the problem was clear.
-
-This gateway was built as a **lightweight, production-safe control layer** to:
-
-- Protect the core inference engine
-- Isolate users and automation pipelines
-- Enable safe API-based access
-- Provide auditability and traceability
-- Preserve privacy and offline operation
-- Avoid touching or destabilizing the inference stack itself
-
----
-
-## 2. Design Philosophy
-
-This project follows a **governance-first, minimal-footprint philosophy**:
-
-- Ollama remains **localhost-only**
-- Users never interact with the inference engine directly
-- All access is authenticated and logged
-- Rate limits protect system stability
-- UI exists only for governance, not inference
-- Automation is a first-class use case
-- The gateway is intentionally lightweight
-- No system Python pollution
-- Clean isolation under `/opt`
-
----
-
-## 3. High-Level Architecture
+## Architecture
 
 ```mermaid
 flowchart LR
     subgraph Host["Inference Host (Single Machine)"]
-        OLLAMA["Ollama Core\n127.0.0.1:11434\nOffline Models"]
-        WEBUI["Open WebUI\nPort 8080\nHuman UI"]
-        GATEWAY["LAN AI Gateway\nPort 7000\nAuth • Logs • Rate Limit"]
-
-        WEBUI -->|localhost| OLLAMA
+        OLLAMA["Ollama\n127.0.0.1:11434"]
+        GATEWAY["Gateway42\nPort 7000\nAuth · Logs · Rate Limit"]
         GATEWAY -->|localhost only| OLLAMA
     end
 
     subgraph LAN["LAN / Team / Automation"]
         USERS["Human Users"]
-        SCRIPTS["Scripts (Python / Bash / PowerShell)"]
-        N8N["n8n Workflows"]
-        PIPE["AI / ML / CV Pipelines"]
+        SCRIPTS["Scripts (Python, Bash)"]
+        AGENTS["AI Agents"]
+        CHAT["Chat clients"]
     end
 
-    USERS -->|HTTP| GATEWAY
-    SCRIPTS -->|HTTP| GATEWAY
-    N8N -->|HTTP| GATEWAY
-    PIPE -->|HTTP| GATEWAY
-````
+    USERS & SCRIPTS & AGENTS & CHAT -->|HTTP| GATEWAY
+```
+
+**The gateway must be installed on the same machine as Ollama.** Ollama listens only on `127.0.0.1:11434` and is never exposed over the LAN. All external access goes through the gateway.
+
+
+## What Gateway42 Adds
+
+| Capability         | Ollama  | Gateway42 |
+| ------------------ | ------- | --------- |
+| LAN API            | No      | Yes       |
+| OpenAI-compatible  | No      | Yes       |
+| API key auth       | No      | Yes       |
+| Per-user isolation | No      | Yes       |
+| Rate limiting      | No      | Yes       |
+| Prompt logging     | No      | Yes       |
+| Response logging   | No      | Yes       |
+| CSV audit export   | No      | Yes       |
+| Admin dashboard    | No      | Yes       |
+
+
+## Design Philosophy
+
+- Ollama stays **localhost-only** — never exposed directly
+- All access is **authenticated** via API keys
+- All requests are **logged** for auditability
+- Rate limits **protect system stability**
+- The admin UI exists for **governance only**, not inference
+
 
 ---
 
-## 4. Core Security Boundary (Critical)
 
-**The gateway must be installed on the same machine where Ollama is running.**
+## Quick Start (Docker)
 
-* Ollama listens only on:
+**Prerequisites:** Docker 24+, Docker Compose v2, [Ollama](https://ollama.com/download) running on the host.
 
-  ```
-  http://127.0.0.1:11434
-  ```
-* Ollama is never exposed over LAN
-* All external access is mediated by the gateway
-* Users cannot bypass authentication or rate limits
+```bash
+# 1. Make sure Ollama is running
+ollama serve
 
-This boundary is **intentional and enforced by design**.
+# 2. Edit docker-compose.yml — set your secrets:
+#    OLLAMA_GATEWAY_SECRET_KEY  — any long random string
+#    ADMIN_PASSWORD             — your chosen admin password
 
----
+# 3. Build and start
+docker compose up -d
 
-## 5. Components Overview
+# 4. Open the admin UI
+open http://localhost:7000
+```
 
-| Component      | Role                                             |
-| -------------- | ------------------------------------------------ |
-| Ollama         | Local inference engine (multi-model, offline)    |
-| Open WebUI     | Optional human UI (port 8080)                    |
-| LAN AI Gateway | Authenticated API & governance layer (port 7000) |
-| SQLite (WAL)   | Users, logs, audit storage                       |
-| systemd        | Auto-start, auto-heal                            |
+**Persistent data** is stored in two named Docker volumes created automatically:
+- `gateway42-db` — SQLite database (users, logs, settings)
+- `gateway42-logs` — application log files
 
----
+Data survives container restarts and upgrades. To wipe everything: `docker compose down -v`.
 
-## 6. What This Gateway Adds
+### Run Without Compose
 
-| Capability         | Ollama Native | Gateway |
-| ------------------ | ------------- | ------- |
-| LAN API            | No            | Yes     |
-| Authentication     | No            | Yes     |
-| Per-user isolation | No            | Yes     |
-| Rate limiting      | No            | Yes     |
-| Prompt logging     | No            | Yes     |
-| Response logging   | No            | Yes     |
-| CSV audit export   | No            | Yes     |
-| Automation-safe    | Limited       | Yes     |
+```bash
+docker build -t gateway42:latest .
 
----
+docker run -d \
+  -p 7000:7000 \
+  --add-host=host.docker.internal:host-gateway \
+  -e OLLAMA_GATEWAY_SECRET_KEY="your-secret" \
+  -e ADMIN_PASSWORD="your-password" \
+  -e OLLAMA_URL="http://host.docker.internal:11434/api/chat" \
+  -v gateway42-db:/gateway/db \
+  -v gateway42-logs:/gateway/logs \
+  --name gateway42 \
+  gateway42:latest
+```
 
-## 7. Control Plane & User Access (Gateway UI)
+> The `--add-host` flag is required on Linux. On macOS/Windows with Docker Desktop it is optional.
 
-The gateway includes a **minimal control plane** focused on governance and security.
-It does **not perform inference**.
+### Upgrading
 
-### User Dashboard
+```bash
+docker compose build   # rebuild the image
+docker compose up -d   # replace the running container
+```
 
-<img width="1874" height="374" alt="Main-dashboard" src="https://github.com/user-attachments/assets/b771d35d-b49c-42b0-9f4e-8c725d1bc70f" />
+The SQLite schema migrates automatically on startup — no manual steps needed.
 
-Users can:
+### Host Networking Note
 
-* Register using email
-* Reset password (if known)
-* Await admin approval
+Inside a Docker container, `localhost` refers to the container itself. Gateway42 uses `host.docker.internal` to reach Ollama on the host:
+- **macOS / Windows** — Docker Desktop provides this automatically.
+- **Linux** — the `extra_hosts: host.docker.internal:host-gateway` entry in `docker-compose.yml` handles this. No extra setup needed.
 
----
-
-### Admin Panel
-
-<img width="1897" height="580" alt="admin-pannel" src="https://github.com/user-attachments/assets/a4bf0275-f87e-4f86-a696-bbe898c121db" />
-
-Admin can:
-
-* Approve or disable users
-* Reset user passwords to `admin123`
-* Export per-user audit logs (CSV)
-* Permanently delete users (export enforced)
-* Change admin password
 
 ---
 
-## 8. Access & User Management
+
+## Kubernetes Deployment
+
+Ready-to-use manifests are in the `k8s/` directory. They deploy Gateway42 as a single-replica Deployment backed by PersistentVolumeClaims.
+
+| File | Purpose |
+| ---- | ------- |
+| `k8s/secret.yaml` | `OLLAMA_GATEWAY_SECRET_KEY` and `ADMIN_PASSWORD` as a Kubernetes Secret |
+| `k8s/configmap.yaml` | Non-sensitive config (Ollama URL, rate limits, log level, etc.) |
+| `k8s/pvc.yaml` | PersistentVolumeClaims: database (1 Gi) and logs (2 Gi) |
+| `k8s/deployment.yaml` | Deployment with health probes and resource limits |
+| `k8s/service.yaml` | ClusterIP Service on port 80 and Ingress resource |
+
+```bash
+# 1. Build and push your image
+docker build -t your-registry/gateway42:latest .
+docker push your-registry/gateway42:latest
+
+# 2. Update the image reference in k8s/deployment.yaml
+
+# 3. Create secrets
+kubectl create secret generic gateway42-secret \
+  --from-literal=OLLAMA_GATEWAY_SECRET_KEY="your-long-random-string" \
+  --from-literal=ADMIN_PASSWORD="your-admin-password"
+
+# 4. Apply manifests
+kubectl apply -f k8s/configmap.yaml
+kubectl apply -f k8s/pvc.yaml
+kubectl apply -f k8s/deployment.yaml
+kubectl apply -f k8s/service.yaml
+
+# 5. Check rollout
+kubectl rollout status deployment/gateway42
+```
+
+**Accessing the UI:** The Service is a `ClusterIP` on port 80. Options for external access:
+- Change `type: LoadBalancer` in `k8s/service.yaml`, or
+- Configure the Ingress with your domain and an ingress controller, or
+- Port-forward locally: `kubectl port-forward svc/gateway42 7000:80`
+
+**Connecting to Ollama:** The default `OLLAMA_URL` in `k8s/configmap.yaml` points to `http://ollama:11434/api/chat` (assumes Ollama is a Service named `ollama` in the same namespace). You can override this from the Settings page at any time.
+
+**Scaling:** Gateway42 uses SQLite, which supports one writer at a time. Keep `replicas: 1` and scale at the Ollama level instead.
+
+**Resource limits** (defaults in `k8s/deployment.yaml`):
+
+| | CPU | Memory |
+|---|---|---|
+| Request | 100m | 128 Mi |
+| Limit | 500m | 512 Mi |
+
+
+---
+
+
+## API Reference
+
+Gateway42 exposes an **OpenAI-compatible API**. Point any OpenAI client at Gateway42 by changing the base URL and providing a Gateway42 API key.
 
 ### Base URL
 
 ```
-http://<HOST_IP>:7000
+http://<your-host>:7000/v1
 ```
 
-Example:
+### Authentication
+
+Pass the user's API key as a Bearer token:
 
 ```
-http://192.168.1.2:7000
+Authorization: Bearer <api_key>
 ```
 
-### Default Admin Account
+Requests with a missing, invalid, or deactivated key are rejected with `401 Unauthorized`.
 
-* Username: `admin`
-* Password: `admin123`
-* **Mandatory password change after first login**
+### Endpoints
 
----
+| Endpoint | Method | Description |
+| -------- | ------ | ----------- |
+| `/v1/chat/completions` | POST | Chat completion. Accepts OpenAI-format bodies. Set `"stream": true` for SSE streaming. |
+| `/v1/models` | GET | Returns installed Ollama models in OpenAI format. |
+| `/health` | GET | Returns `{"status": "ok"}`. No auth required. Use for uptime monitoring. |
 
-## 9. Rate Limiting
-
-* Default: **10 requests per minute per user**
-* Enforced at the gateway
-* Applies to scripts, automation, and pipelines
-* Prevents runaway workloads
-
-HTTP `429` is returned if exceeded.
-
----
-
-## 10. API Endpoints
-
-### Health Check
-
-```
-GET /health
-```
-
-### Inference
-
-```
-POST /chat
-```
-
----
-
-## 11. Request Format (Authentication Required)
-
-```json
-{
-  "auth": {
-    "username": "user@company.com",
-    "password": "password"
-  },
-  "model": "llama3.2:latest",
-  "messages": [
-    { "role": "user", "content": "Hello" }
-  ]
-}
-```
-
----
-
-## 12. Usage Examples
-
-### Linux / macOS
+### Example — cURL
 
 ```bash
-curl http://192.168.1.2:7000/chat \
--H "Content-Type: application/json" \
--d '{
-  "auth":{"username":"user@company.com","password":"password"},
-  "messages":[{"role":"user","content":"Explain MQTT"}]
-}'
+curl http://<host>:7000/v1/chat/completions \
+  -H "Authorization: Bearer <api_key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama3.2:latest",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
 ```
 
-### Windows PowerShell
+### Example — Python (openai SDK)
 
-```powershell
-Invoke-RestMethod `
- -Uri "http://192.168.1.2:7000/chat" `
- -Method Post `
- -ContentType "application/json" `
- -Body '{
-   "auth":{"username":"user@company.com","password":"password"},
-   "messages":[{"role":"user","content":"Explain MQTT"}]
- }'
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://<host>:7000/v1",
+    api_key="<api_key>",
+)
+
+response = client.chat.completions.create(
+    model="llama3.2:latest",
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+print(response.choices[0].message.content)
 ```
 
----
+### Supported Parameters
 
-## 13. Logging, Audit & Compliance
+The following OpenAI parameters are translated to Ollama equivalents:
 
-* Logs:
+| OpenAI parameter | Ollama parameter | Notes |
+| ---------------- | ---------------- | ----- |
+| `model` | `model` | Must match an installed Ollama model name |
+| `messages` | `messages` | Full conversation history |
+| `stream` | `stream` | SSE streaming when `true` |
+| `temperature` | `temperature` | |
+| `top_p` | `top_p` | |
+| `max_tokens` | `num_predict` | |
+| `seed` | `seed` | |
+| `stop` | `stop` | String or list of strings |
+| `presence_penalty` | `repeat_last_n` | |
+| `frequency_penalty` | `repeat_penalty` | Mapped as `1.0 + value` |
 
-  * User
-  * Prompt
-  * Model response
-  * Timestamp
-* Stored in SQLite (WAL mode)
-* Per-user CSV export supported
-* Export required before deletion
+### Error Codes
 
-Suitable for:
+| Status | Meaning |
+| ------ | ------- |
+| `401` | Missing, invalid, or deactivated API key |
+| `429` | Rate limit exceeded — wait before retrying |
+| `502` | Gateway42 could not reach the Ollama instance |
+| `500` | Internal server error |
 
-* Research validation
-* Automation debugging
-* Incident investigation
-* Compliance review
-
----
-
-## 14. Installation & Rollback
-
-* Install script:
-
-  * Creates isolated environment under `/opt`
-  * Sets up database and systemd service
-* Rollback script:
-
-  * Removes gateway only
-  * Ollama and Open WebUI remain untouched
 
 ---
 
-## 15. Project Versioning & Evolution
 
-This project has evolved in **intentional phases**, each solving a specific problem.
+## Rate Limiting
 
-| Version  | Focus                                  | Status    |
-| -------- | -------------------------------------- | --------- |
-| **v1.0** | Headless API gateway (PoC)             | Completed |
-| **v2.x** | Auth, UI, audit, rate limiting         | Current   |
-| **v3.x** | Hybrid local + cloud LLM control plane | Planned   |
+Gateway42 enforces a **sliding window rate limit** per user (60-second window).
 
-### v1.0 – Headless Gateway
+- Default: **10 requests per minute** per user
+- Configurable per-user from the Admin Dashboard
+- Returns `429 Too Many Requests` when exceeded
+- Applies to scripts, automation, and pipelines
+- Counters reset on *Reset System* or when a user is deleted
+- Default for new users is set by the `DEFAULT_RATE_LIMIT` environment variable
 
-* Validated API design
-* Automation safety
-* No UI, no auth
-* Used for internal proof-of-concept
-
-### v2.x – Governance Layer (Current)
-
-* User authentication
-* Admin control plane
-* Rate limiting
-* Audit logging
-* Production stability
-
-### v3.x – Hybrid Local + Cloud (Planned)
-
-* Unified access to:
-
-  * Local LLMs (Ollama)
-  * Cloud APIs (OpenAI, Claude, Gemini)
-* Server-side API key management
-* Per-user usage visibility
-* Cost and governance controls
 
 ---
 
-## 16. Cloud & Hybrid Capability (Planned)
 
-The gateway is architecturally designed to support **cloud LLM APIs** without exposing raw credentials.
+## Admin Dashboard
 
-Planned capabilities:
+Access at `http://<host>:7000`. Admin-only — not intended for end users.
 
-* Provider routing per request
-* Centralized API key storage
-* Unified auth, logging, rate limits
-* Safe internal sharing of paid accounts
-* Hybrid local + cloud workloads
+### Default Admin Credentials
 
----
+- Username: `admin` (or the value of `ADMIN_EMAIL`)
+- Password: set via `ADMIN_PASSWORD` environment variable
+- **Change your password after first login**
 
-## 17. Roadmap
+### User Management
 
-Planned enhancements:
+New users are registered with a unique API key and start in **DISABLED** status. Activate them manually once you have shared their key securely. Available actions per user:
 
-1. Admin-editable per-user rate limits
-2. Authenticated model discovery API
-3. Hybrid provider routing (local + cloud)
-4. Usage metrics & observability dashboard
+| Action | Description |
+| ------ | ----------- |
+| Toggle status | Switch between **ACTIVE** and **DISABLED**. Only active users can make API requests. |
+| Set rate limit | Adjust requests-per-minute (1–1000) per user. |
+| New API key | Generates a fresh key and immediately invalidates the old one. Displayed once — copy it before leaving the page. |
+| Export CSV | Downloads all audit log entries for this user. Required before deletion. |
+| Delete | Permanently removes the user and their log entries. CSV export must be done first. |
 
----
+### Model Management (Settings page)
 
-## 18. Capacity, Limits & Operational Expectations (Important)
+- View all models installed on the Ollama instance with their disk size
+- **Delete** a model to free disk space
+- **Download** a model by name (e.g. `llama3.2:latest`) with live progress tracking
+- Browse available models at [ollama.com/models](https://ollama.com/models)
 
-This project is intentionally designed as a **lightweight governance and control layer** for local and hybrid LLM usage.
-It is **not** a high-throughput inference platform or a public multi-tenant service.
+### Audit Logs
 
-The following limits and expectations are provided to ensure **correct usage, stability, and realistic planning**.
+Every request is recorded with: timestamp, user, model, prompt, and response.
 
----
+- Logs page shows the most recent 200 entries by default
+- Search by prompt text, response text, or user email
+- Auto-refresh: Off / 5s / 10s / 30s / 60s
+- Export **all** log entries as CSV (`log_id`, `email`, `model`, `prompt`, `response`, `timestamp`)
 
-### 18.1 Intended Usage Profile
+### Reset System
 
-This gateway is best suited for:
+Permanently deletes all audit logs and rate-limit counters. User accounts and settings are not affected. This action cannot be undone.
 
-* Small to mid-sized teams (research, AI/ML, CV, DevOps)
-* Shared on-prem GPU environments
-* Automation pipelines requiring **auditability and safety**
-* Privacy-first or offline-first deployments
-
-It is **not intended** for:
-
-* High-bandwidth public APIs
-* Large-scale SaaS inference
-* Unbounded concurrency workloads
-* Multi-region or HA inference clusters
 
 ---
 
-### 18.2 Tested & Practical Capacity (Realistic Numbers)
 
-These numbers reflect **safe operating ranges**, not theoretical maximums.
+## Configuration
 
-#### User Scale
+Set these environment variables before starting Gateway42. Variables marked **required** must be set or the application will refuse to start.
 
-| Metric                  | Supported Range |
-| ----------------------- | --------------- |
-| Active users            | 5 – 20          |
-| Concurrent active users | 2 – 5           |
-| Admin users             | 1 – 2           |
+| Variable | Required | Default | Description |
+| -------- | -------- | ------- | ----------- |
+| `OLLAMA_GATEWAY_SECRET_KEY` | **Yes** | — | Secret key for signing session cookies. Use a long, random string. |
+| `ADMIN_PASSWORD` | **Yes** | — | Password for the admin login page. |
+| `OLLAMA_URL` | No | `http://127.0.0.1:11434/api/chat` | Default Ollama endpoint. Can be overridden from the Settings page. |
+| `ADMIN_EMAIL` | No | `admin` | Admin account identifier shown in logs. |
+| `OLLAMA_GATEWAY_DB_PATH` | No | `./db/gateway.db` | Path to the SQLite database file. Avoid network-mounted filesystems. |
+| `DEFAULT_RATE_LIMIT` | No | `10` | Default requests-per-minute for newly registered users. |
+| `SESSION_TIMEOUT` | No | `3600` | Admin session lifetime in seconds. |
+| `MAX_MESSAGE_LENGTH` | No | `10000` | Maximum characters stored per prompt or response in the audit log. |
+| `LOG_LEVEL` | No | `INFO` | Python logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
+| `LOG_FILE` | No | `./logs/gateway.log` | Path to the application log file. |
+| `DEBUG` | No | `false` | Set to `true` to enable debug mode. Do not use in production. |
 
-Inference capacity, not the gateway, becomes the bottleneck beyond this.
+Using a `.env` file:
 
----
-
-#### Request Rate
-
-| Metric                    | Value                           |
-| ------------------------- | ------------------------------- |
-| Default rate limit        | **10 requests / minute / user** |
-| Aggregate safe throughput | ~50–200 requests / minute       |
-| Enforcement point         | Gateway                         |
-
-If exceeded, HTTP `429` is returned to protect system stability.
-
----
-
-### 18.3 Concurrency Model
-
-| Layer        | Constraint                       |
-| ------------ | -------------------------------- |
-| Gateway      | Async, handles many HTTP clients |
-| SQLite (WAL) | Single writer, many readers      |
-| Ollama       | GPU-bound, model dependent       |
-
-Requests may queue naturally; rate limiting prevents cascading failures.
-
----
-
-### 18.4 Token Length & Prompt Size
-
-* Token limits are enforced by the model (not the gateway)
-* Recommended usage:
-
-| Prompt Type        | Suggested Limit |
-| ------------------ | --------------- |
-| Automation prompts | <1k tokens      |
-| Analysis tasks     | 2k–4k tokens    |
-| Large context      | Use sparingly   |
-
-Excessive prompts can monopolize GPU time.
-
----
-
-### 18.5 Multimodal (Images, Attachments)
-
-If using models like LLaVA:
-
-| Factor             | Practical Limit |
-| ------------------ | --------------- |
-| Images per request | 1               |
-| Image size         | <5 MB           |
-| Concurrent users   | 1–2             |
-
-Multimodal inference is significantly more resource-intensive.
-
----
-
-### 18.6 Logging & Storage
-
-Each request logs:
-
-* User identity
-* Prompt
-* Model response
-* Timestamp
-
-| Component    | Notes                      |
-| ------------ | -------------------------- |
-| SQLite (WAL) | Safe for concurrent access |
-| Growth       | Linear with usage          |
-| CSV export   | Mandatory before deletion  |
-
-Avoid network-mounted filesystems for the DB.
-
----
-
-### 18.7 Known Constraints (By Design)
-
-This gateway does **not attempt** to handle:
-
-| Scenario                     | Outcome               |
-| ---------------------------- | --------------------- |
-| Hundreds of concurrent users | Inference starvation  |
-| Public traffic               | Rate-limited / denied |
-| Large file uploads           | GPU contention        |
-| Unbounded token use          | Latency spikes        |
-
-These are deliberate design boundaries.
-
----
-
-### 18.8 Positioning vs Large-Scale Platforms
-
-| Aspect      | This Gateway   | SaaS Platforms |
-| ----------- | -------------- | -------------- |
-| Privacy     | Full (on-prem) | Partial        |
-| Audit depth | Full           | Limited        |
-| Cost        | Hardware-only  | Usage-based    |
-| Scale       | Limited        | Very high      |
-| Control     | Full           | Partial        |
-
-This system optimizes for **control and accountability**, not raw throughput.
-
----
-
-## 19. Development & Hot Reloading
-
-For development purposes, the gateway supports hot reloading to speed up the development workflow. When running with the `--reload` flag, the application will automatically restart when Python source files change.
-
-To run with hot reloading:
 ```bash
-./scripts/run.sh --reload
+# .env
+OLLAMA_GATEWAY_SECRET_KEY=your-long-random-string
+ADMIN_PASSWORD=your-admin-password
+ADMIN_EMAIL=admin@example.com
 ```
 
-Or directly:
-```bash
-python -m app.app --reload
-```
-
-This feature is particularly useful during development as you don't need to manually restart the server after making code changes.
-
-## 20. Final Notes
-
-This is not a cloud LLM platform.
-It is not a UI replacement.
-
-It is a **focused, lightweight LLM control plane** designed to safely expose inference capabilities to humans and automation.
-
-Built because it was needed.
-Shared because others face the same problem.
 
 ---
 
+
+## Known Design Constraints
+
+This gateway intentionally does not handle:
+
+| Scenario | Outcome |
+| -------- | ------- |
+| Hundreds of concurrent users | Inference starvation |
+| Public internet traffic | Rate-limited / denied |
+| Large file uploads | GPU contention |
+| Unbounded token use | Latency spikes |
+
+These are deliberate design boundaries, not bugs.
+
+
+---
+
+
+## Audit & Compliance
+
+| Property | Detail |
+| -------- | ------ |
+| Storage | SQLite (WAL mode) — safe for concurrent reads |
+| Growth | Linear with usage |
+| Export | CSV, per-user or full log |
+| Deletion | CSV export required before user deletion |
+
+Suitable for: research validation, automation debugging, incident investigation, compliance review.
