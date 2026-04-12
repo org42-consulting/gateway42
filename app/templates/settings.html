@@ -39,7 +39,7 @@
     {% if ollama_model_details %}
     <div style="padding:0; overflow:hidden; border-radius:var(--radius-sm) !important; margin-bottom:20px;">
         <div style="overflow-x:auto;">
-            <table class="data-table card-light">
+            <table class="data-table ">
                 <thead>
                     <tr>
                         <th>Model</th>
@@ -68,7 +68,7 @@
     {% else %}
     <p style="font-size:.8125rem; color:rgba(255,255,255,.35); margin-bottom:16px;">No models installed.</p>
     {% endif %}
-
+    
     <label>Download Model</label>
       <p style="font-size:.8125rem; color:rgba(255,255,255,.45); ">
       Visit <a class="link" href="https://ollama.com/models" target="_blank">https://ollama.com/models</a> to find available models and their names. <br/>

@@ -18,8 +18,8 @@ mkdir -p db
 mkdir -p logs
 
 # Set default environment variables if not set
-export OLLAMA_GATEWAY_SECRET_KEY="${OLLAMA_GATEWAY_SECRET_KEY:-change-this-in-production}"
-export OLLAMA_GATEWAY_DB_PATH="${OLLAMA_GATEWAY_DB_PATH:-./db/gateway.db}"
+export GW42_SECRET_KEY="${GW42_SECRET_KEY:-change-this-in-production}"
+export GW42_DB_PATH="${GW42_DB_PATH:-./db/gateway.db}"
 export OLLAMA_URL="${OLLAMA_URL:-http://127.0.0.1:11434/api/chat}"
 export ADMIN_PASSWORD="${ADMIN_PASSWORD:-admin123}"
 export DEFAULT_RATE_LIMIT="${DEFAULT_RATE_LIMIT:-10}"

@@ -62,8 +62,8 @@ flowchart LR
 ollama serve
 
 # 2. Edit docker-compose.yml — set your secrets:
-#    OLLAMA_GATEWAY_SECRET_KEY  — any long random string
-#    ADMIN_PASSWORD             — your chosen admin password
+#    GW42_SECRET_KEY  — any long random string
+#    ADMIN_PASSWORD   — your chosen admin password
 
 # 3. Build and start
 docker compose up -d
@@ -78,6 +78,49 @@ open http://localhost:7000
 
 Data survives container restarts and upgrades. To wipe everything: `docker compose down -v`.
 
+### Using a Published Image
+
+If you want to run Gateway42 without cloning the repo or building locally, replace the `build:` line in `docker-compose.yml` with an `image:` reference:
+
+```yaml
+services:
+  gateway42:
+    image: ghcr.io/YOUR_ORG/gateway42:latest   # replace with the published image tag
+    # build: .  ← remove or comment out this line
+```
+
+Set your secrets in a `.env` file in the same directory:
+
+```bash
+# .env
+GW42_SECRET_KEY=your-long-random-secret
+ADMIN_PASSWORD=your-admin-password
+```
+
+And reference them in `docker-compose.yml`:
+
+```yaml
+    environment:
+      GW42_SECRET_KEY: "${GW42_SECRET_KEY}"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD}"
+```
+
+Pull the image and start:
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+To upgrade to a newer published image:
+
+```bash
+docker compose pull   # fetch the latest image
+docker compose up -d  # replace the running container
+```
+
+Data volumes are preserved across upgrades.
+
 ### Run Without Compose
 
 ```bash
@@ -86,7 +129,7 @@ docker build -t gateway42:latest .
 docker run -d \
   -p 7000:7000 \
   --add-host=host.docker.internal:host-gateway \
-  -e OLLAMA_GATEWAY_SECRET_KEY="your-secret" \
+  -e GW42_SECRET_KEY="your-secret" \
   -e ADMIN_PASSWORD="your-password" \
   -e OLLAMA_URL="http://host.docker.internal:11434/api/chat" \
   -v gateway42-db:/gateway/db \
@@ -99,8 +142,17 @@ docker run -d \
 
 ### Upgrading
 
+**If you built the image locally:**
+
 ```bash
 docker compose build   # rebuild the image
+docker compose up -d   # replace the running container
+```
+
+**If you are using a published image:**
+
+```bash
+docker compose pull    # fetch the latest image
 docker compose up -d   # replace the running container
 ```
 
@@ -119,7 +171,7 @@ Ready-to-use manifests are in the `k8s/` directory. They deploy Gateway42 as a s
 
 | File | Purpose |
 | ---- | ------- |
-| `k8s/secret.yaml` | `OLLAMA_GATEWAY_SECRET_KEY` and `ADMIN_PASSWORD` as a Kubernetes Secret |
+| `k8s/secret.yaml` | `GW42_SECRET_KEY` and `ADMIN_PASSWORD` as a Kubernetes Secret |
 | `k8s/configmap.yaml` | Non-sensitive config (Ollama URL, rate limits, log level, etc.) |
 | `k8s/pvc.yaml` | PersistentVolumeClaims: database (1 Gi) and logs (2 Gi) |
 | `k8s/deployment.yaml` | Deployment with health probes and resource limits |
@@ -134,7 +186,7 @@ docker push your-registry/gateway42:latest
 
 # 3. Create secrets
 kubectl create secret generic gateway42-secret \
-  --from-literal=OLLAMA_GATEWAY_SECRET_KEY="your-long-random-string" \
+  --from-literal=GW42_SECRET_KEY="your-long-random-string" \
   --from-literal=ADMIN_PASSWORD="your-admin-password"
 
 # 4. Apply manifests
@@ -319,11 +371,11 @@ Set these environment variables before starting Gateway42. Variables marked **re
 
 | Variable | Required | Default | Description |
 | -------- | -------- | ------- | ----------- |
-| `OLLAMA_GATEWAY_SECRET_KEY` | **Yes** | — | Secret key for signing session cookies. Use a long, random string. |
+| `GW42_SECRET_KEY` | **Yes** | — | Secret key for signing session cookies. Use a long, random string. |
 | `ADMIN_PASSWORD` | **Yes** | — | Password for the admin login page. |
 | `OLLAMA_URL` | No | `http://127.0.0.1:11434/api/chat` | Default Ollama endpoint. Can be overridden from the Settings page. |
 | `ADMIN_EMAIL` | No | `admin` | Admin account identifier shown in logs. |
-| `OLLAMA_GATEWAY_DB_PATH` | No | `./db/gateway.db` | Path to the SQLite database file. Avoid network-mounted filesystems. |
+| `GW42_DB_PATH` | No | `./db/gateway.db` | Path to the SQLite database file. Avoid network-mounted filesystems. |
 | `DEFAULT_RATE_LIMIT` | No | `10` | Default requests-per-minute for newly registered users. |
 | `SESSION_TIMEOUT` | No | `3600` | Admin session lifetime in seconds. |
 | `MAX_MESSAGE_LENGTH` | No | `10000` | Maximum characters stored per prompt or response in the audit log. |
@@ -335,7 +387,7 @@ Using a `.env` file:
 
 ```bash
 # .env
-OLLAMA_GATEWAY_SECRET_KEY=your-long-random-string
+GW42_SECRET_KEY=your-long-random-string
 ADMIN_PASSWORD=your-admin-password
 ADMIN_EMAIL=admin@example.com
 ```

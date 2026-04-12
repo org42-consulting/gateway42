@@ -1,8 +1,8 @@
 import os
 import sys
 
-SECRET_KEY = os.getenv('OLLAMA_GATEWAY_SECRET_KEY', '')
-DB_PATH = os.getenv('OLLAMA_GATEWAY_DB_PATH', './db/gateway.db')
+SECRET_KEY = os.getenv('GW42_SECRET_KEY', '')
+DB_PATH = os.getenv('GW42_DB_PATH', './db/gateway.db')
 OLLAMA_URL = os.getenv('OLLAMA_URL', 'http://127.0.0.1:11434/api/chat')
 ADMIN_EMAIL = os.getenv('ADMIN_EMAIL', 'admin')
 ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', '')
@@ -21,7 +21,7 @@ def validate_config() -> None:
     """Fail fast at startup if required environment variables are missing."""
     errors = []
     if not SECRET_KEY:
-        errors.append("OLLAMA_GATEWAY_SECRET_KEY must be set")
+        errors.append("GW42_SECRET_KEY must be set")
     if not ADMIN_PASSWORD:
         errors.append("ADMIN_PASSWORD must be set")
     if errors:

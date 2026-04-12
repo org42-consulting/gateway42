@@ -14,4 +14,4 @@ RUN mkdir -p db logs
 
 EXPOSE 7000
 
-CMD ["hypercorn", "routes:app", "--bind", "0.0.0.0:7000", "--workers", "2"]
+CMD ["hypercorn", "routes:app", "--bind", "0.0.0.0:7000", "--workers", "1"]

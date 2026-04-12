@@ -373,11 +373,11 @@ print(response.choices[0].message.content)</pre>
     <table class="help-table">
         <thead><tr><th>Variable</th><th>Required</th><th>Default</th><th>Description</th></tr></thead>
         <tbody>
-            <tr><td><code>OLLAMA_GATEWAY_SECRET_KEY</code></td><td>Yes</td><td>—</td><td>Secret key used to sign session cookies. Use a long, random string.</td></tr>
+            <tr><td><code>GW42_SECRET_KEY</code></td><td>Yes</td><td>—</td><td>Secret key used to sign session cookies. Use a long, random string.</td></tr>
             <tr><td><code>ADMIN_PASSWORD</code></td><td>Yes</td><td>—</td><td>Password for the admin login page.</td></tr>
             <tr><td><code>OLLAMA_URL</code></td><td>No</td><td><code>http://127.0.0.1:11434/api/chat</code></td><td>Default Ollama endpoint. Can be overridden via the Settings page.</td></tr>
             <tr><td><code>ADMIN_EMAIL</code></td><td>No</td><td><code>admin</code></td><td>Admin account identifier shown in logs.</td></tr>
-            <tr><td><code>OLLAMA_GATEWAY_DB_PATH</code></td><td>No</td><td><code>./db/gateway.db</code></td><td>Path to the SQLite database file.</td></tr>
+            <tr><td><code>GW42_DB_PATH</code></td><td>No</td><td><code>./db/gateway.db</code></td><td>Path to the SQLite database file.</td></tr>
             <tr><td><code>DEFAULT_RATE_LIMIT</code></td><td>No</td><td><code>10</code></td><td>Default requests-per-minute for newly registered users.</td></tr>
             <tr><td><code>SESSION_TIMEOUT</code></td><td>No</td><td><code>3600</code></td><td>Admin session lifetime in seconds.</td></tr>
             <tr><td><code>MAX_MESSAGE_LENGTH</code></td><td>No</td><td><code>10000</code></td><td>Maximum characters stored per prompt or response in the audit log.</td></tr>
@@ -423,7 +423,7 @@ print(response.choices[0].message.content)</pre>
 ollama serve   # or start it via the Ollama app
 
 # 2. Edit docker-compose.yml — set your secrets:
-#    OLLAMA_GATEWAY_SECRET_KEY — any long random string
+#    GW42_SECRET_KEY — any long random string
 #    ADMIN_PASSWORD            — your chosen admin password
 
 # 3. Build and start
@@ -431,6 +431,27 @@ docker compose up -d
 
 # 4. Open the admin UI
 open http://localhost:7000</pre>
+
+    <h3>Using a published image</h3>
+    <p>
+        To run Gateway42 without cloning the repository or building locally, replace the <code>build: .</code>
+        line in <code>docker-compose.yml</code> with an <code>image:</code> reference:
+    </p>
+    <pre>services:
+  gateway42:
+    image: ghcr.io/YOUR_ORG/gateway42:latest   # replace with the published image tag
+    # build: .  ← remove or comment out this line</pre>
+    <p>Store your secrets in a <code>.env</code> file in the same directory:</p>
+    <pre># .env
+GW42_SECRET_KEY=your-long-random-secret
+ADMIN_PASSWORD=your-admin-password</pre>
+    <p>Reference them in <code>docker-compose.yml</code>:</p>
+    <pre>    environment:
+      GW42_SECRET_KEY: "${GW42_SECRET_KEY}"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD}"</pre>
+    <p>Then pull and start:</p>
+    <pre>docker compose pull
+docker compose up -d</pre>
 
     <h3>Persistent data</h3>
     <p>Two named Docker volumes are created automatically:</p>
@@ -446,7 +467,7 @@ open http://localhost:7000</pre>
 docker run -d \
   -p 7000:7000 \
   --add-host=host.docker.internal:host-gateway \
-  -e OLLAMA_GATEWAY_SECRET_KEY="your-secret" \
+  -e GW42_SECRET_KEY="your-secret" \
   -e ADMIN_PASSWORD="your-password" \
   -e OLLAMA_URL="http://host.docker.internal:11434/api/chat" \
   -v gateway42-db:/gateway/db \
@@ -459,7 +480,11 @@ docker run -d \
     </p>
 
     <h3>Upgrading</h3>
+    <p><strong>If you built the image locally:</strong></p>
     <pre>docker compose build    # rebuild the gateway42 image
+docker compose up -d    # replace the running container</pre>
+    <p><strong>If you are using a published image:</strong></p>
+    <pre>docker compose pull     # fetch the latest image
 docker compose up -d    # replace the running container</pre>
     <p>The SQLite database schema is migrated automatically on startup — no manual steps required.</p>
 
@@ -469,7 +494,7 @@ docker compose up -d    # replace the running container</pre>
         in the project root and reference them with <code>${VARIABLE_NAME}</code>:
     </p>
     <pre># .env
-OLLAMA_GATEWAY_SECRET_KEY=your-long-random-string
+GW42_SECRET_KEY=your-long-random-string
 ADMIN_PASSWORD=your-admin-password
 ADMIN_EMAIL=admin@example.com</pre>
 </div>
@@ -490,7 +515,7 @@ ADMIN_EMAIL=admin@example.com</pre>
     <table class="help-table">
         <thead><tr><th>File</th><th>Purpose</th></tr></thead>
         <tbody>
-            <tr><td><code>k8s/secret.yaml</code></td><td>Stores <code>OLLAMA_GATEWAY_SECRET_KEY</code> and <code>ADMIN_PASSWORD</code> as a Kubernetes Secret.</td></tr>
+            <tr><td><code>k8s/secret.yaml</code></td><td>Stores <code>GW42_SECRET_KEY</code> and <code>ADMIN_PASSWORD</code> as a Kubernetes Secret.</td></tr>
             <tr><td><code>k8s/configmap.yaml</code></td><td>Non-sensitive configuration (Ollama URL, rate limits, log level, etc.).</td></tr>
             <tr><td><code>k8s/pvc.yaml</code></td><td>PersistentVolumeClaims for the database (1 Gi) and logs (2 Gi).</td></tr>
             <tr><td><code>k8s/deployment.yaml</code></td><td>The Deployment definition with health probes and resource limits.</td></tr>
@@ -509,7 +534,7 @@ docker push your-registry/gateway42:latest
 # 3. Set your secrets (edit k8s/secret.yaml before applying,
 #    or use kubectl create secret directly)
 kubectl create secret generic gateway42-secret \
-  --from-literal=OLLAMA_GATEWAY_SECRET_KEY="your-long-random-string" \
+  --from-literal=GW42_SECRET_KEY="your-long-random-string" \
   --from-literal=ADMIN_PASSWORD="your-admin-password"
 
 # 4. Apply all manifests
