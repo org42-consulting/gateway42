@@ -58,7 +58,7 @@
     </div>
 </div>
 
-<!-- User Management -->
+<!-- Registered Users -->
 <div class="card mb-6">
     <h2>Registered Users</h2>
     <p class="section-desc">New users are disabled by default. Click the status button to activate them.</p>
@@ -85,7 +85,7 @@
                 </td>
                 <td>
                     <form action="/admin/update-rate-limit/{{u.id}}" method="post" class="form-inline">
-                        <input type="number" name="rate_limit" value="{{ u.rate_limit }}" min="1" max="1000" class="input-sm">
+                        <input type="number" name="rate_limit" value="{{ u.rate_limit }}" min="1" max="1000" style="width: 60px; padding: 3px;">
                         <button type="submit" class="btn-small btn-ghost">Update</button>
                     </form>
                 </td>

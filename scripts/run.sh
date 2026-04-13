@@ -1,11 +1,10 @@
 #!/bin/bash
 
-# Ollama LAN AI Gateway - Run Script
-# This script starts the Ollama LAN AI Gateway application
-
 set -e  # Exit on any error
 
-echo "Starting Ollama Gateway..."
+echo
+echo ">>> Starting Gateway42."
+echo
 
 # Check if Python is available
 if ! command -v python3 &> /dev/null; then
@@ -30,3 +29,4 @@ echo "Starting gateway on port 7000. Access the admin interface at http://localh
 python3 app/app.py
 
 echo "Gateway stopped."
+echo
