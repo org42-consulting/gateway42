@@ -21,7 +21,7 @@
             <label>Port Number</label>
             <input type="number" name="port" value="{{ ollama_port }}" placeholder="e.g., 11434">
         </div>
-        <div style="display:flex; gap:10px; padding-top:4px;">
+        <div class="flex-row" style="padding-top:4px;">
             <button class="btn btn-primary" type="submit">Save Settings</button>
             <a href="/admin/ollama-test" class="btn btn-ghost">Test Connectivity</a>
         </div>
@@ -33,12 +33,12 @@
   Model Management Card
   ---------------------------------------------------------------------------->
 <style>.card-inactive { opacity:.45; pointer-events:none; }</style>
-<div class="card {% if not ollama_status %}card-inactive{% endif %}" style="margin-top:24px;">
+<div class="card card-mt {% if not ollama_status %}card-inactive{% endif %}">
     <h2>Model Management</h2>
 
     {% if ollama_model_details %}
-    <div style="padding:0; overflow:hidden; border-radius:var(--radius-sm) !important; margin-bottom:20px;">
-        <div style="overflow-x:auto;">
+    <div class="table-wrap" style="margin-bottom:20px;">
+        <div class="scroll-x">
             <table class="data-table ">
                 <thead>
                     <tr>
@@ -51,7 +51,7 @@
                     {% for m in ollama_model_details %}
                     <tr>
                         <td>{{ m.name }}</td>
-                        <td style="color:rgba(255,255,255,.45); font-size:.75rem;">{{ m.size }}</td>
+                        <td class="text-hint" style="white-space:normal;">{{ m.size }}</td>
                         <td>
                             <form action="/admin/ollama-delete-model" method="post"
                                   onsubmit="return confirm('Delete {{ m.name }}? This cannot be undone.');">
@@ -66,30 +66,27 @@
         </div>
     </div>
     {% else %}
-    <p style="font-size:.8125rem; color:rgba(255,255,255,.35); margin-bottom:16px;">No models installed.</p>
+    <p class="text-hint" style="margin-bottom:16px; white-space:normal;">No models installed.</p>
     {% endif %}
     
     <label>Download Model</label>
-      <p style="font-size:.8125rem; color:rgba(255,255,255,.45); ">
+      <p class="section-desc" style="margin-bottom:0;">
       Visit <a class="link" href="https://ollama.com/models" target="_blank">https://ollama.com/models</a> to find available models and their names. <br/>
       Enter the model name below to download it directly to your Ollama instance.
     </p>
-    <div style="display:flex; gap:10px; margin-top:6px;">
+    <div class="flex-row" style="margin-top:6px;">
         <input type="text" id="pull-model-name" placeholder="e.g., llama3.2:latest" style="max-width:320px;">
         <button class="btn btn-primary" id="pull-btn" type="button" onclick="startPull()">Pull</button>
     </div>
-    <div id="pull-status" style="display:none; margin-top:16px; padding:12px 14px;
-         background:rgba(255,255,255,.04); border:1px solid rgba(255,255,255,.08);
-         border-radius:var(--radius-sm);">
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-            <span id="pull-status-text" style="font-size:.8125rem; color:rgba(255,255,255,.65);"></span>
-            <span id="pull-pct" style="font-size:.75rem; font-weight:700; color:var(--ai-electric);"></span>
+    <div id="pull-status" class="pull-status">
+        <div class="pull-status-row">
+            <span id="pull-status-text" class="pull-status-text"></span>
+            <span id="pull-pct" class="pull-pct"></span>
         </div>
-        <div style="height:6px; background:rgba(255,255,255,.08); border-radius:3px; overflow:hidden;">
-            <div id="pull-progress-fill" style="height:100%; background:var(--ai-electric);
-                 border-radius:3px; width:0%; transition:width .3s ease;"></div>
+        <div class="pull-bar">
+            <div id="pull-progress-fill" class="pull-bar-fill"></div>
         </div>
-        <div id="pull-bytes" style="font-size:.75rem; color:rgba(255,255,255,.3); margin-top:6px;"></div>
+        <div id="pull-bytes" class="pull-bytes"></div>
     </div>
 </div>
 
@@ -192,7 +189,7 @@ function startPull() {
 <!----------------------------------------------------------------------------
   Change Admin Password Card
   ---------------------------------------------------------------------------->
-<div class="card" style="margin-top:24px;">
+<div class="card card-mt">
     <h2>Change Admin Password</h2>
     <form action="/admin/change-password" method="post" class="space-y-3">
         <div>
@@ -214,7 +211,7 @@ function startPull() {
 <!----------------------------------------------------------------------------
   Register New User Card
   ---------------------------------------------------------------------------->
-<div class="card" style="margin-top:24px;">
+<div class="card card-mt">
   <h2>Register New User</h2>
   <form action="/register" method="post" class="space-y-3">
       <div>
@@ -229,9 +226,9 @@ function startPull() {
 <!----------------------------------------------------------------------------
   Reset System Card
   ---------------------------------------------------------------------------->
-<div class="card" style="margin-top:24px; border-color:rgba(220,38,38,.25);">
-    <h2 style="color:#fca5a5;">Reset System</h2>
-    <p style="font-size:.8125rem; color:rgba(255,255,255,.45); margin-bottom:14px;">
+<div class="card card-mt card-danger">
+    <h2>Reset System</h2>
+    <p class="section-desc">
         Permanently deletes all audit logs and clears all rate-limit counters. Users and settings are not affected.
     </p>
     <form action="/admin/reset-system" method="post"

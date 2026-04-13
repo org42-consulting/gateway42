@@ -12,8 +12,8 @@
 <!-- Ollama Status -->
 <div id="ollama-status" class="card mb-6">
     <h2>Ollama Status</h2>
-    <div style="padding:0; overflow:hidden; border-radius:var(--radius-sm) !important;">
-        <div style="overflow-x:auto;">
+    <div class="table-wrap">
+        <div class="scroll-x">
             <table class="data-table ">
                 <thead>
                     <tr>
@@ -40,16 +40,13 @@
                         <td>Models</td>
                         <td>
                             {% if ollama_models %}
-                            <div style="display:flex; flex-wrap:wrap; gap:6px;">
+                            <div class="flex-row" style="gap:6px;">
                                 {% for model in ollama_models %}
-                                <span style="font-size:.75rem; font-weight:700; padding:3px 10px;
-                                    background:rgba(255,255,255,.08); border:1px solid rgba(255,255,255,.15);
-                                    border-radius:100px; color:rgba(255,255,255,.75);">{{ model }}
-                                </span>
+                                <span class="model-tag">{{ model }}</span>
                                 {% endfor %}
                             </div>
                             {% else %}
-                            <span style="font-size:.8125rem; font-weight:700; color:rgba(255,255,255,.35);">
+                            <span class="text-hint" style="font-weight:700;">
                                 {% if ollama_status %}No models found.{% else %}Unavailable — Ollama is not reachable.{% endif %}
                             </span>
                             {% endif %}
@@ -64,15 +61,13 @@
 <!-- User Management -->
 <div class="card mb-6">
     <h2>Registered Users</h2>
-    <p style="font-size:.8125rem; color:rgba(255,255,255,.45); margin-bottom:14px;">
-        New users are disabled by default. Click the status button to activate them.
-    </p>
+    <p class="section-desc">New users are disabled by default. Click the status button to activate them.</p>
     <div >
         <table id="users-table" class="data-table">
             <thead>
                 <tr>
                     <th>Email</th>
-                    <th style="min-width: 100px;max-width: 200px;">Status</th>
+                    <th style="min-width:100px; max-width:200px;">Status</th>
                     <th>Rate / min</th>
                     <th>Actions</th>
                 </tr>
@@ -82,25 +77,25 @@
             <tr>
                 <td>{{ u.email }}</td>
                 <td>
-                    <form action="/toggle/{{u.id}}" method="post" style="display:inline;">
-                        <button type="submit" class="badge {% if u.status=='active' %}badge-active{% else %}badge-disabled{% endif %}" style="cursor:pointer; ">
+                    <form action="/toggle/{{u.id}}" method="post" class="form-inline">
+                        <button type="submit" class="badge {% if u.status=='active' %}badge-active{% else %}badge-disabled{% endif %}">
                             {{ 'ACTIVE' if u.status=='active' else 'DISABLED' }}
                         </button>
                     </form>
                 </td>
                 <td>
-                    <form action="/admin/update-rate-limit/{{u.id}}" method="post" style="display:inline;">
-                        <input type="number" name="rate_limit" value="{{ u.rate_limit }}" min="1" max="1000" style="width:60px; padding:3px;">
-                        <button type="submit" class="btn btn-small">Update</button>
+                    <form action="/admin/update-rate-limit/{{u.id}}" method="post" class="form-inline">
+                        <input type="number" name="rate_limit" value="{{ u.rate_limit }}" min="1" max="1000" class="input-sm">
+                        <button type="submit" class="btn-small btn-ghost">Update</button>
                     </form>
                 </td>
                 <td>
-                    <div style="display:flex; gap:6px; flex-wrap:wrap;">
-                        <form action="/admin/reset/{{u.id}}" method="post" style="display:inline;">
-                            <button type="submit" class="btn btn-warning">New API Key</button>
+                    <div class="flex-row" style="gap:6px;">
+                        <form action="/admin/reset/{{u.id}}" method="post" class="form-inline">
+                            <button type="submit" class="btn-small btn-warning">New API Key</button>
                         </form>
-                        <a href="/export/{{u.id}}" class="btn btn-primary">Export CSV</a>
-                        <a href="/confirm-delete/{{u.id}}" class="btn btn-danger">Delete</a>
+                        <a href="/export/{{u.id}}" class="btn-small btn-primary">Export CSV</a>
+                        <a href="/confirm-delete/{{u.id}}" class="btn-small btn-danger">Delete</a>
                     </div>
                 </td>
             </tr>
@@ -113,7 +108,7 @@
 <!----------------------------------------------------------------------------
   Register New User Card
   ---------------------------------------------------------------------------->
-<div class="card" style="margin-top:24px;">
+<div class="card card-mt">
   <h2>Register New User</h2>
   <form action="/register" method="post" class="space-y-3">
       <div>
@@ -125,11 +120,9 @@
 </div>
 
 <!-- Reset System -->
-<div id="reset-system-card" class="card" style="margin-top:24px; border-color:rgba(220,38,38,.45); ">
-    <h2 style="color:#fca5a5;">Reset System</h2>
-    <p style="font-size:.8125rem; color:rgba(255,255,255,.45); margin-bottom:14px;">
-        Permanently deletes all audit logs and clears all rate-limit counters. Users and settings are not affected.
-    </p>
+<div id="reset-system-card" class="card card-mt card-danger">
+    <h2>Reset System</h2>
+    <p class="section-desc">Permanently deletes all audit logs and clears all rate-limit counters. Users and settings are not affected.</p>
     <form action="/admin/reset-system" method="post"
           onsubmit="return confirm('This will permanently delete all logs and reset all rate-limit counters. This cannot be undone. Continue?');">
         <input type="hidden" name="next" value="admin_panel">

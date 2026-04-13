@@ -1,4 +1,5 @@
 import asyncio
+import collections
 import csv
 import io
 import json
@@ -37,6 +38,31 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
 )
 logger = logging.getLogger(__name__)
+
+
+class _SystemLogHandler(logging.Handler):
+    """Keeps the last MAX_ENTRIES log records in memory for the admin UI."""
+    MAX_ENTRIES = 500
+
+    def __init__(self):
+        super().__init__()
+        self._buf: collections.deque = collections.deque(maxlen=self.MAX_ENTRIES)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        from datetime import datetime, timezone
+        self._buf.append({
+            "ts":    datetime.fromtimestamp(record.created, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
+            "level": record.levelname,
+            "name":  record.name,
+            "msg":   record.getMessage(),
+        })
+
+    def entries(self) -> list:
+        return list(self._buf)
+
+
+_syslog_handler = _SystemLogHandler()
+logging.getLogger().addHandler(_syslog_handler)
 
 app = Quart(__name__, static_folder=os.path.dirname(os.path.abspath(__file__)), static_url_path="")
 app.secret_key = SECRET_KEY
@@ -111,6 +137,7 @@ async def index():
 @app.route("/logout")
 async def logout():
     session.clear()
+    logger.info("Admin logged out")
     return redirect(url_for("index"))
 
 
@@ -160,6 +187,7 @@ async def admin_login():
 
         session["admin"] = True
         session.permanent = True
+        logger.info("Admin successfully logged in")
         return redirect(url_for("admin_panel"))
     except Exception as e:
         logger.error("Admin login error: %s", e)
@@ -482,11 +510,71 @@ async def admin_logs_data():
         return jsonify({"error": "Unauthorized"}), 401
     try:
         search = request.args.get("q", "").strip()
-        rows = [dict(r) for r in await asyncio.to_thread(get_logs, search)]
-        return jsonify({"logs": rows, "count": len(rows), "search": search})
+        page   = max(1, int(request.args.get("page", 1)))
+        rows   = [dict(r) for r in await asyncio.to_thread(get_logs, search, 10_000)]
+        total  = len(rows)
+        pages  = max(1, (total + 9) // 10)
+        page   = min(page, pages)
+        rows   = rows[(page - 1) * 10 : page * 10]
+        return jsonify({"logs": rows, "count": len(rows), "total": total,
+                        "page": page, "pages": pages, "search": search})
     except Exception as e:
         logger.error("Logs data error: %s", e)
         return jsonify({"error": "Internal server error"}), 500
+
+
+@app.route("/admin/logs/system")
+async def admin_system_logs():
+    """JSON endpoint: returns in-memory system log entries for the admin UI."""
+    if not session.get("admin"):
+        return jsonify({"error": "Unauthorized"}), 401
+    q      = request.args.get("q", "").strip().lower()
+    page   = max(1, int(request.args.get("page", 1)))
+    entries = _syslog_handler.entries()
+    entries.reverse()  # newest first
+    if q:
+        entries = [e for e in entries if q in e["msg"].lower()]
+    total  = len(entries)
+    pages  = max(1, (total + 9) // 10)
+    page   = min(page, pages)
+    entries = entries[(page - 1) * 10 : page * 10]
+    return jsonify({"logs": entries, "count": len(entries), "total": total,
+                    "page": page, "pages": pages, "search": q})
+
+
+@app.route("/admin/logs/system/export")
+async def admin_system_logs_export():
+    """Download in-memory system log entries as CSV."""
+    if not session.get("admin"):
+        return redirect(url_for("index"))
+    q = request.args.get("q", "").strip().lower()
+    entries = _syslog_handler.entries()
+    entries.reverse()
+    if q:
+        entries = [e for e in entries if q in e["msg"].lower()]
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["timestamp", "level", "logger", "message"])
+    for e in entries:
+        writer.writerow([e["ts"], e["level"], e["name"], e["msg"]])
+    return Response(
+        buf.getvalue(),
+        mimetype="text/csv",
+        headers={
+            "Content-Disposition": "attachment; filename=system_logs.csv",
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.route("/admin/logs/system/reset", methods=["POST"])
+async def admin_system_logs_reset():
+    """Clear the in-memory system log buffer."""
+    if not session.get("admin"):
+        return jsonify({"error": "Unauthorized"}), 401
+    _syslog_handler._buf.clear()
+    logger.info("System log buffer cleared by admin")
+    return jsonify({"ok": True})
 
 
 # ── CSV Export ─────────────────────────────────────────────────────────────────
@@ -505,6 +593,7 @@ async def export(uid):
             writer.writerow([r["id"], r["prompt"], r["response"], r["ts"]])
 
         session[f"exported_{uid}"] = True
+        logger.info("CSV log export for user %d", uid)
         return Response(
             buf.getvalue(),
             mimetype="text/csv",
@@ -514,7 +603,7 @@ async def export(uid):
             },
         )
     except Exception as e:
-        logger.error("Export error: %s", e)
+        logger.error("CSV export error: %s", e)
         return "Internal server error", 500
 
 
@@ -530,7 +619,7 @@ async def export_all_logs():
         writer.writerow(["log_id", "email", "model", "prompt", "response", "timestamp"])
         for r in rows:
             writer.writerow([r["id"], r["email"], r["model"], r["prompt"], r["response"], r["ts"]])
-
+        logger.info("CSV export of all logs")
         return Response(
             buf.getvalue(),
             mimetype="text/csv",
@@ -588,6 +677,7 @@ async def admin_reset_system():
 
 @app.route("/health")
 async def health():
+    logger.debug("Health check passed")
     return {"status": "ok"}
 
 
@@ -630,7 +720,8 @@ async def list_models():
 
 @app.route("/v1/chat/completions", methods=["POST"])
 async def chat_completions():
-    """OpenAI-compatible POST /v1/chat/completions.
+    """
+    OpenAI-compatible POST /v1/chat/completions.
 
     Handles both streaming (stream=true) and non-streaming requests.
     Auth: Authorization: Bearer <api_key>

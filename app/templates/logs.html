@@ -19,7 +19,7 @@
             {% if search %}
                 <a href="/admin/logs" class="btn btn-ghost">Clear</a>
             {% endif %}
-            <a href="/admin/export-logs" class="btn btn-ghost">Export CSV</a>
+            <a href="/admin/export-logs" class="btn btn-primary">Export CSV</a>
             <button type="submit" form="reset-system-form" class="btn btn-danger"
                     onclick="return confirm('This will permanently delete all logs and reset all rate-limit counters. This cannot be undone. Continue?')">Reset System</button>
             <div style="margin-left:auto; display:flex; align-items:center; gap:8px;">
@@ -34,8 +34,7 @@
                     <option value="30000">30s</option>
                     <option value="60000">60s</option>
                 </select>
-                <span id="refresh-indicator"
-                      style="font-size:.75rem; color:rgba(255,255,255,.35); white-space:nowrap;"></span>
+                <span id="refresh-indicator" style="font-size:.75rem; color:rgba(255,255,255,.35); white-space:nowrap;"></span>
             </div>
         </div>
     </form>
@@ -43,72 +42,97 @@
         <input type="hidden" name="next" value="admin_logs">
     </form>
 
-    {% if logs %}
-    <div id="logs-table" style="padding:0; overflow:hidden;border-radius: var(--radius-sm) !important;">
-        <div style="overflow-x:auto;">
-            <table class="data-table">
-                <thead>
-                    <tr>
-                        <th style="width:160px;">Time</th>
-                        <th style="width:160px;">User</th>
-                        <th style="width:160px;">Model</th>
-                        <th>Prompt</th>
-                        <th>Response</th>
-                    </tr>
-                </thead>
-                <tbody>
-                {% for row in logs %}
-                <tr>
-                    <td style="white-space:nowrap; color:rgba(255,255,255,.45); font-size:.75rem;">{{ row.ts[:19].replace('T',' ') }}</td>
-                    <td style="color:rgba(255,255,255,.65);">{{ row.email }}</td>
-                    <td style="color:rgba(255,255,255,.65); white-space:nowrap;">{{ row.model or '—' }}</td>
-                    <td style="max-width:320px;">
-                        <div style="max-height:60px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="{{ row.prompt }}">
-                            {{ row.prompt }}
-                        </div>
-                    </td>
-                    <td style="max-width:320px;">
-                        <div style="max-height:60px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="{{ row.response }}">
-                            {{ row.response }}
-                        </div>
-                    </td>
-                </tr>
-                {% endfor %}
-                </tbody>
-            </table>
+    <div id="logs-table" style="padding:0; overflow:hidden; border-radius:var(--radius-sm) !important;">
+        <div style="text-align:center; padding:40px; color:rgba(255,255,255,.35);">Loading…</div>
+    </div>
+    <div id="logs-pagination" style="display:flex; align-items:center; gap:6px; margin-top:12px; flex-wrap:wrap;"></div>
+    <p id="logs-count" style="font-size:.75rem; color:rgba(255,255,255,.35); margin-top:6px;"></p>
+
+</div>
+
+
+<div class="card" style="margin-top:24px;">
+    <h2>System Logs</h2>
+    <div style="display:flex; gap:10px; align-items:center; margin-bottom:20px; flex-wrap:wrap;">
+        <input type="text" id="syslog-search" placeholder="Search message…" style="max-width:400px;">
+        <button class="btn btn-primary" id="syslog-search-btn">Search</button>
+        <button class="btn btn-ghost" id="syslog-clear-btn" style="display:none;">Clear</button>
+        <a href="/admin/logs/system/export" id="syslog-export-btn" class="btn btn-primary">Export CSV</a>
+        <button class="btn btn-danger" id="syslog-reset-btn">Reset Logs</button>
+        <div style="margin-left:auto; display:flex; align-items:center; gap:8px;">
+            <label style="display:inline; margin:0; white-space:nowrap;">Auto-refresh:</label>
+            <select id="syslog-refresh-interval"
+                    style="background:rgba(255,255,255,.08); border:1px solid rgba(255,255,255,.15);
+                           border-radius:var(--radius-sm); padding:6px 10px; color:rgba(255,255,255,.9);
+                           font-family:'Mulish',sans-serif; font-size:.8125rem; cursor:pointer; outline:none;">
+                <option value="0">Off</option>
+                <option value="5000">5s</option>
+                <option value="10000" selected>10s</option>
+                <option value="30000">30s</option>
+                <option value="60000">60s</option>
+            </select>
+            <span id="syslog-refresh-indicator" style="font-size:.75rem; color:rgba(255,255,255,.35); white-space:nowrap;"></span>
         </div>
     </div>
-    <p id="logs-count" style="font-size:.75rem; color:rgba(255,255,255,.35); margin-top:10px;">
-        Showing {{ logs|length }} entr{{ 'y' if logs|length == 1 else 'ies' }}{% if not search %} (latest 200){% endif %}.
-    </p>
-    {% else %}
-    <div class="card" style="text-align:center; padding:40px; color:rgba(255,255,255,.35);">
-        {% if search %}No logs match <strong style="color:rgba(255,255,255,.6);">{{ search }}</strong>.{% else %}No logs yet.{% endif %}
-    </div>
-    {% endif %}
 
+    <div id="syslog-table" style="padding:0; overflow:hidden; border-radius:var(--radius-sm) !important;">
+        <div style="text-align:center; padding:40px; color:rgba(255,255,255,.35);">Loading…</div>
+    </div>
+    <div id="syslog-pagination" style="display:flex; align-items:center; gap:6px; margin-top:12px; flex-wrap:wrap;"></div>
+    <p id="syslog-count" style="font-size:.75rem; color:rgba(255,255,255,.35); margin-top:6px;"></p>
 </div>
 
 
 {% block scripts %}
 <script>
+// ── Shared pagination helper ───────────────────────────────────────────────────
+function buildPagination(paginationEl, page, pages, onPageChange) {
+    if (pages <= 1) { paginationEl.innerHTML = ''; return; }
+
+    const s = 'padding:4px 10px;border-radius:var(--radius-sm);cursor:pointer;font-size:.8125rem;' +
+              "font-family:'Mulish',sans-serif;border:1px solid rgba(255,255,255,.15);";
+    const btn = (label, p, active, disabled) => {
+        const style = s + (active   ? 'background:rgba(255,255,255,.18);color:rgba(255,255,255,.95);'
+                                    : 'background:rgba(255,255,255,.06);color:rgba(255,255,255,.55);');
+        return `<button style="${style}" data-page="${p}"${disabled ? ' disabled' : ''}>${label}</button>`;
+    };
+
+    const lo = Math.max(1, page - 2), hi = Math.min(pages, page + 2);
+    let html = btn('&#8592; Prev', page - 1, false, page <= 1);
+    if (lo > 1)        html += btn('1', 1, false, false);
+    if (lo > 2)        html += '<span style="color:rgba(255,255,255,.3);padding:0 4px;">…</span>';
+    for (let p = lo; p <= hi; p++) html += btn(p, p, p === page, false);
+    if (hi < pages-1)  html += '<span style="color:rgba(255,255,255,.3);padding:0 4px;">…</span>';
+    if (hi < pages)    html += btn(pages, pages, false, false);
+    html += btn('Next &#8594;', page + 1, false, page >= pages);
+
+    paginationEl.innerHTML = html;
+    paginationEl.querySelectorAll('button[data-page]').forEach(b => {
+        if (!b.disabled) b.addEventListener('click', () => onPageChange(+b.dataset.page));
+    });
+}
+
+// ── Request Logs ──────────────────────────────────────────────────────────────
 (function () {
-    const tableWrap = document.getElementById('logs-table');
-    const countEl   = document.getElementById('logs-count');
-    const select    = document.getElementById('refresh-interval');
-    const indicator = document.getElementById('refresh-indicator');
-    const searchEl  = document.getElementById('search-input');
+    const tableWrap  = document.getElementById('logs-table');
+    const paginEl    = document.getElementById('logs-pagination');
+    const countEl    = document.getElementById('logs-count');
+    const select     = document.getElementById('refresh-interval');
+    const indicator  = document.getElementById('refresh-indicator');
+    const searchEl   = document.getElementById('search-input');
 
     let timerId = null;
+    let currentPage = 1;
 
     function esc(str) {
-        return String(str)
-            .replace(/&/g, '&amp;').replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;')
+                          .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     }
 
-    function buildTable(logs) {
-        if (!logs.length) return '';
+    function buildTable(logs, q) {
+        if (!logs.length) return `<div style="text-align:center;padding:40px;color:rgba(255,255,255,.35);">${
+            q ? `No logs match <strong style="color:rgba(255,255,255,.6);">${esc(q)}</strong>.`
+              : 'No logs yet.'}</div>`;
         const rows = logs.map(r => {
             const ts = (r.ts || '').slice(0, 19).replace('T', ' ');
             return `<tr>
@@ -117,66 +141,163 @@
                 <td style="color:rgba(255,255,255,.65);white-space:nowrap;">${esc(r.model || '—')}</td>
                 <td style="max-width:320px;">
                     <div style="max-height:60px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
-                         title="${esc(r.prompt || '')}">${esc(r.prompt || '')}</div>
-                </td>
+                         title="${esc(r.prompt || '')}">${esc(r.prompt || '')}</div></td>
                 <td style="max-width:320px;">
                     <div style="max-height:60px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
-                         title="${esc(r.response || '')}">${esc(r.response || '')}</div>
-                </td>
+                         title="${esc(r.response || '')}">${esc(r.response || '')}</div></td>
             </tr>`;
         }).join('');
-        return `<div style="overflow-x:auto;">
-            <table class="data-table">
-                <thead><tr>
-                    <th style="width:160px;">Time</th>
-                    <th style="width:160px;">User</th>
-                    <th style="width:160px;">Model</th>
-                    <th>Prompt</th>
-                    <th>Response</th>
-                </tr></thead>
-                <tbody>${rows}</tbody>
-            </table>
-        </div>`;
+        return `<div style="overflow-x:auto;"><table class="data-table">
+            <thead><tr>
+                <th style="width:160px;">Time</th><th style="width:160px;">User</th>
+                <th style="width:160px;">Model</th><th>Prompt</th><th>Response</th>
+            </tr></thead><tbody>${rows}</tbody></table></div>`;
     }
+
+    function goTo(p) { currentPage = p; refresh(); }
 
     async function refresh() {
         const q = searchEl ? searchEl.value.trim() : '';
-        const url = '/admin/logs/data' + (q ? '?q=' + encodeURIComponent(q) : '');
+        const params = new URLSearchParams({ page: currentPage });
+        if (q) params.set('q', q);
         try {
-            const resp = await fetch(url);
+            const resp = await fetch('/admin/logs/data?' + params);
             if (!resp.ok) return;
             const data = await resp.json();
-
-            if (tableWrap) {
-                tableWrap.innerHTML = data.logs.length
-                    ? buildTable(data.logs)
-                    : '<div style="text-align:center;padding:40px;color:rgba(255,255,255,.35);">No logs yet.</div>';
-            }
+            if (tableWrap) tableWrap.innerHTML = buildTable(data.logs || [], q);
+            buildPagination(paginEl, data.page, data.pages, goTo);
             if (countEl) {
-                const n = data.count;
-                const suffix = n === 1 ? 'y' : 'ies';
-                countEl.textContent = `Showing ${n} entr${suffix}${data.search ? '' : ' (latest 200)'}.`;
+                const {total, page, pages} = data;
+                const from = (page - 1) * 10 + 1, to = Math.min(page * 10, total);
+                countEl.textContent = total
+                    ? `Showing ${from}–${to} of ${total} entr${total === 1 ? 'y' : 'ies'}.`
+                    : 'No entries.';
             }
             indicator.textContent = 'Updated ' + new Date().toLocaleTimeString();
-        } catch (_) {
-            indicator.textContent = 'Refresh failed';
-        }
+        } catch (_) { indicator.textContent = 'Refresh failed'; }
     }
 
     function applyInterval(ms) {
-        clearInterval(timerId);
-        timerId = null;
-        if (ms > 0) {
-            timerId = setInterval(refresh, ms);
-            indicator.textContent = 'Auto-refresh on';
-        } else {
-            indicator.textContent = '';
-        }
+        clearInterval(timerId); timerId = null;
+        if (ms > 0) { timerId = setInterval(refresh, ms); indicator.textContent = 'Auto-refresh on'; }
+        else indicator.textContent = '';
     }
 
-    select.addEventListener('change', () => applyInterval(parseInt(select.value, 10)));
+    // Reset to page 1 on new search
+    const form = document.querySelector('form[action="/admin/logs"]');
+    if (form) form.addEventListener('submit', () => { currentPage = 1; });
 
-    // Start with the default selected value (10 s)
+    select.addEventListener('change', () => applyInterval(parseInt(select.value, 10)));
+    refresh();
+    applyInterval(parseInt(select.value, 10));
+})();
+
+// ── System Logs ───────────────────────────────────────────────────────────────
+(function () {
+    const tableWrap  = document.getElementById('syslog-table');
+    const paginEl    = document.getElementById('syslog-pagination');
+    const countEl    = document.getElementById('syslog-count');
+    const select     = document.getElementById('syslog-refresh-interval');
+    const indicator  = document.getElementById('syslog-refresh-indicator');
+    const searchEl   = document.getElementById('syslog-search');
+    const searchBtn  = document.getElementById('syslog-search-btn');
+    const clearBtn   = document.getElementById('syslog-clear-btn');
+    const exportBtn  = document.getElementById('syslog-export-btn');
+    const resetBtn   = document.getElementById('syslog-reset-btn');
+
+    let timerId = null;
+    let currentQ = '';
+    let currentPage = 1;
+
+    function esc(str) {
+        return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;')
+                          .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    function levelColor(level) {
+        if (level === 'ERROR' || level === 'CRITICAL') return 'rgba(255,90,90,.85)';
+        if (level === 'WARNING') return 'rgba(255,190,60,.85)';
+        return 'rgba(255,255,255,.65)';
+    }
+
+    function buildTable(logs, q) {
+        if (!logs.length) return `<div style="text-align:center;padding:40px;color:rgba(255,255,255,.35);">${
+            q ? `No entries match <strong style="color:rgba(255,255,255,.6);">${esc(q)}</strong>.`
+              : 'No system log entries yet.'}</div>`;
+        const rows = logs.map(r => `<tr>
+            <td style="white-space:nowrap;color:rgba(255,255,255,.45);font-size:.75rem;">${esc(r.ts || '')}</td>
+            <td style="white-space:nowrap;color:${levelColor(r.level)};font-weight:600;">${esc(r.level || '')}</td>
+            <td style="color:rgba(255,255,255,.5);white-space:nowrap;">${esc(r.name || '')}</td>
+            <td>${esc(r.msg || '')}</td>
+        </tr>`).join('');
+        return `<div style="overflow-x:auto;"><table class="data-table">
+            <thead><tr>
+                <th style="width:160px;">Time</th><th style="width:90px;">Level</th>
+                <th style="width:200px;">Logger</th><th>Message</th>
+            </tr></thead><tbody>${rows}</tbody></table></div>`;
+    }
+
+    function updateExportUrl(q) {
+        exportBtn.href = '/admin/logs/system/export' + (q ? '?q=' + encodeURIComponent(q) : '');
+    }
+
+    function goTo(p) { currentPage = p; refresh(); }
+
+    async function refresh() {
+        const params = new URLSearchParams({ page: currentPage });
+        if (currentQ) params.set('q', currentQ);
+        try {
+            const resp = await fetch('/admin/logs/system?' + params);
+            if (!resp.ok) return;
+            const data = await resp.json();
+            if (tableWrap) tableWrap.innerHTML = buildTable(data.logs || [], currentQ);
+            buildPagination(paginEl, data.page, data.pages, goTo);
+            if (countEl) {
+                const {total, page} = data;
+                const from = (page - 1) * 10 + 1, to = Math.min(page * 10, total);
+                countEl.textContent = total
+                    ? `Showing ${from}–${to} of ${total} entr${total === 1 ? 'y' : 'ies'}.`
+                    : 'No entries.';
+            }
+            indicator.textContent = 'Updated ' + new Date().toLocaleTimeString();
+        } catch (_) { indicator.textContent = 'Refresh failed'; }
+    }
+
+    function applyInterval(ms) {
+        clearInterval(timerId); timerId = null;
+        if (ms > 0) { timerId = setInterval(refresh, ms); indicator.textContent = 'Auto-refresh on'; }
+        else indicator.textContent = '';
+    }
+
+    function doSearch() {
+        currentQ = searchEl.value.trim();
+        currentPage = 1;
+        clearBtn.style.display = currentQ ? '' : 'none';
+        updateExportUrl(currentQ);
+        refresh();
+    }
+
+    searchBtn.addEventListener('click', doSearch);
+    searchEl.addEventListener('keydown', e => { if (e.key === 'Enter') doSearch(); });
+
+    clearBtn.addEventListener('click', () => {
+        searchEl.value = ''; currentQ = ''; currentPage = 1;
+        clearBtn.style.display = 'none';
+        updateExportUrl('');
+        refresh();
+    });
+
+    resetBtn.addEventListener('click', async () => {
+        if (!confirm('This will permanently clear all in-memory system log entries. Continue?')) return;
+        try {
+            await fetch('/admin/logs/system/reset', { method: 'POST' });
+            currentPage = 1;
+            refresh();
+        } catch (_) { indicator.textContent = 'Reset failed'; }
+    });
+
+    select.addEventListener('change', () => applyInterval(parseInt(select.value, 10)));
+    refresh();
     applyInterval(parseInt(select.value, 10));
 })();
 </script>

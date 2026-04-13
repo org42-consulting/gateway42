@@ -424,7 +424,7 @@ ollama serve   # or start it via the Ollama app
 
 # 2. Edit docker-compose.yml — set your secrets:
 #    GW42_SECRET_KEY — any long random string
-#    ADMIN_PASSWORD            — your chosen admin password
+#    ADMIN_PASSWORD  — your chosen admin password
 
 # 3. Build and start
 docker compose up -d
@@ -594,6 +594,7 @@ kubectl rollout status deployment/gateway42</pre>
             <tr><td>Limit</td><td>500m</td><td>512 Mi</td></tr>
         </tbody>
     </table>
+    <p><br/></p>
     <p>Adjust these values in <code>k8s/deployment.yaml</code> to suit your cluster.</p>
 </div>
 

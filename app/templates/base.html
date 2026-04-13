@@ -2,7 +2,7 @@
 <html>
 <head>
     <script src="https://cdn.tailwindcss.com"></script>
-    <title>Gateway42</title>
+    <title>Gateway42.</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Mulish:wght@400;600;700;800&display=swap" />
     <style>
@@ -15,6 +15,7 @@
             --color-blue-2: #B9D9E0;
             --color-blue-3: #5F8C96;
             --color-red: rgba(220,38,38);
+            --color-orange: #fa5005;
             --radius-sm:   4px;
             --radius-md:   12px;
             --radius-lg:   26px;
@@ -58,6 +59,15 @@
             flex-direction: column;
         }
 
+        .header-logo {
+            height:40px; 
+            padding:4px 8px 4px 4px;
+            border-right:1px solid var(--color-orange);
+            /*
+            flex-shrink:0;
+            */
+        }
+
         .header-wordmark .brand {
             font-size: 14px;
             font-weight: 800;
@@ -69,6 +79,10 @@
             font-size: 11px;
             font-weight: 400;
             color: rgba(255,255,255,.55);
+            /*
+            font-style: italic;
+            color: var(--ai-electric);
+            */
         }
 
         /* ── Navigation sidebar ── */
@@ -79,7 +93,7 @@
             -webkit-backdrop-filter: blur(16px);
             padding: 20px 0;
             position: fixed;
-            top: 52px;
+            top: 48px;
             left: 0;
             bottom: 0;
             overflow-y: auto;
@@ -88,7 +102,7 @@
 
         .sidebar-nav {
             list-style: none;
-            padding: 0;
+            padding: 0px 0px 0px 0px;
             margin: 0;
         }
 
@@ -158,7 +172,10 @@
         .card h2 {
             font-size: 1.2rem;
             font-weight: 700;
+            /*
             color: #fff;
+            */
+            color: var(--ai-electric);
             margin-bottom: 20px;
         }
 
@@ -226,6 +243,19 @@
             text-decoration: none;
             transition: background .25s, box-shadow .25s;
             line-height: 1.4;
+        }
+
+        .btn-small {
+            display: inline-block;
+            font-family: 'Mulish', sans-serif;
+            font-size: .8125rem;
+            font-weight: 700;
+            border: none;
+            cursor: pointer;
+            border-radius: var(--radius-sm);
+            padding: 4px 8px;
+            text-decoration: none;
+            transition: background .25s, box-shadow .25s;
         }
 
         .btn-primary {
@@ -305,6 +335,7 @@
             border-radius: 100px;
             font-size: .6875rem;
             font-weight: 700;
+            cursor: pointer;
         }
 
         .badge-active {
@@ -343,6 +374,83 @@
             border: 1px solid rgba(0,180,216,.3);
             color: var(--ai-electric);
         }
+
+        /* ── Layout utilities ── */
+        .ml-auto      { margin-left: auto; }
+        .content-wrap { max-width: 80%; margin: 0 auto; }
+        .centered-page { min-height: 60vh; display: flex; align-items: center; justify-content: center; }
+        .flex-row     { display: flex; gap: 10px; flex-wrap: wrap; }
+
+        /* ── Card variants ── */
+        .card-mt     { margin-top: 24px; }
+        .card-danger { border-color: rgba(220,38,38,.4); }
+        .card-danger h2 { color: #fca5a5; }
+
+        /* ── Help sections ── */
+        .help-section { margin-top: 24px; }
+
+        /* ── Tables ── */
+        .table-wrap  { padding: 0; overflow: hidden; border-radius: var(--radius-sm); }
+        .scroll-x    { overflow-x: auto; }
+        .table-empty { text-align: center; padding: 40px; color: rgba(255,255,255,.35); }
+        .table-count { font-size: .75rem; color: rgba(255,255,255,.35); margin-top: 6px; }
+
+        /* ── Toolbar ── */
+        .toolbar       { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 20px; }
+        .toolbar-right { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+
+        /* ── Form controls ── */
+        label.inline { display: inline; margin: 0; white-space: nowrap; }
+        .select-sm {
+            background: rgba(255,255,255,.08);
+            border: 1px solid rgba(255,255,255,.15);
+            border-radius: var(--radius-sm);
+            padding: 6px 10px;
+            color: rgba(255,255,255,.9);
+            font-family: 'Mulish', sans-serif;
+            font-size: .8125rem;
+            cursor: pointer;
+            outline: none;
+        }
+        .form-inline { display: inline; }
+        .input-sm    { width: 60px; padding: 3px; }
+
+        /* ── Pagination ── */
+        .pagination { display: flex; align-items: center; gap: 6px; margin-top: 12px; flex-wrap: wrap; }
+
+        /* ── Text utilities ── */
+        .text-hint    { font-size: .75rem; color: rgba(255,255,255,.35); white-space: nowrap; }
+        .section-desc { font-size: .8125rem; color: rgba(255,255,255,.45); margin-bottom: 14px; }
+
+        /* ── Model tags ── */
+        .model-tag {
+            font-size: .75rem;
+            font-weight: 700;
+            padding: 3px 10px;
+            background: rgba(255,255,255,.08);
+            border: 1px solid rgba(255,255,255,.15);
+            border-radius: 100px;
+            color: rgba(255,255,255,.75);
+        }
+
+        /* ── Dialog card ── */
+        .dialog-card { width: 100%; max-width: 480px; }
+
+        /* ── Pull progress widget ── */
+        .pull-status {
+            display: none;
+            margin-top: 16px;
+            padding: 12px 14px;
+            background: rgba(255,255,255,.04);
+            border: 1px solid rgba(255,255,255,.08);
+            border-radius: var(--radius-sm);
+        }
+        .pull-status-row  { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+        .pull-status-text { font-size: .8125rem; color: rgba(255,255,255,.65); }
+        .pull-pct         { font-size: .75rem; font-weight: 700; color: var(--ai-electric); }
+        .pull-bar         { height: 6px; background: rgba(255,255,255,.08); border-radius: 3px; overflow: hidden; }
+        .pull-bar-fill    { height: 100%; background: var(--ai-electric); border-radius: 3px; width: 0%; transition: width .3s ease; }
+        .pull-bytes       { font-size: .75rem; color: rgba(255,255,255,.3); margin-top: 6px; }
     </style>
 </head>
 
@@ -360,12 +468,12 @@
     <!-- Header Bar -->
     <header>
         <div class="header-inner">
-            <img src="/images/gw42-white-transparent.png" alt="Gateway42" style="height:44px; padding-top: 8px;padding-bottom: 8px;padding-right:4px; border-right:1px solid #fa5005; flex-shrink:0;">
+            <img src="/images/net-logo.png" alt="Gateway42." class="header-logo">
             <div class="header-wordmark">
                 <span class="brand">Gateway42.</span>
                 <span class="tagline">An opinionated gateway for Ollama.</span>
             </div>
-            <div style="margin-left:auto;">
+            <div class="ml-auto">
                 <form action="/logout" method="get">
                     <button class="btn btn-danger">Logout</button>
                 </form>
@@ -375,7 +483,7 @@
 
     <!-- Main content -->
     <main class="main-content">
-        <div style="max-width:80%; margin:0 auto;">
+        <div class="content-wrap">
             {% block content %}{% endblock %}
         </div>
     </main>
