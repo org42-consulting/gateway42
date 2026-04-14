@@ -1,4 +1,4 @@
-<!doctype html>
+{{define "base.html"}}<!doctype html>
 <html>
 <head>
     <script src="https://cdn.tailwindcss.com"></script>
@@ -34,7 +34,6 @@
                 #0c4a6e;
         }
 
-
         /* ── Header ── */
         header {
             position: fixed;
@@ -60,7 +59,7 @@
         }
 
         .header-logo {
-            height:40px; 
+            height:40px;
             padding:4px 8px 4px 4px;
             border-right: 1px solid var(--color-blue-3)
         }
@@ -76,10 +75,6 @@
             font-size: 11px;
             font-weight: 400;
             color: rgba(255,255,255,.55);
-            /*
-            font-style: italic;
-            color: var(--ai-electric);
-            */
         }
 
         /* ── Navigation sidebar ── */
@@ -150,7 +145,6 @@
         .card-light {
             backdrop-filter: blur(8px);
             -webkit-backdrop-filter: blur(8px);
-
             padding: 24px;
             transition: border-color .2s, box-shadow .2s;
         }
@@ -169,9 +163,6 @@
         .card h2 {
             font-size: 1.2rem;
             font-weight: 700;
-            /*
-            color: #fff;
-            */
             color: var(--ai-electric);
             margin-bottom: 20px;
         }
@@ -218,8 +209,6 @@
             border-color: var(--ai-electric);
             box-shadow: 0 0 0 2px rgba(0,180,216,.2);
         }
-
-        input .input-sm { width: 60px; padding: 3px; }
 
         label {
             display: block;
@@ -456,10 +445,10 @@
     <!-- Navigation sidebar -->
     <nav class="sidebar">
         <ul class="sidebar-nav">
-            <li><a href="/admin/panel" class="{{ 'active' if request.path == '/admin/panel' else '' }}">Dashboard</a></li>
-            <li><a href="/admin/settings-page" class="{{ 'active' if request.path == '/admin/settings-page' else '' }}">Settings</a></li>
-            <li><a href="/admin/logs" class="{{ 'active' if request.path.startswith('/admin/logs') else '' }}">Logs</a></li>
-            <li><a href="/admin/help" class="{{ 'active' if request.path == '/admin/help' else '' }}">Help</a></li>
+            <li><a href="/admin/panel" class="{{if eq .CurrentPath "/admin/panel"}}active{{end}}">Dashboard</a></li>
+            <li><a href="/admin/settings-page" class="{{if eq .CurrentPath "/admin/settings-page"}}active{{end}}">Settings</a></li>
+            <li><a href="/admin/logs" class="{{if hasPrefix .CurrentPath "/admin/logs"}}active{{end}}">Logs</a></li>
+            <li><a href="/admin/help" class="{{if eq .CurrentPath "/admin/help"}}active{{end}}">Help</a></li>
         </ul>
     </nav>
 
@@ -482,9 +471,9 @@
     <!-- Main content -->
     <main class="main-content">
         <div class="content-wrap">
-            {% block content %}{% endblock %}
+            {{block "content" .}}{{end}}
         </div>
     </main>
-    {% block scripts %}{% endblock %}
+    {{block "scripts" .}}{{end}}
 </body>
-</html>
+</html>{{end}}

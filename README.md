@@ -62,7 +62,6 @@ flowchart LR
 ollama serve
 
 # 2. Edit docker-compose.yml — set your secrets:
-#    GW42_SECRET_KEY  — any long random string
 #    ADMIN_PASSWORD   — your chosen admin password
 
 # 3. Build and start
@@ -93,7 +92,6 @@ Set your secrets in a `.env` file in the same directory:
 
 ```bash
 # .env
-GW42_SECRET_KEY=your-long-random-secret
 ADMIN_PASSWORD=your-admin-password
 ```
 
@@ -101,7 +99,6 @@ And reference them in `docker-compose.yml`:
 
 ```yaml
     environment:
-      GW42_SECRET_KEY: "${GW42_SECRET_KEY}"
       ADMIN_PASSWORD: "${ADMIN_PASSWORD}"
 ```
 
@@ -129,7 +126,6 @@ docker build -t gateway42:latest .
 docker run -d \
   -p 7000:7000 \
   --add-host=host.docker.internal:host-gateway \
-  -e GW42_SECRET_KEY="your-secret" \
   -e ADMIN_PASSWORD="your-password" \
   -e OLLAMA_URL="http://host.docker.internal:11434/api/chat" \
   -v gateway42-db:/gateway/db \
@@ -163,57 +159,6 @@ The SQLite schema migrates automatically on startup — no manual steps needed.
 Inside a Docker container, `localhost` refers to the container itself. Gateway42 uses `host.docker.internal` to reach Ollama on the host:
 - **macOS / Windows** — Docker Desktop provides this automatically.
 - **Linux** — the `extra_hosts: host.docker.internal:host-gateway` entry in `docker-compose.yml` handles this. No extra setup needed.
-
-
-## Kubernetes deployment
-
-Ready-to-use manifests are in the `k8s/` directory. They deploy Gateway42 as a single-replica Deployment backed by PersistentVolumeClaims.
-
-| File | Purpose |
-| ---- | ------- |
-| `k8s/secret.yaml` | `GW42_SECRET_KEY` and `ADMIN_PASSWORD` as a Kubernetes Secret |
-| `k8s/configmap.yaml` | Non-sensitive config (Ollama URL, rate limits, log level, etc.) |
-| `k8s/pvc.yaml` | PersistentVolumeClaims: database (1 Gi) and logs (2 Gi) |
-| `k8s/deployment.yaml` | Deployment with health probes and resource limits |
-| `k8s/service.yaml` | ClusterIP Service on port 80 and Ingress resource |
-
-```bash
-# 1. Build and push your image
-docker build -t your-registry/gateway42:latest .
-docker push your-registry/gateway42:latest
-
-# 2. Update the image reference in k8s/deployment.yaml
-
-# 3. Create secrets
-kubectl create secret generic gateway42-secret \
-  --from-literal=GW42_SECRET_KEY="your-long-random-string" \
-  --from-literal=ADMIN_PASSWORD="your-admin-password"
-
-# 4. Apply manifests
-kubectl apply -f k8s/configmap.yaml
-kubectl apply -f k8s/pvc.yaml
-kubectl apply -f k8s/deployment.yaml
-kubectl apply -f k8s/service.yaml
-
-# 5. Check rollout
-kubectl rollout status deployment/gateway42
-```
-
-**Accessing the UI:** The Service is a `ClusterIP` on port 80. Options for external access:
-- Change `type: LoadBalancer` in `k8s/service.yaml`, or
-- Configure the Ingress with your domain and an ingress controller, or
-- Port-forward locally: `kubectl port-forward svc/gateway42 7000:80`
-
-**Connecting to Ollama:** The default `OLLAMA_URL` in `k8s/configmap.yaml` points to `http://ollama:11434/api/chat` (assumes Ollama is a Service named `ollama` in the same namespace). You can override this from the Settings page at any time.
-
-**Scaling:** Gateway42 uses SQLite, which supports one writer at a time. Keep `replicas: 1` and scale at the Ollama level instead.
-
-**Resource limits** (defaults in `k8s/deployment.yaml`):
-
-| | CPU | Memory |
-|---|---|---|
-| Request | 100m | 128 Mi |
-| Limit | 500m | 512 Mi |
 
 
 ## API reference
@@ -371,7 +316,6 @@ Set these environment variables before starting Gateway42. Variables marked **re
 
 | Variable | Required | Default | Description |
 | -------- | -------- | ------- | ----------- |
-| `GW42_SECRET_KEY` | **Yes** | — | Secret key for signing session cookies. Use a long, random string. |
 | `ADMIN_PASSWORD` | **Yes** | — | Password for the admin login page. |
 | `OLLAMA_URL` | No | `http://127.0.0.1:11434/api/chat` | Default Ollama endpoint. Can be overridden from the Settings page. |
 | `ADMIN_EMAIL` | No | `admin` | Admin account identifier shown in logs. |
@@ -387,7 +331,6 @@ Using a `.env` file:
 
 ```bash
 # .env
-GW42_SECRET_KEY=your-long-random-string
 ADMIN_PASSWORD=your-admin-password
 ADMIN_EMAIL=admin@example.com
 ```

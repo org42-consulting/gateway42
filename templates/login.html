@@ -1,4 +1,4 @@
-<!doctype html>
+{{define "login.html"}}<!doctype html>
 <html>
 <head>
     <script src="https://cdn.tailwindcss.com"></script>
@@ -107,14 +107,12 @@
         <img src="/images/gw42.png" alt="Gateway42" style="width:300px;">
         <label style="margin-bottom:26px;">An opinionated gateway for Ollama.</label>
         <div class="card">
-            <h1 style="font-size:1.25rem; font-weight:800; color:#fff; ">Admin Login</h1>
+            <h1 style="font-size:1.25rem; font-weight:800; color:#fff;">Admin Login</h1>
             <p style="font-size:.8125rem; color:rgba(255,255,255,.45); margin-bottom:20px;">Warning: Admin access only.</p>
 
-            {% with messages = get_flashed_messages(with_categories=true) %}
-            {% for category, message in messages %}
-                <div class="flash flash-{{ 'error' if category == 'error' else 'success' }}">{{ message }}</div>
-            {% endfor %}
-            {% endwith %}
+            {{range .Flashes}}
+            <div class="flash flash-{{.Category}}">{{.Message}}</div>
+            {{end}}
 
             <form action="/admin" method="post" class="space-y-4">
                 <div>
@@ -126,4 +124,4 @@
         </div>
     </div>
 </body>
-</html>
+</html>{{end}}

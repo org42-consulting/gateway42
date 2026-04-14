@@ -1,7 +1,4 @@
-{% extends "base.html" %}
-
-{% block content %}
-
+{{define "content"}}
 
 <style>
     .help-section { margin-bottom: 32px; }
@@ -74,10 +71,7 @@
     .pill-post { background: rgba(251,191,36,.15);  color: #fbbf24; border: 1px solid rgba(251,191,36,.3); }
 </style>
 
-
-<!----------------------------------------------------------------------------
-  Overview
-  ---------------------------------------------------------------------------->
+<!-- Overview -->
 <div class="card help-section">
     <h2>Overview</h2>
     <p>
@@ -93,10 +87,7 @@
     </ul>
 </div>
 
-
-<!----------------------------------------------------------------------------
-  Dashboard
-  ---------------------------------------------------------------------------->
+<!-- Dashboard -->
 <div class="card help-section" style="margin-top:24px;">
     <h2>Dashboard</h2>
     <p>The Dashboard is the main landing page after login. It shows two panels:</p>
@@ -113,7 +104,7 @@
     <table class="help-table">
         <thead><tr><th>Column / Action</th><th>Description</th></tr></thead>
         <tbody>
-            <tr><td>Email</td><td>The user's registered email address. Used as the username.</td></tr>
+            <tr><td>Client Name</td><td>A unique name identifying the client. Used as the account identifier.</td></tr>
             <tr><td>Status</td><td>
                 Clicking the status badge toggles the user between <strong>ACTIVE</strong> and <strong>DISABLED</strong>.
                 Only active users can make API requests. Newly registered users start as <strong>DISABLED</strong>.
@@ -139,7 +130,7 @@
 
     <h3>Register New User</h3>
     <p>
-        Enter an email address and click <em>Register User</em>. A unique API key is generated automatically
+        Enter a client name and click <em>Register User</em>. A unique API key is generated automatically
         and displayed on the next page. The user starts in <strong>DISABLED</strong> status — activate them
         manually once you have shared their API key securely.
     </p>
@@ -152,10 +143,7 @@
     </p>
 </div>
 
-
-<!----------------------------------------------------------------------------
-  Settings
-  ---------------------------------------------------------------------------->
+<!-- Settings -->
 <div class="card help-section" style="margin-top:24px;">
     <h2>Settings</h2>
 
@@ -202,10 +190,7 @@
     <p>Same as the Reset System action on the Dashboard — see above for details.</p>
 </div>
 
-
-<!----------------------------------------------------------------------------
-  Logs
-  ---------------------------------------------------------------------------->
+<!-- Logs -->
 <div class="card help-section" style="margin-top:24px;">
     <h2>Logs</h2>
     <p>
@@ -218,7 +203,7 @@
         <thead><tr><th>Column</th><th>Description</th></tr></thead>
         <tbody>
             <tr><td>Time</td><td>UTC timestamp of the request (YYYY-MM-DD HH:MM:SS).</td></tr>
-            <tr><td>User</td><td>Email address of the user whose API key was used.</td></tr>
+            <tr><td>Client</td><td>Name of the client whose API key was used.</td></tr>
             <tr><td>Model</td><td>The Ollama model name specified in the request. Shows <em>—</em> for older entries recorded before model tracking was added.</td></tr>
             <tr><td>Prompt</td><td>The full message list sent to the model, truncated for display. Hover to see more.</td></tr>
             <tr><td>Response</td><td>The model's reply, truncated for display. Streaming responses are recorded as <em>streamed</em>.</td></tr>
@@ -227,7 +212,7 @@
 
     <h3>Search</h3>
     <p>
-        The search field filters logs by prompt text, response text, or user email. Results update on
+        The search field filters logs by prompt text, response text, or client name. Results update on
         submission. Click <em>Clear</em> to reset the filter.
     </p>
 
@@ -240,17 +225,14 @@
     <h3>Export CSV</h3>
     <p>
         Downloads <strong>all</strong> log entries (not just the current 200) as a CSV file with columns:
-        <code>log_id</code>, <code>email</code>, <code>model</code>, <code>prompt</code>, <code>response</code>, <code>timestamp</code>.
+        <code>log_id</code>, <code>client_name</code>, <code>model</code>, <code>prompt</code>, <code>response</code>, <code>timestamp</code>.
     </p>
 
     <h3>Reset System</h3>
     <p>Same as the Reset System action on the Dashboard — clears all logs. Requires confirmation.</p>
 </div>
 
-
-<!----------------------------------------------------------------------------
-  API Usage
-  ---------------------------------------------------------------------------->
+<!-- API Usage -->
 <div class="card help-section" style="margin-top:24px;">
     <h2>API Usage</h2>
     <p>
@@ -345,10 +327,7 @@ print(response.choices[0].message.content)</pre>
     </table>
 </div>
 
-
-<!----------------------------------------------------------------------------
-  Rate Limiting
-  ---------------------------------------------------------------------------->
+<!-- Rate Limiting -->
 <div class="card help-section" style="margin-top:24px;">
     <h2>Rate Limiting</h2>
     <p>
@@ -363,34 +342,26 @@ print(response.choices[0].message.content)</pre>
     </ul>
 </div>
 
-
-<!----------------------------------------------------------------------------
-  Configuration
-  ---------------------------------------------------------------------------->
+<!-- Configuration -->
 <div class="card help-section" style="margin-top:24px;">
     <h2>Configuration</h2>
     <p>Gateway42 is configured via environment variables. The two marked <strong>required</strong> must be set or the application will refuse to start.</p>
     <table class="help-table">
         <thead><tr><th>Variable</th><th>Required</th><th>Default</th><th>Description</th></tr></thead>
         <tbody>
-            <tr><td><code>GW42_SECRET_KEY</code></td><td>Yes</td><td>—</td><td>Secret key used to sign session cookies. Use a long, random string.</td></tr>
             <tr><td><code>ADMIN_PASSWORD</code></td><td>Yes</td><td>—</td><td>Password for the admin login page.</td></tr>
             <tr><td><code>OLLAMA_URL</code></td><td>No</td><td><code>http://127.0.0.1:11434/api/chat</code></td><td>Default Ollama endpoint. Can be overridden via the Settings page.</td></tr>
-            <tr><td><code>ADMIN_EMAIL</code></td><td>No</td><td><code>admin</code></td><td>Admin account identifier shown in logs.</td></tr>
             <tr><td><code>GW42_DB_PATH</code></td><td>No</td><td><code>./db/gateway.db</code></td><td>Path to the SQLite database file.</td></tr>
             <tr><td><code>DEFAULT_RATE_LIMIT</code></td><td>No</td><td><code>10</code></td><td>Default requests-per-minute for newly registered users.</td></tr>
             <tr><td><code>SESSION_TIMEOUT</code></td><td>No</td><td><code>3600</code></td><td>Admin session lifetime in seconds.</td></tr>
             <tr><td><code>MAX_MESSAGE_LENGTH</code></td><td>No</td><td><code>10000</code></td><td>Maximum characters stored per prompt or response in the audit log.</td></tr>
-            <tr><td><code>LOG_LEVEL</code></td><td>No</td><td><code>INFO</code></td><td>Python logging level (<code>DEBUG</code>, <code>INFO</code>, <code>WARNING</code>, <code>ERROR</code>).</td></tr>
-            <tr><td><code>LOG_FILE</code></td><td>No</td><td><code>./logs/gateway.log</code></td><td>Path to the application log file.</td></tr>
-            <tr><td><code>DEBUG</code></td><td>No</td><td><code>false</code></td><td>Set to <code>true</code> to enable Quart debug mode. Do not use in production.</td></tr>
+            <tr><td><code>LOG_LEVEL</code></td><td>No</td><td><code>INFO</code></td><td>Logging level (<code>DEBUG</code>, <code>INFO</code>).</td></tr>
+            <tr><td><code>LOG_FILE</code></td><td>No</td><td><code>./logs/gateway.log</code></td><td>Path to the application log file (directory is created automatically).</td></tr>
         </tbody>
     </table>
 </div>
 
-<!----------------------------------------------------------------------------
-  Deployment — Docker
-  ---------------------------------------------------------------------------->
+<!-- Deployment -->
 <div class="card help-section" style="margin-top:24px;">
     <h2>Running with Docker</h2>
     <p>
@@ -399,31 +370,11 @@ print(response.choices[0].message.content)</pre>
         (the default Ollama port). The container reaches the host via <code>host.docker.internal</code>.
     </p>
 
-    <h3>Prerequisites</h3>
-    <ul>
-        <li><a class="link" href="https://docs.docker.com/get-docker/" target="_blank">Docker</a> 24 or later.</li>
-        <li><a class="link" href="https://docs.docker.com/compose/" target="_blank">Docker Compose</a> v2 (bundled with Docker Desktop).</li>
-        <li>Ollama installed and running on the host: <a class="link" href="https://ollama.com/download" target="_blank">ollama.com/download</a>.</li>
-    </ul>
-
-    <h3>How host networking works</h3>
-    <p>
-        Inside a Docker container, <code>localhost</code> refers to the container itself — not the machine
-        running Docker. Gateway42 uses <code>host.docker.internal</code> instead, which Docker resolves to
-        the host's IP address:
-    </p>
-    <ul>
-        <li><strong>macOS / Windows</strong> — Docker Desktop provides <code>host.docker.internal</code> automatically.</li>
-        <li><strong>Linux</strong> — the <code>extra_hosts: host.docker.internal:host-gateway</code> entry in
-            <code>docker-compose.yml</code> adds the same mapping. No extra setup needed.</li>
-    </ul>
-
     <h3>Quick start</h3>
     <pre># 1. Make sure Ollama is running on the host
-ollama serve   # or start it via the Ollama app
+ollama serve
 
 # 2. Edit docker-compose.yml — set your secrets:
-#    GW42_SECRET_KEY — any long random string
 #    ADMIN_PASSWORD  — your chosen admin password
 
 # 3. Build and start
@@ -432,27 +383,6 @@ docker compose up -d
 # 4. Open the admin UI
 open http://localhost:7000</pre>
 
-    <h3>Using a published image</h3>
-    <p>
-        To run Gateway42 without cloning the repository or building locally, replace the <code>build: .</code>
-        line in <code>docker-compose.yml</code> with an <code>image:</code> reference:
-    </p>
-    <pre>services:
-  gateway42:
-    image: ghcr.io/YOUR_ORG/gateway42:latest   # replace with the published image tag
-    # build: .  ← remove or comment out this line</pre>
-    <p>Store your secrets in a <code>.env</code> file in the same directory:</p>
-    <pre># .env
-GW42_SECRET_KEY=your-long-random-secret
-ADMIN_PASSWORD=your-admin-password</pre>
-    <p>Reference them in <code>docker-compose.yml</code>:</p>
-    <pre>    environment:
-      GW42_SECRET_KEY: "${GW42_SECRET_KEY}"
-      ADMIN_PASSWORD: "${ADMIN_PASSWORD}"</pre>
-    <p>Then pull and start:</p>
-    <pre>docker compose pull
-docker compose up -d</pre>
-
     <h3>Persistent data</h3>
     <p>Two named Docker volumes are created automatically:</p>
     <ul>
@@ -460,142 +390,6 @@ docker compose up -d</pre>
         <li><code>gateway42-logs</code> — application log files.</li>
     </ul>
     <p>Data survives container restarts and upgrades. To wipe everything: <code>docker compose down -v</code>.</p>
-
-    <h3>Run without Compose</h3>
-    <pre>docker build -t gateway42:latest .
-
-docker run -d \
-  -p 7000:7000 \
-  --add-host=host.docker.internal:host-gateway \
-  -e GW42_SECRET_KEY="your-secret" \
-  -e ADMIN_PASSWORD="your-password" \
-  -e OLLAMA_URL="http://host.docker.internal:11434/api/chat" \
-  -v gateway42-db:/gateway/db \
-  -v gateway42-logs:/gateway/logs \
-  --name gateway42 \
-  gateway42:latest</pre>
-    <p>
-        The <code>--add-host</code> flag is required on Linux. On macOS and Windows with Docker Desktop
-        it is optional but harmless.
-    </p>
-
-    <h3>Upgrading</h3>
-    <p><strong>If you built the image locally:</strong></p>
-    <pre>docker compose build    # rebuild the gateway42 image
-docker compose up -d    # replace the running container</pre>
-    <p><strong>If you are using a published image:</strong></p>
-    <pre>docker compose pull     # fetch the latest image
-docker compose up -d    # replace the running container</pre>
-    <p>The SQLite database schema is migrated automatically on startup — no manual steps required.</p>
-
-    <h3>Environment variables</h3>
-    <p>
-        Set variables directly in <code>docker-compose.yml</code>, or use a <code>.env</code> file
-        in the project root and reference them with <code>${VARIABLE_NAME}</code>:
-    </p>
-    <pre># .env
-GW42_SECRET_KEY=your-long-random-string
-ADMIN_PASSWORD=your-admin-password
-ADMIN_EMAIL=admin@example.com</pre>
 </div>
 
-
-<!----------------------------------------------------------------------------
-  Deployment — Kubernetes
-  ---------------------------------------------------------------------------->
-<div class="card help-section" style="margin-top:24px;">
-    <h2>Running on Kubernetes</h2>
-    <p>
-        Ready-to-use manifests are provided in the <code>k8s/</code> directory.
-        They deploy Gateway42 as a single-replica Deployment backed by PersistentVolumeClaims for the
-        database and logs.
-    </p>
-
-    <h3>Files</h3>
-    <table class="help-table">
-        <thead><tr><th>File</th><th>Purpose</th></tr></thead>
-        <tbody>
-            <tr><td><code>k8s/secret.yaml</code></td><td>Stores <code>GW42_SECRET_KEY</code> and <code>ADMIN_PASSWORD</code> as a Kubernetes Secret.</td></tr>
-            <tr><td><code>k8s/configmap.yaml</code></td><td>Non-sensitive configuration (Ollama URL, rate limits, log level, etc.).</td></tr>
-            <tr><td><code>k8s/pvc.yaml</code></td><td>PersistentVolumeClaims for the database (1 Gi) and logs (2 Gi).</td></tr>
-            <tr><td><code>k8s/deployment.yaml</code></td><td>The Deployment definition with health probes and resource limits.</td></tr>
-            <tr><td><code>k8s/service.yaml</code></td><td>ClusterIP Service on port 80 and an Ingress resource for external access.</td></tr>
-        </tbody>
-    </table>
-
-    <h3>Deploy</h3>
-    <pre># 1. Build and push the image to your registry
-docker build -t your-registry/gateway42:latest .
-docker push your-registry/gateway42:latest
-
-# 2. Update the image reference in k8s/deployment.yaml
-#    image: your-registry/gateway42:latest
-
-# 3. Set your secrets (edit k8s/secret.yaml before applying,
-#    or use kubectl create secret directly)
-kubectl create secret generic gateway42-secret \
-  --from-literal=GW42_SECRET_KEY="your-long-random-string" \
-  --from-literal=ADMIN_PASSWORD="your-admin-password"
-
-# 4. Apply all manifests
-kubectl apply -f k8s/configmap.yaml
-kubectl apply -f k8s/pvc.yaml
-kubectl apply -f k8s/deployment.yaml
-kubectl apply -f k8s/service.yaml
-
-# 5. Check rollout status
-kubectl rollout status deployment/gateway42</pre>
-
-    <h3>Access the UI</h3>
-    <p>
-        The Service is a <code>ClusterIP</code> on port 80. To access it from outside the cluster,
-        either:
-    </p>
-    <ul>
-        <li>Update <code>k8s/service.yaml</code> to use <code>type: LoadBalancer</code>, <strong>or</strong></li>
-        <li>Configure the Ingress in <code>k8s/service.yaml</code> with your domain and an ingress
-            controller (e.g. <a class="link" href="https://kubernetes.github.io/ingress-nginx/" target="_blank">nginx-ingress</a>), <strong>or</strong></li>
-        <li>Use port-forwarding for local access: <code>kubectl port-forward svc/gateway42 7000:80</code></li>
-    </ul>
-
-    <h3>Connecting to Ollama</h3>
-    <p>
-        The default <code>OLLAMA_URL</code> in <code>k8s/configmap.yaml</code> points to
-        <code>http://ollama:11434/api/chat</code>, which assumes Ollama is deployed as a Service named
-        <code>ollama</code> in the same namespace. Alternatives:
-    </p>
-    <ul>
-        <li><strong>Separate namespace:</strong> use the full DNS name <code>http://ollama.&lt;namespace&gt;.svc.cluster.local:11434/api/chat</code>.</li>
-        <li><strong>External Ollama:</strong> set <code>OLLAMA_URL</code> to the external IP or hostname.</li>
-        <li><strong>Runtime override:</strong> change the URL any time from the Settings page — it is saved to the database and takes effect immediately.</li>
-    </ul>
-
-    <h3>Scaling</h3>
-    <p>
-        Gateway42 uses a SQLite database, which supports only one writer at a time.
-        Running more than one replica is therefore not recommended without replacing the database backend.
-        For high-throughput deployments, keep <code>replicas: 1</code> and scale horizontally at the
-        Ollama level instead.
-    </p>
-
-    <h3>Health checks</h3>
-    <p>
-        The Deployment configures both a <strong>readiness probe</strong> and a <strong>liveness probe</strong>
-        against <code>GET /health</code>. Kubernetes will not route traffic to the pod until the readiness
-        probe succeeds, and will restart the pod if the liveness probe fails.
-    </p>
-
-    <h3>Resource limits</h3>
-    <p>Default resource requests and limits set in <code>k8s/deployment.yaml</code>:</p>
-    <table class="help-table">
-        <thead><tr><th></th><th>CPU</th><th>Memory</th></tr></thead>
-        <tbody>
-            <tr><td>Request</td><td>100m</td><td>128 Mi</td></tr>
-            <tr><td>Limit</td><td>500m</td><td>512 Mi</td></tr>
-        </tbody>
-    </table>
-    <p><br/></p>
-    <p>Adjust these values in <code>k8s/deployment.yaml</code> to suit your cluster.</p>
-</div>
-
-{% endblock %}
+{{end}}

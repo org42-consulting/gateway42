@@ -1,6 +1,4 @@
-{% extends "base.html" %}
-
-{% block content %}
+{{define "content"}}
 <div style="min-height: 60vh; display:flex; align-items:center; justify-content:center;">
     <div class="card" style="width:100%; max-width:480px; border-color:rgba(220,38,38,.3);">
         <h2 style="font-size:1.125rem; font-weight:800; color:#fca5a5; margin-bottom:8px;">Confirm Deletion</h2>
@@ -8,13 +6,13 @@
             You <strong style="color:rgba(255,255,255,.85);">must</strong> export user data before deletion.
             This action cannot be undone.
         </p>
-        <form action="/delete/{{uid}}" method="post">
+        <form action="/delete/{{.UID}}" method="post">
             <div style="display:flex; gap:10px; flex-wrap:wrap;">
-                <a href="/export/{{uid}}" class="btn btn-primary">Download CSV</a>
+                <a href="/export/{{.UID}}" class="btn btn-primary">Download CSV</a>
                 <button type="submit" class="btn btn-danger">Delete Permanently</button>
                 <a href="/admin/panel" class="btn btn-ghost">Cancel</a>
             </div>
         </form>
     </div>
 </div>
-{% endblock %}
+{{end}}

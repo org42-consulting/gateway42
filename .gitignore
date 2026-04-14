@@ -1,20 +1,3 @@
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-*.egg
-*.egg-info/
-dist/
-build/
-.eggs/
-
-# Virtual environment
-ollama-gateway/
-venv/
-.venv/
-env/
-
 # Database
 db/
 *.db
@@ -50,11 +33,12 @@ docker_run.sh
 *.swo
 *~
 
-# pytest / coverage
-.pytest_cache/
-.coverage
-htmlcov/
+# Scripting and build artifacts
+build.sh
+docker_build.sh
+docker_push.sh
+docker_run.sh
+dist/
 
-# mypy / pyright
-.mypy_cache/
-.pyright/
+# build artifacts
+gw42-server

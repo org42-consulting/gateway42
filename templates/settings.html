@@ -1,25 +1,19 @@
-{% extends "base.html" %}
+{{define "content"}}
 
-{% block content %}
-
-
-{% with messages = get_flashed_messages(with_categories=true) %}
-  {% for category, message in messages %}
-    <div class="flash flash-{{ 'error' if category == 'error' else 'success' }}">{{ message }}</div>
-  {% endfor %}
-{% endwith %}
-
+{{range .Flashes}}
+<div class="flash flash-{{.Category}}">{{.Message}}</div>
+{{end}}
 
 <div id="ollama-settings" class="card">
     <h2>Ollama Settings</h2>
     <form action="/admin/ollama-settings" method="post" class="space-y-3">
         <div>
             <label>Ollama Base URL</label>
-            <input type="text" name="ollama_url" value="{{ ollama_url }}" placeholder="e.g., http://127.0.0.1">
+            <input type="text" name="ollama_url" value="{{.OllamaURL}}" placeholder="e.g., http://127.0.0.1">
         </div>
         <div>
             <label>Port Number</label>
-            <input type="number" name="port" value="{{ ollama_port }}" placeholder="e.g., 11434">
+            <input type="number" name="port" value="{{.OllamaPort}}" placeholder="e.g., 11434">
         </div>
         <div class="flex-row" style="padding-top:4px;">
             <button class="btn btn-primary" type="submit">Save Settings</button>
@@ -28,18 +22,15 @@
     </form>
 </div>
 
-
-<!----------------------------------------------------------------------------
-  Model Management Card
-  ---------------------------------------------------------------------------->
+<!-- Model Management Card -->
 <style>.card-inactive { opacity:.45; pointer-events:none; }</style>
-<div class="card card-mt {% if not ollama_status %}card-inactive{% endif %}">
+<div class="card card-mt {{if not .OllamaStatus}}card-inactive{{end}}">
     <h2>Model Management</h2>
 
-    {% if ollama_model_details %}
+    {{if .OllamaModelDetails}}
     <div class="table-wrap" style="margin-bottom:20px;">
         <div class="scroll-x">
-            <table class="data-table ">
+            <table class="data-table">
                 <thead>
                     <tr>
                         <th>Model</th>
@@ -48,31 +39,31 @@
                     </tr>
                 </thead>
                 <tbody>
-                    {% for m in ollama_model_details %}
+                    {{range .OllamaModelDetails}}
                     <tr>
-                        <td>{{ m.name }}</td>
-                        <td class="text-hint" style="white-space:normal;">{{ m.size }}</td>
+                        <td>{{.Name}}</td>
+                        <td class="text-hint" style="white-space:normal;">{{.Size}}</td>
                         <td>
                             <form action="/admin/ollama-delete-model" method="post"
-                                  onsubmit="return confirm('Delete {{ m.name }}? This cannot be undone.');">
-                                <input type="hidden" name="model" value="{{ m.name }}">
+                                  onsubmit="return confirm('Delete {{.Name}}? This cannot be undone.');">
+                                <input type="hidden" name="model" value="{{.Name}}">
                                 <button type="submit" class="btn btn-danger btn-small">Delete</button>
                             </form>
                         </td>
                     </tr>
-                    {% endfor %}
+                    {{end}}
                 </tbody>
             </table>
         </div>
     </div>
-    {% else %}
+    {{else}}
     <p class="text-hint" style="margin-bottom:16px; white-space:normal;">No models installed.</p>
-    {% endif %}
-    
+    {{end}}
+
     <label>Download Model</label>
-      <p class="section-desc" style="margin-bottom:0;">
-      Visit <a class="link" href="https://ollama.com/models" target="_blank">https://ollama.com/models</a> to find available models and their names. <br/>
-      Enter the model name below to download it directly to your Ollama instance.
+    <p class="section-desc" style="margin-bottom:0;">
+        Visit <a class="link" href="https://ollama.com/models" target="_blank">https://ollama.com/models</a> to find available models and their names. <br/>
+        Enter the model name below to download it directly to your Ollama instance.
     </p>
     <div class="flex-row" style="margin-top:6px;">
         <input type="text" id="pull-model-name" placeholder="e.g., llama3.2:latest" style="max-width:320px;">
@@ -90,7 +81,53 @@
     </div>
 </div>
 
-{% block scripts %}
+<!-- Change Admin Password Card -->
+<div class="card card-mt">
+    <h2>Change Admin Password</h2>
+    <form action="/admin/change-password" method="post" class="space-y-3">
+        <div>
+            <label>Current Password</label>
+            <input type="password" name="current" placeholder="Current password">
+        </div>
+        <div>
+            <label>New Password</label>
+            <input type="password" name="new" placeholder="New password">
+        </div>
+        <div>
+            <label>Confirm New Password</label>
+            <input type="password" name="confirm" placeholder="Confirm new password">
+        </div>
+        <button class="btn btn-primary" type="submit">Update Password</button>
+    </form>
+</div>
+
+<!-- Register New User Card -->
+<div class="card card-mt">
+  <h2>Register New User</h2>
+  <form action="/register" method="post" class="space-y-3">
+      <div>
+          <label>Client Name</label>
+          <input type="text" name="name" placeholder="e.g. Acme Corp">
+      </div>
+      <button class="btn btn-primary" type="submit">Register User</button>
+  </form>
+</div>
+
+<!-- Reset System Card -->
+<div class="card card-mt card-danger">
+    <h2>Reset System</h2>
+    <p class="section-desc">
+        Permanently deletes all audit logs and clears all rate-limit counters. Users and settings are not affected.
+    </p>
+    <form action="/admin/reset-system" method="post"
+          onsubmit="return confirm('This will permanently delete all logs and reset all rate-limit counters. This cannot be undone. Continue?');">
+        <button type="submit" class="btn btn-danger">Reset System</button>
+    </form>
+</div>
+
+{{end}}
+
+{{define "scripts"}}
 <script>
 function startPull() {
     const name = document.getElementById('pull-model-name').value.trim();
@@ -112,7 +149,6 @@ function startPull() {
     pct.textContent = '';
     bytesEl.textContent = '';
 
-    // Track progress per layer digest so overall % is accurate
     const layers = {};
 
     function fmt(b) {
@@ -183,59 +219,4 @@ function startPull() {
     };
 }
 </script>
-{% endblock %}
-
-
-<!----------------------------------------------------------------------------
-  Change Admin Password Card
-  ---------------------------------------------------------------------------->
-<div class="card card-mt">
-    <h2>Change Admin Password</h2>
-    <form action="/admin/change-password" method="post" class="space-y-3">
-        <div>
-            <label>Current Password</label>
-            <input type="password" name="current" placeholder="Current password">
-        </div>
-        <div>
-            <label>New Password</label>
-            <input type="password" name="new" placeholder="New password">
-        </div>
-        <div>
-            <label>Confirm New Password</label>
-            <input type="password" name="confirm" placeholder="Confirm new password">
-        </div>
-        <button class="btn btn-primary" type="submit">Update Password</button>
-    </form>
-</div>
-
-<!----------------------------------------------------------------------------
-  Register New User Card
-  ---------------------------------------------------------------------------->
-<div class="card card-mt">
-  <h2>Register New User</h2>
-  <form action="/register" method="post" class="space-y-3">
-      <div>
-          <label>Email</label>
-          <input type="email" name="email" placeholder="user@example.com">
-      </div>
-      <button class="btn btn-primary" type="submit">Register User</button>
-  </form>
-</div>
-
-
-<!----------------------------------------------------------------------------
-  Reset System Card
-  ---------------------------------------------------------------------------->
-<div class="card card-mt card-danger">
-    <h2>Reset System</h2>
-    <p class="section-desc">
-        Permanently deletes all audit logs and clears all rate-limit counters. Users and settings are not affected.
-    </p>
-    <form action="/admin/reset-system" method="post"
-          onsubmit="return confirm('This will permanently delete all logs and reset all rate-limit counters. This cannot be undone. Continue?');">
-        <button type="submit" class="btn btn-danger">Reset System</button>
-    </form>
-</div>
-
-
-{% endblock %}
+{{end}}

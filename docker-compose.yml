@@ -5,7 +5,6 @@ services:
     ports:
       - "7000:7000"
     environment:
-      GW42_SECRET_KEY: "${GW42_SECRET_KEY}"
       ADMIN_PASSWORD: "${ADMIN_PASSWORD}"
       # host.docker.internal resolves to the host machine on macOS and Windows.
       # The extra_hosts entry below maps it on Linux as well.

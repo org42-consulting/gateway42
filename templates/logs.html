@@ -1,24 +1,19 @@
-{% extends "base.html" %}
+{{define "content"}}
 
-{% block content %}
-
-
-{% with messages = get_flashed_messages(with_categories=true) %}
-  {% for category, message in messages %}
-    <div class="flash flash-{{ 'error' if category == 'error' else 'success' }}">{{ message }}</div>
-  {% endfor %}
-{% endwith %}
+{{range .Flashes}}
+<div class="flash flash-{{.Category}}">{{.Message}}</div>
+{{end}}
 
 <div class="card" style="margin-top:24px;">
     <h2>Request Logs</h2>
     <!-- Search + refresh control -->
     <form method="get" action="/admin/logs" style="margin-bottom:20px;">
         <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-            <input type="text" name="q" id="search-input" value="{{ search }}" placeholder="Search prompt, response or email…" style="max-width:400px;">
+            <input type="text" name="q" id="search-input" value="{{.Search}}" placeholder="Search prompt, response or client name…" style="max-width:400px;">
             <button class="btn btn-primary" type="submit">Search</button>
-            {% if search %}
+            {{if .Search}}
                 <a href="/admin/logs" class="btn btn-ghost">Clear</a>
-            {% endif %}
+            {{end}}
             <a href="/admin/export-logs" class="btn btn-primary">Export CSV</a>
             <button type="submit" form="reset-system-form" class="btn btn-danger"
                     onclick="return confirm('This will permanently delete all logs and reset all rate-limit counters. This cannot be undone. Continue?')">Reset System</button>
@@ -47,7 +42,6 @@
     </div>
     <div id="logs-pagination" style="display:flex; align-items:center; gap:6px; margin-top:12px; flex-wrap:wrap;"></div>
     <p id="logs-count" style="font-size:.75rem; color:rgba(255,255,255,.35); margin-top:6px;"></p>
-
 </div>
 
 
@@ -82,8 +76,9 @@
     <p id="syslog-count" style="font-size:.75rem; color:rgba(255,255,255,.35); margin-top:6px;"></p>
 </div>
 
+{{end}}
 
-{% block scripts %}
+{{define "scripts"}}
 <script>
 // ── Shared pagination helper ───────────────────────────────────────────────────
 function buildPagination(paginationEl, page, pages, onPageChange) {
@@ -134,22 +129,22 @@ function buildPagination(paginationEl, page, pages, onPageChange) {
             q ? `No logs match <strong style="color:rgba(255,255,255,.6);">${esc(q)}</strong>.`
               : 'No logs yet.'}</div>`;
         const rows = logs.map(r => {
-            const ts = (r.ts || '').slice(0, 19).replace('T', ' ');
+            const ts = (r.TS || '').slice(0, 19).replace('T', ' ');
             return `<tr>
                 <td style="white-space:nowrap;color:rgba(255,255,255,.45);font-size:.75rem;">${esc(ts)}</td>
-                <td style="color:rgba(255,255,255,.65);">${esc(r.email || '')}</td>
-                <td style="color:rgba(255,255,255,.65);white-space:nowrap;">${esc(r.model || '—')}</td>
+                <td style="color:rgba(255,255,255,.65);">${esc(r.Name || '')}</td>
+                <td style="color:rgba(255,255,255,.65);white-space:nowrap;">${esc(r.Model || '—')}</td>
                 <td style="max-width:320px;">
                     <div style="max-height:60px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
-                         title="${esc(r.prompt || '')}">${esc(r.prompt || '')}</div></td>
+                         title="${esc(r.Prompt || '')}">${esc(r.Prompt || '')}</div></td>
                 <td style="max-width:320px;">
                     <div style="max-height:60px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
-                         title="${esc(r.response || '')}">${esc(r.response || '')}</div></td>
+                         title="${esc(r.Response || '')}">${esc(r.Response || '')}</div></td>
             </tr>`;
         }).join('');
         return `<div style="overflow-x:auto;"><table class="data-table">
             <thead><tr>
-                <th style="width:160px;">Time</th><th style="width:160px;">User</th>
+                <th style="width:160px;">Time</th><th style="width:160px;">Client</th>
                 <th style="width:160px;">Model</th><th>Prompt</th><th>Response</th>
             </tr></thead><tbody>${rows}</tbody></table></div>`;
     }
@@ -183,7 +178,6 @@ function buildPagination(paginationEl, page, pages, onPageChange) {
         else indicator.textContent = '';
     }
 
-    // Reset to page 1 on new search
     const form = document.querySelector('form[action="/admin/logs"]');
     if (form) form.addEventListener('submit', () => { currentPage = 1; });
 
@@ -215,8 +209,8 @@ function buildPagination(paginationEl, page, pages, onPageChange) {
     }
 
     function levelColor(level) {
-        if (level === 'ERROR' || level === 'CRITICAL') return 'rgba(255,90,90,.85)';
-        if (level === 'WARNING') return 'rgba(255,190,60,.85)';
+        if (level === 'ERROR' || level === 'ERROR+4') return 'rgba(255,90,90,.85)';
+        if (level === 'WARN'  || level === 'WARN+4')  return 'rgba(255,190,60,.85)';
         return 'rgba(255,255,255,.65)';
     }
 
@@ -301,6 +295,4 @@ function buildPagination(paginationEl, page, pages, onPageChange) {
     applyInterval(parseInt(select.value, 10));
 })();
 </script>
-{% endblock %}
-
-{% endblock %}
+{{end}}

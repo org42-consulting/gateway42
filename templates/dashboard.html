@@ -1,20 +1,15 @@
-{% extends "base.html" %}
+{{define "content"}}
 
-{% block content %}
-
-
-{% with messages = get_flashed_messages(with_categories=true) %}
-  {% for category, message in messages %}
-    <div class="flash flash-{{ 'error' if category == 'error' else 'success' }}">{{ message }}</div>
-  {% endfor %}
-{% endwith %}
+{{range .Flashes}}
+<div class="flash flash-{{.Category}}">{{.Message}}</div>
+{{end}}
 
 <!-- Ollama Status -->
 <div id="ollama-status" class="card mb-6">
     <h2>Ollama Status</h2>
     <div class="table-wrap">
         <div class="scroll-x">
-            <table class="data-table ">
+            <table class="data-table">
                 <thead>
                     <tr>
                         <th style="width:120px;">Property</th>
@@ -25,31 +20,31 @@
                     <tr>
                         <td>Status</td>
                         <td>
-                            {% if ollama_status %}
+                            {{if .OllamaStatus}}
                                 <span class="badge badge-active">ACTIVE</span>
-                            {% else %}
+                            {{else}}
                                 <span class="badge badge-disabled">INACTIVE</span>
-                            {% endif %}
+                            {{end}}
                         </td>
                     </tr>
                     <tr>
                         <td>Endpoint</td>
-                        <td>{{ ollama_url }}:{{ ollama_port }}</td>
+                        <td>{{.OllamaURL}}:{{.OllamaPort}}</td>
                     </tr>
                     <tr>
                         <td>Models</td>
                         <td>
-                            {% if ollama_models %}
+                            {{if .OllamaModels}}
                             <div class="flex-row" style="gap:6px;">
-                                {% for model in ollama_models %}
-                                <span class="model-tag">{{ model }}</span>
-                                {% endfor %}
+                                {{range .OllamaModels}}
+                                <span class="model-tag">{{.}}</span>
+                                {{end}}
                             </div>
-                            {% else %}
+                            {{else}}
                             <span class="text-hint" style="font-weight:700;">
-                                {% if ollama_status %}No models found.{% else %}Unavailable — Ollama is not reachable.{% endif %}
+                                {{if .OllamaStatus}}No models found.{{else}}Unavailable — Ollama is not reachable.{{end}}
                             </span>
-                            {% endif %}
+                            {{end}}
                         </td>
                     </tr>
                 </tbody>
@@ -58,64 +53,62 @@
     </div>
 </div>
 
-<!-- Registered Users -->
+<!-- Registered Clients -->
 <div class="card mb-6">
-    <h2>Registered Users</h2>
-    <p class="section-desc">New users are disabled by default. Click the status button to activate them.</p>
-    <div >
+    <h2>Registered Clients</h2>
+    <p class="section-desc">New clients are disabled by default. Click the status button to activate them.</p>
+    <div>
         <table id="users-table" class="data-table">
             <thead>
                 <tr>
-                    <th>Email</th>
+                    <th>Client Name</th>
                     <th style="min-width:100px; max-width:200px;">Status</th>
                     <th>Rate / min</th>
                     <th>Actions</th>
                 </tr>
             </thead>
             <tbody>
-            {% for u in users %}
+            {{range .Users}}
             <tr>
-                <td>{{ u.email }}</td>
+                <td>{{.Name}}</td>
                 <td>
-                    <form action="/toggle/{{u.id}}" method="post" class="form-inline">
-                        <button type="submit" class="badge {% if u.status=='active' %}badge-active{% else %}badge-disabled{% endif %}">
-                            {{ 'ACTIVE' if u.status=='active' else 'DISABLED' }}
+                    <form action="/toggle/{{.ID}}" method="post" class="form-inline">
+                        <button type="submit" class="badge {{if eq .Status "active"}}badge-active{{else}}badge-disabled{{end}}">
+                            {{if eq .Status "active"}}ACTIVE{{else}}DISABLED{{end}}
                         </button>
                     </form>
                 </td>
                 <td>
-                    <form action="/admin/update-rate-limit/{{u.id}}" method="post" class="form-inline">
-                        <input type="number" name="rate_limit" value="{{ u.rate_limit }}" min="1" max="1000" style="width: 60px; padding: 3px;">
+                    <form action="/admin/update-rate-limit/{{.ID}}" method="post" class="form-inline">
+                        <input type="number" name="rate_limit" value="{{.RateLimit}}" min="1" max="1000" style="width: 60px; padding: 3px;">
                         <button type="submit" class="btn-small btn-ghost">Update</button>
                     </form>
                 </td>
                 <td>
                     <div class="flex-row" style="gap:6px;">
-                        <form action="/admin/reset/{{u.id}}" method="post" class="form-inline">
+                        <form action="/admin/reset/{{.ID}}" method="post" class="form-inline">
                             <button type="submit" class="btn-small btn-warning">New API Key</button>
                         </form>
-                        <a href="/export/{{u.id}}" class="btn-small btn-primary">Export CSV</a>
-                        <a href="/confirm-delete/{{u.id}}" class="btn-small btn-danger">Delete</a>
+                        <a href="/export/{{.ID}}" class="btn-small btn-primary">Export CSV</a>
+                        <a href="/confirm-delete/{{.ID}}" class="btn-small btn-danger">Delete</a>
                     </div>
                 </td>
             </tr>
-            {% endfor %}
+            {{end}}
             </tbody>
         </table>
     </div>
 </div>
 
-<!----------------------------------------------------------------------------
-  Register New User Card
-  ---------------------------------------------------------------------------->
+<!-- Register New Client -->
 <div class="card card-mt">
-  <h2>Register New User</h2>
+  <h2>Register New Client</h2>
   <form action="/register" method="post" class="space-y-3">
       <div>
-          <label>Email</label>
-          <input type="email" name="email" placeholder="user@example.com">
+          <label>Client Name</label>
+          <input type="text" name="name" placeholder="e.g. my-agent-app">
       </div>
-      <button class="btn btn-primary" type="submit">Register User</button>
+      <button class="btn btn-primary" type="submit">Register Client</button>
   </form>
 </div>
 
@@ -130,4 +123,4 @@
     </form>
 </div>
 
-{% endblock %}
+{{end}}

@@ -1,17 +1,20 @@
-FROM python:3.13-slim
+FROM golang:1.22-alpine AS builder
+WORKDIR /app
 
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /app/server .
+
+# ── Runtime image ──────────────────────────────────────────────────────────────
+FROM alpine:latest
 WORKDIR /gateway
 
-# Install dependencies first (cached layer)
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY --from=builder /app/server .
 
-# Copy application code
-COPY app/ .
-
-# Create directories for persistent data (overridden by volumes in production)
 RUN mkdir -p db logs
 
 EXPOSE 7000
 
-CMD ["hypercorn", "routes:app", "--bind", "0.0.0.0:7000", "--workers", "1"]
+CMD ["./server"]
