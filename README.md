@@ -1,10 +1,10 @@
-# Gateway42 — An opinionated gateway for Ollama
+# Gateway42. — An opinionated gateway for Ollama
 
 **Authenticated, audited, rate-limited API gateway for local LLMs. On-prem. Privacy-first.**
 
-Gateway42 sits between your users and a shared [Ollama](https://ollama.com) instance, exposing an **OpenAI-compatible API** while adding authentication, per-user rate limiting, and full audit logging. Any client or library built for the OpenAI API works with Gateway42 without code changes — just swap the base URL and API key.
+Gateway42. sits between your users and a shared [Ollama](https://ollama.com) instance, exposing an **OpenAI-compatible API** while adding authentication, per-user rate limiting, and full audit logging. Any client or library built for the OpenAI API works with Gateway42. without code changes — just swap the base URL and API key.
 
-<img width="1342" height="872" alt="Image" src="https://github.com/user-attachments/assets/c6c38d0e-e40b-445b-9b9e-e08fbe55a268" />
+<img width="1555" height="906" alt="Image" src="https://github.com/user-attachments/assets/370260c3-4222-4f07-a983-c4e7bdf73713" />
 
 ## Architecture
 
@@ -282,7 +282,7 @@ New users are registered with a unique API key and start in **DISABLED** status.
 | New API key | Generates a fresh key and immediately invalidates the old one. Displayed once — copy it before leaving the page. |
 | Export CSV | Downloads all audit log entries for this user. Required before deletion. |
 | Delete | Permanently removes the user and their log entries. CSV export must be done first. |
-<img width="1342" height="872" alt="Image" src="https://github.com/user-attachments/assets/c6c38d0e-e40b-445b-9b9e-e08fbe55a268" />
+<img width="1555" height="906" alt="Image" src="https://github.com/user-attachments/assets/370260c3-4222-4f07-a983-c4e7bdf73713" />
 
 ### Model Management (Settings page)
 
@@ -290,7 +290,7 @@ New users are registered with a unique API key and start in **DISABLED** status.
 - **Delete** a model to free disk space
 - **Download** a model by name (e.g. `llama3.2:latest`) with live progress tracking
 - Browse available models at [ollama.com/models](https://ollama.com/models)
-<img width="1341" height="770" alt="Image" src="https://github.com/user-attachments/assets/b1fa0ad6-a2e2-49d1-b05d-abdd631254a8" />
+<img width="1554" height="806" alt="Image" src="https://github.com/user-attachments/assets/d99401c0-f270-4da4-837f-9a7568643520" />
 
 
 ### Audit Logs
@@ -301,8 +301,12 @@ Every request is recorded with: timestamp, user, model, prompt, and response.
 - Search by prompt text, response text, or user email
 - Auto-refresh: Off / 5s / 10s / 30s / 60s
 - Export **all** log entries as CSV (`log_id`, `email`, `model`, `prompt`, `response`, `timestamp`)
-<img width="1358" height="455" alt="Image" src="https://github.com/user-attachments/assets/eee0c34e-ec79-42c4-936f-7668ed2792c5" />
 
+Request logs:  
+<img width="1554" height="535" alt="Image" src="https://github.com/user-attachments/assets/f25e6fc7-ca3c-42b2-b5ae-bc370a4652c5" />
+
+System Logs:  
+<img width="1555" height="901" alt="Image" src="https://github.com/user-attachments/assets/ce8cc6ab-9ba6-4b22-921f-075e67ad736a" />
 
 ### Reset System
 
@@ -318,7 +322,6 @@ Set these environment variables before starting Gateway42. Variables marked **re
 | -------- | -------- | ------- | ----------- |
 | `ADMIN_PASSWORD` | **Yes** | — | Password for the admin login page. |
 | `OLLAMA_URL` | No | `http://127.0.0.1:11434/api/chat` | Default Ollama endpoint. Can be overridden from the Settings page. |
-| `ADMIN_EMAIL` | No | `admin` | Admin account identifier shown in logs. |
 | `GW42_DB_PATH` | No | `./db/gateway.db` | Path to the SQLite database file. Avoid network-mounted filesystems. |
 | `DEFAULT_RATE_LIMIT` | No | `10` | Default requests-per-minute for newly registered users. |
 | `SESSION_TIMEOUT` | No | `3600` | Admin session lifetime in seconds. |
@@ -332,7 +335,6 @@ Using a `.env` file:
 ```bash
 # .env
 ADMIN_PASSWORD=your-admin-password
-ADMIN_EMAIL=admin@example.com
 ```
 
 
