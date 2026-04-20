@@ -83,7 +83,7 @@
         <li><strong>API key authentication</strong> — every user receives a unique key; only active users can send requests.</li>
         <li><strong>Per-user rate limiting</strong> — configurable maximum requests per minute per user.</li>
         <li><strong>Audit logging</strong> — every prompt and response is stored with a timestamp, user, and model name.</li>
-        <li><strong>Admin dashboard</strong> — manage users, configure Ollama, download or delete models, and review logs.</li>
+        <li><strong>Admin dashboard</strong> — manage users, configure Ollama, search for and download models, and review logs.</li>
     </ul>
 </div>
 
@@ -169,13 +169,18 @@
             <strong>Delete</strong> — removes a model from the Ollama instance. A confirmation dialog is shown first.
             This frees disk space but does not affect audit logs that referenced that model.
         </li>
-        <li>
-            <strong>Download Model</strong> — enter a model name (e.g. <code>llama3.2:latest</code>) and click
-            <em>Pull</em>. A live progress bar tracks the download layer by layer, showing bytes transferred and
-            overall percentage. Model names are available at
-            <a class="link" href="https://ollama.com/models" target="_blank">ollama.com/models</a>.
-        </li>
     </ul>
+
+    <h3>Search Models</h3>
+    <p>
+        Search for available models on <a class="link" href="https://ollama.com/search" target="_blank">ollama.com</a>.
+        Enter a model name or keyword and click <em>Search</em>. Results show matching models from the Ollama library,
+        including both standard models (e.g. <code>llama3.2</code>) and namespaced models (e.g. <code>batiai/qwen3.6-35b</code>).
+    </p>
+    <p>
+        Each search result includes a <strong>Pull</strong> button. Clicking it downloads the model to your Ollama instance.
+        A live progress bar tracks the download layer by layer, showing bytes transferred and overall percentage.
+    </p>
 
     <h3>Change Admin Password</h3>
     <p>
@@ -361,35 +366,5 @@ print(response.choices[0].message.content)</pre>
     </table>
 </div>
 
-<!-- Deployment -->
-<div class="card help-section" style="margin-top:24px;">
-    <h2>Running with Docker</h2>
-    <p>
-        Gateway42 ships with a <code>Dockerfile</code> and a <code>docker-compose.yml</code>.
-        It assumes Ollama is already running on the host machine at <code>localhost:11434</code>
-        (the default Ollama port). The container reaches the host via <code>host.docker.internal</code>.
-    </p>
-
-    <h3>Quick start</h3>
-    <pre># 1. Make sure Ollama is running on the host
-ollama serve
-
-# 2. Edit docker-compose.yml — set your secrets:
-#    ADMIN_PASSWORD  — your chosen admin password
-
-# 3. Build and start
-docker compose up -d
-
-# 4. Open the admin UI
-open http://localhost:7000</pre>
-
-    <h3>Persistent data</h3>
-    <p>Two named Docker volumes are created automatically:</p>
-    <ul>
-        <li><code>gateway42-db</code> — SQLite database (users, logs, settings).</li>
-        <li><code>gateway42-logs</code> — application log files.</li>
-    </ul>
-    <p>Data survives container restarts and upgrades. To wipe everything: <code>docker compose down -v</code>.</p>
-</div>
 
 {{end}}

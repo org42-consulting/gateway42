@@ -60,16 +60,40 @@
     <p class="text-hint" style="margin-bottom:16px; white-space:normal;">No models installed.</p>
     {{end}}
 
-    <label>Download Model</label>
+    <!-- Search Models Section -->
+    <label style="margin-top:16px;">Search Model</label>
     <p class="section-desc" style="margin-bottom:0;">
-        Visit <a class="link" href="https://ollama.com/models" target="_blank">https://ollama.com/models</a> to find available models and their names. <br/>
-        Enter the model name below to download it directly to your Ollama instance.
+        Search for models on <a class="link" href="https://ollama.com/search" target="_blank">https://ollama.com/search</a>
     </p>
     <div class="flex-row" style="margin-top:6px;">
-        <input type="text" id="pull-model-name" placeholder="e.g., llama3.2:latest" style="max-width:320px;">
-        <button class="btn btn-primary" id="pull-btn" type="button" onclick="startPull()">Pull</button>
+        <input type="text" id="search-model-name" placeholder="e.g., llama3.2" style="max-width:320px;">
+        <button class="btn btn-primary" id="search-btn" type="button" onclick="startSearch()">Search</button>
     </div>
-    <div id="pull-status" class="pull-status">
+    <div id="search-status" class="pull-status" style="display:none;">
+        <div class="pull-status-row">
+            <span id="search-status-text" class="pull-status-text"></span>
+        </div>
+    </div>
+
+    <!-- Search Results Table -->
+    <div id="search-results-container" class="table-wrap" style="margin-top:20px; display:none;">
+        <div class="scroll-x">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Model</th>
+                        <th style="width:90px;">Size</th>
+                        <th style="width:80px;"></th>
+                    </tr>
+                </thead>
+                <tbody id="search-results-body">
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Pull Status Display -->
+    <div id="pull-status" class="pull-status" style="margin-top:20px;">
         <div class="pull-status-row">
             <span id="pull-status-text" class="pull-status-text"></span>
             <span id="pull-pct" class="pull-pct"></span>
@@ -101,18 +125,6 @@
     </form>
 </div>
 
-<!-- Register New User Card -->
-<div class="card card-mt">
-  <h2>Register New User</h2>
-  <form action="/register" method="post" class="space-y-3">
-      <div>
-          <label>Client Name</label>
-          <input type="text" name="name" placeholder="e.g. Acme Corp">
-      </div>
-      <button class="btn btn-primary" type="submit">Register User</button>
-  </form>
-</div>
-
 <!-- Reset System Card -->
 <div class="card card-mt card-danger">
     <h2>Reset System</h2>
@@ -129,11 +141,82 @@
 
 {{define "scripts"}}
 <script>
-function startPull() {
-    const name = document.getElementById('pull-model-name').value.trim();
-    if (!name) return;
+function startSearch() {
+    const query = document.getElementById('search-model-name').value.trim();
+    if (!query) return;
 
-    const btn        = document.getElementById('pull-btn');
+    const btn = document.getElementById('search-btn');
+    const status = document.getElementById('search-status');
+    const statusText = document.getElementById('search-status-text');
+    const resultsContainer = document.getElementById('search-results-container');
+    const resultsBody = document.getElementById('search-results-body');
+
+    btn.disabled = true;
+    btn.textContent = 'Searching…';
+    status.style.display = 'block';
+    statusText.style.color = 'rgba(255,255,255,.65)';
+    statusText.textContent = 'Searching ollama.com...';
+    resultsContainer.style.display = 'none';
+    resultsBody.innerHTML = '';
+
+    fetch('/admin/ollama-search?q=' + encodeURIComponent(query))
+        .then(response => response.json())
+        .then(data => {
+            btn.disabled = false;
+            btn.textContent = 'Search';
+
+            if (data.error) {
+                statusText.textContent = 'Error: ' + data.error;
+                statusText.style.color = '#f87171';
+                return;
+            }
+
+            const results = data.results || [];
+            if (results.length === 0) {
+                statusText.textContent = 'No models found.';
+                statusText.style.color = 'rgba(255,255,255,.65)';
+                return;
+            }
+
+            statusText.textContent = 'Found ' + results.length + ' model(s).';
+            statusText.style.color = '#4ade80';
+
+            resultsBody.innerHTML = '';
+            results.forEach(model => {
+                const row = document.createElement('tr');
+                const nameCell = document.createElement('td');
+                const sizeCell = document.createElement('td');
+                const actionCell = document.createElement('td');
+                const pullBtn = document.createElement('button');
+
+                nameCell.textContent = model.Name;
+                sizeCell.className = 'text-hint';
+                sizeCell.style.whiteSpace = 'normal';
+                sizeCell.textContent = model.Size;
+
+                pullBtn.className = 'btn btn-primary btn-small';
+                pullBtn.textContent = 'Pull';
+                pullBtn.onclick = function() { startPullSearchResult(model.Name); };
+
+                actionCell.appendChild(pullBtn);
+                row.appendChild(nameCell);
+                row.appendChild(sizeCell);
+                row.appendChild(actionCell);
+                resultsBody.appendChild(row);
+            });
+
+            resultsContainer.style.display = 'block';
+        })
+        .catch(err => {
+            btn.disabled = false;
+            btn.textContent = 'Search';
+            statusText.textContent = 'Connection error.';
+            statusText.style.color = '#f87171';
+        });
+}
+
+function startPullSearchResult(modelName) {
+    const btn        = document.getElementById('search-btn');
     const status     = document.getElementById('pull-status');
     const statusText = document.getElementById('pull-status-text');
     const fill       = document.getElementById('pull-progress-fill');
@@ -175,7 +258,7 @@ function startPull() {
         btn.disabled = false;
         btn.textContent = 'Pull';
         if (success) {
-            statusText.textContent = name + ' pulled successfully.';
+            statusText.textContent = modelName + ' pulled successfully.';
             statusText.style.color = '#4ade80';
             fill.style.width = '100%';
             pct.textContent = '100%';
@@ -183,7 +266,7 @@ function startPull() {
         }
     }
 
-    const es = new EventSource('/admin/ollama-pull-stream?model=' + encodeURIComponent(name));
+    const es = new EventSource('/admin/ollama-pull-search-stream?model=' + encodeURIComponent(modelName));
 
     es.onmessage = (e) => {
         if (e.data === '[DONE]') { es.close(); return; }

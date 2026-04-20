@@ -52,113 +52,55 @@ flowchart LR
 - Rate limits **protect system stability**
 - The admin UI exists for **governance only**, not inference
 
-
-## Quick start (Docker)
-
-**Prerequisites:** Docker 24+, Docker Compose v2, [Ollama](https://ollama.com/download) running on the host.
-
+## Quick start (native)
+**Prerequisites:** Go 1.2x, [Ollama](https://ollama.com/download) running on the host.
 ```bash
 # 1. Make sure Ollama is running
 ollama serve
 
-# 2. Edit docker-compose.yml — set your secrets:
-#    ADMIN_PASSWORD   — your chosen admin password
+# 2. Build and start
+go build -o gateway42 .
+./gateway42
 
-# 3. Build and start
-docker compose up -d
-
-# 4. Open the admin UI
+# 3. Open the admin UI
 open http://localhost:7000
 ```
 
-**Persistent data** is stored in two named Docker volumes created automatically:
-- `gateway42-db` — SQLite database (users, logs, settings)
-- `gateway42-logs` — application log files
+> Default admin password is `admin123`. Change it after first login via the admin UI.
 
-Data survives container restarts and upgrades. To wipe everything: `docker compose down -v`.
 
-### Using a Published Image
+## macOS Service (launchd)
 
-If you want to run Gateway42 without cloning the repo or building locally, replace the `build:` line in `docker-compose.yml` with an `image:` reference:
-
-```yaml
-services:
-  gateway42:
-    image: ghcr.io/YOUR_ORG/gateway42:latest   # replace with the published image tag
-    # build: .  ← remove or comment out this line
-```
-
-Set your secrets in a `.env` file in the same directory:
+Install gateway42 as a persistent background service that starts automatically at login:
 
 ```bash
-# .env
-ADMIN_PASSWORD=your-admin-password
+./install.sh
 ```
 
-And reference them in `docker-compose.yml`:
+The script will:
+- Build the binary if needed
+- Install it to `/usr/local/bin/gateway42`
+- Create data directories at `~/.gateway42/` and `~/Library/Logs/gateway42/`
+- Register and start a LaunchAgent (`com.gateway42.service`)
 
-```yaml
-    environment:
-      ADMIN_PASSWORD: "${ADMIN_PASSWORD}"
-```
-
-Pull the image and start:
+**Service management:**
 
 ```bash
-docker compose pull
-docker compose up -d
+# View status and exit code
+launchctl list com.gateway42.service
+
+# Follow logs
+tail -f ~/Library/Logs/gateway42/gateway.log
+
+# Stop / start
+launchctl stop com.gateway42.service
+launchctl start com.gateway42.service
+
+# Uninstall (removes binary and plist, preserves data)
+./install.sh uninstall
 ```
 
-To upgrade to a newer published image:
-
-```bash
-docker compose pull   # fetch the latest image
-docker compose up -d  # replace the running container
-```
-
-Data volumes are preserved across upgrades.
-
-### Run Without Compose
-
-```bash
-docker build -t gateway42:latest .
-
-docker run -d \
-  -p 7000:7000 \
-  --add-host=host.docker.internal:host-gateway \
-  -e ADMIN_PASSWORD="your-password" \
-  -e OLLAMA_URL="http://host.docker.internal:11434/api/chat" \
-  -v gateway42-db:/gateway/db \
-  -v gateway42-logs:/gateway/logs \
-  --name gateway42 \
-  gateway42:latest
-```
-
-> The `--add-host` flag is required on Linux. On macOS/Windows with Docker Desktop it is optional.
-
-### Upgrading
-
-**If you built the image locally:**
-
-```bash
-docker compose build   # rebuild the image
-docker compose up -d   # replace the running container
-```
-
-**If you are using a published image:**
-
-```bash
-docker compose pull    # fetch the latest image
-docker compose up -d   # replace the running container
-```
-
-The SQLite schema migrates automatically on startup — no manual steps needed.
-
-### Host networking note
-
-Inside a Docker container, `localhost` refers to the container itself. Gateway42 uses `host.docker.internal` to reach Ollama on the host:
-- **macOS / Windows** — Docker Desktop provides this automatically.
-- **Linux** — the `extra_hosts: host.docker.internal:host-gateway` entry in `docker-compose.yml` handles this. No extra setup needed.
+The service restarts automatically on crash. It stops cleanly on `launchctl stop`.
 
 
 ## API reference
@@ -268,7 +210,7 @@ Access at `http://<host>:7000`. Admin-only — not intended for end users.
 ### Default Admin Credentials
 
 - No username
-- Password: set via `ADMIN_PASSWORD` environment variable
+- Password: `admin123` (or the value of `ADMIN_PASSWORD` if set)
 - **Change your password after first login**
 
 ### User Management
@@ -288,8 +230,8 @@ New users are registered with a unique API key and start in **DISABLED** status.
 
 - View all models installed on the Ollama instance with their disk size
 - **Delete** a model to free disk space
-- **Download** a model by name (e.g. `llama3.2:latest`) with live progress tracking
-- Browse available models at [ollama.com/models](https://ollama.com/models)
+- **Search** for models on ollama.com and download them with live progress tracking
+- Supports both standard models (e.g. `llama3.2`) and namespaced models (e.g. `batiai/qwen3.6-35b`)
 <img width="1554" height="806" alt="Image" src="https://github.com/user-attachments/assets/d99401c0-f270-4da4-837f-9a7568643520" />
 
 
@@ -316,25 +258,28 @@ Permanently deletes all audit logs and rate-limit counters. User accounts and se
 
 ## Configuration
 
-Set these environment variables before starting Gateway42. Variables marked **required** must be set or the application will refuse to start.
+All configuration is via environment variables. No variables are strictly required — sensible defaults are applied.
 
-| Variable | Required | Default | Description |
-| -------- | -------- | ------- | ----------- |
-| `ADMIN_PASSWORD` | **Yes** | — | Password for the admin login page. |
-| `OLLAMA_URL` | No | `http://127.0.0.1:11434/api/chat` | Default Ollama endpoint. Can be overridden from the Settings page. |
-| `GW42_DB_PATH` | No | `./db/gateway.db` | Path to the SQLite database file. Avoid network-mounted filesystems. |
-| `DEFAULT_RATE_LIMIT` | No | `10` | Default requests-per-minute for newly registered users. |
-| `SESSION_TIMEOUT` | No | `3600` | Admin session lifetime in seconds. |
-| `MAX_MESSAGE_LENGTH` | No | `10000` | Maximum characters stored per prompt or response in the audit log. |
-| `LOG_LEVEL` | No | `INFO` | Python logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
-| `LOG_FILE` | No | `./logs/gateway.log` | Path to the application log file. |
-| `DEBUG` | No | `false` | Set to `true` to enable debug mode. Do not use in production. |
+| Variable | Default | Description |
+| -------- | ------- | ----------- |
+| `ADMIN_PASSWORD` | `admin123` | Password for the admin login page. **Change after first login.** |
+| `PORT` | `7000` | Port the HTTP/HTTPS server listens on. |
+| `OLLAMA_URL` | `http://127.0.0.1:11434/api/chat` | Default Ollama endpoint. Can be overridden from the Settings page. |
+| `GW42_DB_PATH` | `./db/gateway.db` | Path to the SQLite database file. Avoid network-mounted filesystems. |
+| `DEFAULT_RATE_LIMIT` | `10` | Default requests-per-minute for newly registered users. |
+| `SESSION_TIMEOUT` | `3600` | Admin session lifetime in seconds. |
+| `MAX_MESSAGE_LENGTH` | `10000` | Maximum characters stored per prompt or response in the audit log. |
+| `LOG_LEVEL` | `INFO` | Log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
+| `LOG_FILE` | `./logs/gateway.log` | Path to the application log file. |
+| `TLS_CERT` | _(empty)_ | Path to TLS certificate file. When set with `TLS_KEY`, enables HTTPS. |
+| `TLS_KEY` | _(empty)_ | Path to TLS private key file. When set with `TLS_CERT`, enables HTTPS. |
 
-Using a `.env` file:
+Using a `.env` file (native / local runs):
 
 ```bash
 # .env
 ADMIN_PASSWORD=your-admin-password
+PORT=7000
 ```
 
 

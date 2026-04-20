@@ -7,8 +7,11 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -132,6 +135,7 @@ func handleAdminSettingsPage(w http.ResponseWriter, r *http.Request) {
 		OllamaStatus:       ollamaStatus,
 		OllamaModels:       ollamaModels,
 		OllamaModelDetails: modelDetails,
+		SearchResults:      []ModelDetail{}, // Will be populated by search
 	})
 }
 
@@ -352,6 +356,126 @@ func handleOllamaSettings(w http.ResponseWriter, r *http.Request) {
 	slog.Info("Ollama settings updated", "url", ollamaURL, "port", port)
 	addFlash(w, r, "success", "Ollama settings saved")
 	http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
+}
+
+// ─────────────────────────────── Model search ─────────────────────────────────
+
+func handleOllamaSearch(w http.ResponseWriter, r *http.Request) {
+	if !isAdminSession(r) {
+		jsonResponse(w, 401, map[string]string{"error": "Unauthorized"})
+		return
+	}
+
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	if query == "" {
+		jsonResponse(w, 200, map[string][]ModelDetail{"results": []ModelDetail{}})
+		return
+	}
+
+	// Search ollama.com/search for the query
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("https://ollama.com/search?q=%s", url.QueryEscape(query)))
+	if err != nil {
+		jsonResponse(w, 502, map[string]string{"error": fmt.Sprintf("Could not reach ollama.com: %v", err)})
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		jsonResponse(w, 502, map[string]string{"error": fmt.Sprintf("Ollama search returned %d", resp.StatusCode)})
+		return
+	}
+
+	// Parse the HTML response to extract model names from /library/ links
+	var results []ModelDetail
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	bodyStr := string(bodyBytes)
+
+	// Look for links matching /library/model-name and /namespace/model-name patterns
+	// e.g., <a href="/library/llama3.2" class="group w-full"> or
+	//       <a href="/batiai/qwen3.6-35b" class="group w-full">
+	re := regexp.MustCompile(`href="/(?:library/)?([^"/]+(?:/[^"/]+)?)\"[^>]*class="group w-full"`)
+	matches := re.FindAllStringSubmatch(bodyStr, -1)
+
+	// Use a map to deduplicate model names
+	modelMap := make(map[string]bool)
+	for _, m := range matches {
+		if len(m) > 1 {
+			modelName := m[1]
+			if !modelMap[modelName] {
+				modelMap[modelName] = true
+				// Size is unknown for search results, show placeholder
+				results = append(results, ModelDetail{Name: modelName, Size: "N/A"})
+			}
+		}
+	}
+
+	jsonResponse(w, 200, map[string][]ModelDetail{"results": results})
+}
+
+func handleOllamaPullSearchStream(w http.ResponseWriter, r *http.Request) {
+	if !isAdminSession(r) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(401)
+		w.Write([]byte(`{"error":"Unauthorized"}`))
+		return
+	}
+	model := strings.TrimSpace(r.URL.Query().Get("model"))
+	if model == "" {
+		w.WriteHeader(400)
+		w.Write([]byte(`{"error":"Model name required"}`))
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", 500)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("Cache-Control", "no-cache")
+
+	baseURL := getOllamaBaseURL()
+	body, _ := json.Marshal(map[string]interface{}{"name": model, "stream": true})
+
+	ctx, cancel := context.WithTimeout(r.Context(), 600*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", baseURL+"/api/pull", bytes.NewReader(body))
+	if err != nil {
+		fmt.Fprintf(w, "data: %s\n\n", jsonErr(err.Error()))
+		flusher.Flush()
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Fprintf(w, "data: %s\n\n", jsonErr(err.Error()))
+		flusher.Flush()
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		fmt.Fprintf(w, "data: %s\n\n", jsonErr(fmt.Sprintf("Ollama returned %d", resp.StatusCode)))
+		flusher.Flush()
+		return
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		fmt.Fprintf(w, "data: %s\n\n", line)
+		flusher.Flush()
+	}
+	fmt.Fprintf(w, "data: [DONE]\n\n")
+	flusher.Flush()
 }
 
 // ─────────────────────────────── Password change ──────────────────────────────

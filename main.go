@@ -53,6 +53,8 @@ type Config struct {
 	LogLevel      string
 	LogFile       string
 	Port          string
+	TLSCert       string
+	TLSKey        string
 }
 
 var cfg Config
@@ -87,6 +89,8 @@ func loadConfig() Config {
 		LogLevel:      getEnv("LOG_LEVEL", "INFO"),
 		LogFile:       getEnv("LOG_FILE", "./logs/gateway.log"),
 		Port:          getEnv("PORT", "7000"),
+		TLSCert:       getEnv("TLS_CERT", ""),
+		TLSKey:        getEnv("TLS_KEY", ""),
 	}
 	return c
 }
@@ -168,6 +172,7 @@ type SettingsData struct {
 	OllamaStatus       bool
 	OllamaModels       []string
 	OllamaModelDetails []ModelDetail
+	SearchResults      []ModelDetail
 }
 
 // LogsData holds data for the logs page
@@ -971,8 +976,10 @@ func setupRouter() *mux.Router {
 	r.HandleFunc("/admin/settings-page", handleAdminSettingsPage).Methods("GET")
 	r.HandleFunc("/admin/ollama-test", handleOllamaTest).Methods("GET")
 	r.HandleFunc("/admin/ollama-pull-stream", handleOllamaPullStream).Methods("GET")
+	r.HandleFunc("/admin/ollama-pull-search-stream", handleOllamaPullSearchStream).Methods("GET")
 	r.HandleFunc("/admin/ollama-delete-model", handleOllamaDeleteModel).Methods("POST")
 	r.HandleFunc("/admin/ollama-settings", handleOllamaSettings).Methods("POST")
+	r.HandleFunc("/admin/ollama-search", handleOllamaSearch).Methods("GET")
 	r.HandleFunc("/admin/change-password", handleChangePassword).Methods("POST")
 	r.HandleFunc("/admin/help", handleAdminHelp).Methods("GET")
 	r.HandleFunc("/admin/logs", handleAdminLogs).Methods("GET")
@@ -1055,9 +1062,17 @@ func main() {
 	router := setupRouter()
 
 	addr := "0.0.0.0:" + cfg.Port
-	slog.Info("Gateway42. listening", "addr", addr)
-	if err := http.ListenAndServe(addr, router); err != nil {
-		slog.Error("server error", "err", err)
-		os.Exit(1)
+	if cfg.TLSCert != "" && cfg.TLSKey != "" {
+		slog.Info("Gateway42 listening (HTTPS)", "addr", addr, "cert", cfg.TLSCert)
+		if err := http.ListenAndServeTLS(addr, cfg.TLSCert, cfg.TLSKey, router); err != nil {
+			slog.Error("server error", "err", err)
+			os.Exit(1)
+		}
+	} else {
+		slog.Info("Gateway42 listening (HTTP)", "addr", addr)
+		if err := http.ListenAndServe(addr, router); err != nil {
+			slog.Error("server error", "err", err)
+			os.Exit(1)
+		}
 	}
 }

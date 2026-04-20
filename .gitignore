@@ -42,3 +42,8 @@ dist/
 
 # build artifacts
 gw42-server
+gateway42
+
+# SSL certificates and scripts
+ssl/
+
