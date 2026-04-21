@@ -246,9 +246,9 @@ func toInt(v interface{}) int {
 	case float64:
 		return int(n)
 	case string:
-		i, _ := fmt.Sscanf(n, "%d", new(int))
-		_ = i
-		return 0
+		var result int
+		fmt.Sscanf(n, "%d", &result)
+		return result
 	}
 	return 0
 }

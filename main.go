@@ -513,10 +513,15 @@ func userCacheSet(key interface{}, u *User) {
 func invalidateUserCache(userID int) {
 	userCacheMu.Lock()
 	defer userCacheMu.Unlock()
-	for k := range userCache {
-		if s, ok := k.(string); ok && strings.HasSuffix(s, fmt.Sprintf(":%d", userID)) {
-			delete(userCache, k)
-			delete(userCacheExp, k)
+	// Delete the id: entry explicitly.
+	idKey := fmt.Sprintf("id:%d", userID)
+	delete(userCache, idKey)
+	delete(userCacheExp, idKey)
+	// Find and delete any api: entry that belongs to this user.
+	for k, u := range userCache {
+		if s, ok := k.(string); ok && strings.HasPrefix(s, "api:") && u.ID == userID {
+			delete(userCache, s)
+			delete(userCacheExp, s)
 		}
 	}
 }
@@ -532,6 +537,9 @@ func getAllUsers() ([]User, error) {
 		var u User
 		rows.Scan(&u.ID, &u.Name, &u.APIKey, &u.Status, &u.RateLimit, &u.CreatedAt)
 		users = append(users, u)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	return users, nil
 }
@@ -657,6 +665,57 @@ func getLogs(search string, limit int) ([]LogRow, error) {
 	return out, nil
 }
 
+func getLogsCount(search string) (int, error) {
+	var count int
+	var err error
+	if search != "" {
+		p := "%" + search + "%"
+		err = db.QueryRow(
+			`SELECT COUNT(*) FROM logs l JOIN users u ON u.id=l.user_id
+			WHERE l.prompt LIKE ? OR l.response LIKE ? OR u.name LIKE ?`,
+			p, p, p,
+		).Scan(&count)
+	} else {
+		err = db.QueryRow(`SELECT COUNT(*) FROM logs l JOIN users u ON u.id=l.user_id`).Scan(&count)
+	}
+	return count, err
+}
+
+func getLogsPage(search string, limit, offset int) ([]LogRow, error) {
+	var (
+		sqlRows *sql.Rows
+		err     error
+	)
+	if search != "" {
+		p := "%" + search + "%"
+		sqlRows, err = db.Query(
+			`SELECT l.id, u.name, COALESCE(l.model,''), l.prompt, l.response, l.ts
+			FROM logs l JOIN users u ON u.id=l.user_id
+			WHERE l.prompt LIKE ? OR l.response LIKE ? OR u.name LIKE ?
+			ORDER BY l.ts DESC LIMIT ? OFFSET ?`,
+			p, p, p, limit, offset,
+		)
+	} else {
+		sqlRows, err = db.Query(
+			`SELECT l.id, u.name, COALESCE(l.model,''), l.prompt, l.response, l.ts
+			FROM logs l JOIN users u ON u.id=l.user_id
+			ORDER BY l.ts DESC LIMIT ? OFFSET ?`,
+			limit, offset,
+		)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer sqlRows.Close()
+	var out []LogRow
+	for sqlRows.Next() {
+		var r LogRow
+		sqlRows.Scan(&r.ID, &r.Name, &r.Model, &r.Prompt, &r.Response, &r.TS)
+		out = append(out, r)
+	}
+	return out, sqlRows.Err()
+}
+
 // ── Admin queries ─────────────────────────────────────────────────────────────
 
 type AdminUser struct {
@@ -780,17 +839,23 @@ func validateName(name string) bool {
 	return len(n) >= 1 && len(n) <= 100
 }
 
+var (
+	reUppercase = regexp.MustCompile(`[A-Z]`)
+	reLowercase = regexp.MustCompile(`[a-z]`)
+	reDigit     = regexp.MustCompile(`\d`)
+)
+
 func validatePassword(password string) (bool, string) {
 	if len(password) < 8 {
 		return false, "Password must be at least 8 characters"
 	}
-	if !regexp.MustCompile(`[A-Z]`).MatchString(password) {
+	if !reUppercase.MatchString(password) {
 		return false, "Password must contain at least one uppercase letter"
 	}
-	if !regexp.MustCompile(`[a-z]`).MatchString(password) {
+	if !reLowercase.MatchString(password) {
 		return false, "Password must contain at least one lowercase letter"
 	}
-	if !regexp.MustCompile(`\d`).MatchString(password) {
+	if !reDigit.MatchString(password) {
 		return false, "Password must contain at least one digit"
 	}
 	return true, ""
@@ -927,6 +992,84 @@ func renderPage(w http.ResponseWriter, page string, data interface{}) {
 	}
 }
 
+// ─────────────────────────── Ollama probe cache ───────────────────────────────
+
+type ollamaProbeData struct {
+	status  bool
+	models  []string
+	details []ModelDetail
+	url     string
+	port    int
+}
+
+var (
+	ollamaProbeMu    sync.Mutex
+	ollamaProbeState ollamaProbeData
+	ollamaProbeExpiry time.Time
+)
+
+const ollamaProbeTTL = 15 * time.Second
+
+// probeOllamaCached returns Ollama status, model names, and model details,
+// caching the result for ollamaProbeTTL to avoid blocking every page load.
+func probeOllamaCached(baseURL string, port int) (bool, []string, []ModelDetail) {
+	ollamaProbeMu.Lock()
+	defer ollamaProbeMu.Unlock()
+	if time.Now().Before(ollamaProbeExpiry) &&
+		ollamaProbeState.url == baseURL &&
+		ollamaProbeState.port == port {
+		return ollamaProbeState.status, ollamaProbeState.models, ollamaProbeState.details
+	}
+	status, models, details := probeOllamaFull(baseURL, port)
+	ollamaProbeState = ollamaProbeData{
+		status: status, models: models, details: details,
+		url: baseURL, port: port,
+	}
+	ollamaProbeExpiry = time.Now().Add(ollamaProbeTTL)
+	return status, models, details
+}
+
+// probeOllamaFull checks Ollama connectivity and returns status, model names,
+// and model details in a single pair of HTTP calls.
+func probeOllamaFull(baseURL string, port int) (bool, []string, []ModelDetail) {
+	endpoint := fmt.Sprintf("%s:%d", baseURL, port)
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(endpoint + "/api/version")
+	if err != nil || resp.StatusCode != 200 {
+		return false, nil, nil
+	}
+	resp.Body.Close()
+
+	client2 := &http.Client{Timeout: 5 * time.Second}
+	resp2, err := client2.Get(endpoint + "/api/tags")
+	if err != nil || resp2.StatusCode != 200 {
+		return true, nil, nil
+	}
+	defer resp2.Body.Close()
+	var tags map[string]interface{}
+	json.NewDecoder(resp2.Body).Decode(&tags)
+	models, _ := tags["models"].([]interface{})
+	var names []string
+	var details []ModelDetail
+	for _, m := range models {
+		mm, ok := m.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name, _ := mm["name"].(string)
+		names = append(names, name)
+		sizeB := toInt(mm["size"])
+		var sizeStr string
+		if sizeB >= 1_000_000_000 {
+			sizeStr = fmt.Sprintf("%.1f GB", float64(sizeB)/1e9)
+		} else {
+			sizeStr = fmt.Sprintf("%d MB", sizeB/1_000_000)
+		}
+		details = append(details, ModelDetail{Name: name, Size: sizeStr})
+	}
+	return true, names, details
+}
+
 // ─────────────────────────────── Background tasks ─────────────────────────────
 
 func startBackgroundTasks() {
@@ -962,7 +1105,8 @@ func setupRouter() *mux.Router {
 	// CORS preflight
 	r.PathPrefix("/v1/").Methods("OPTIONS").HandlerFunc(handleCorsPreflight)
 
-	// After-request CORS for /v1/*
+	// Middleware applied to all routes
+	r.Use(recoveryMiddleware)
 	r.Use(corsMiddleware)
 
 	// Public
@@ -1017,6 +1161,18 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+func recoveryMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := recover(); err != nil {
+				slog.Error("panic recovered", "err", err, "path", r.URL.Path)
+				http.Error(w, "Internal server error", http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
 // ─────────────────────────────── Main ─────────────────────────────────────────
 
 func main() {
@@ -1040,6 +1196,7 @@ func main() {
 	sessionStore.Options = &sessions.Options{
 		MaxAge:   cfg.SessionTTL,
 		HttpOnly: true,
+		Secure:   cfg.TLSCert != "" && cfg.TLSKey != "",
 		Path:     "/",
 	}
 
@@ -1051,9 +1208,6 @@ func main() {
 
 	// Templates
 	initTemplates()
-
-	// Logs directory
-	os.MkdirAll(filepath.Dir(cfg.LogFile), 0755)
 
 	// Background tasks
 	startBackgroundTasks()

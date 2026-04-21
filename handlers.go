@@ -99,7 +99,7 @@ func handleAdminPanel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ollamaURL, ollamaPort := parseOllamaSettings()
-	ollamaStatus, ollamaModels := probeOllama(ollamaURL, ollamaPort)
+	ollamaStatus, ollamaModels, _ := probeOllamaCached(ollamaURL, ollamaPort)
 
 	renderPage(w, "dashboard", DashboardData{
 		BaseData:     BaseData{Flashes: flashes, CurrentPath: r.URL.Path},
@@ -122,11 +122,7 @@ func handleAdminSettingsPage(w http.ResponseWriter, r *http.Request) {
 	flashes := consumeFlashes(w, r, sess)
 
 	ollamaURL, ollamaPort := parseOllamaSettings()
-	ollamaStatus, ollamaModels := probeOllama(ollamaURL, ollamaPort)
-	var modelDetails []ModelDetail
-	if ollamaStatus {
-		modelDetails = fetchModelDetails(ollamaURL, ollamaPort)
-	}
+	ollamaStatus, ollamaModels, modelDetails := probeOllamaCached(ollamaURL, ollamaPort)
 
 	renderPage(w, "settings", SettingsData{
 		BaseData:           BaseData{Flashes: flashes, CurrentPath: r.URL.Path},
@@ -139,65 +135,6 @@ func handleAdminSettingsPage(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// probeOllama checks connectivity and returns (status, modelNames).
-func probeOllama(baseURL string, port int) (bool, []string) {
-	endpoint := fmt.Sprintf("%s:%d", baseURL, port)
-	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get(endpoint + "/api/version")
-	if err != nil || resp.StatusCode != 200 {
-		return false, nil
-	}
-	resp.Body.Close()
-
-	client2 := &http.Client{Timeout: 5 * time.Second}
-	resp2, err := client2.Get(endpoint + "/api/tags")
-	if err != nil || resp2.StatusCode != 200 {
-		return true, nil
-	}
-	defer resp2.Body.Close()
-	var tags map[string]interface{}
-	json.NewDecoder(resp2.Body).Decode(&tags)
-	models, _ := tags["models"].([]interface{})
-	var names []string
-	for _, m := range models {
-		if mm, ok := m.(map[string]interface{}); ok {
-			if name, ok := mm["name"].(string); ok {
-				names = append(names, name)
-			}
-		}
-	}
-	return true, names
-}
-
-func fetchModelDetails(baseURL string, port int) []ModelDetail {
-	endpoint := fmt.Sprintf("%s:%d", baseURL, port)
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(endpoint + "/api/tags")
-	if err != nil || resp.StatusCode != 200 {
-		return nil
-	}
-	defer resp.Body.Close()
-	var tags map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&tags)
-	models, _ := tags["models"].([]interface{})
-	var out []ModelDetail
-	for _, m := range models {
-		mm, ok := m.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		name, _ := mm["name"].(string)
-		sizeB := toInt(mm["size"])
-		var sizeStr string
-		if sizeB >= 1_000_000_000 {
-			sizeStr = fmt.Sprintf("%.1f GB", float64(sizeB)/1e9)
-		} else {
-			sizeStr = fmt.Sprintf("%d MB", sizeB/1_000_000)
-		}
-		out = append(out, ModelDetail{Name: name, Size: sizeStr})
-	}
-	return out
-}
 
 // ─────────────────────────────── Ollama management ────────────────────────────
 
@@ -224,20 +161,8 @@ func handleOllamaTest(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
 }
 
-func handleOllamaPullStream(w http.ResponseWriter, r *http.Request) {
-	if !isAdminSession(r) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(401)
-		w.Write([]byte(`{"error":"Unauthorized"}`))
-		return
-	}
-	model := strings.TrimSpace(r.URL.Query().Get("model"))
-	if model == "" {
-		w.WriteHeader(400)
-		w.Write([]byte(`{"error":"Model name required"}`))
-		return
-	}
-
+// ollamaPullStream streams a model pull from Ollama as SSE. Auth is checked by callers.
+func ollamaPullStream(w http.ResponseWriter, r *http.Request, model string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming not supported", 500)
@@ -287,6 +212,22 @@ func handleOllamaPullStream(w http.ResponseWriter, r *http.Request) {
 	}
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
+}
+
+func handleOllamaPullStream(w http.ResponseWriter, r *http.Request) {
+	if !isAdminSession(r) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(401)
+		w.Write([]byte(`{"error":"Unauthorized"}`))
+		return
+	}
+	model := strings.TrimSpace(r.URL.Query().Get("model"))
+	if model == "" {
+		w.WriteHeader(400)
+		w.Write([]byte(`{"error":"Model name required"}`))
+		return
+	}
+	ollamaPullStream(w, r, model)
 }
 
 func jsonErr(msg string) string {
@@ -426,56 +367,7 @@ func handleOllamaPullSearchStream(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"error":"Model name required"}`))
 		return
 	}
-
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "streaming not supported", 500)
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.Header().Set("Cache-Control", "no-cache")
-
-	baseURL := getOllamaBaseURL()
-	body, _ := json.Marshal(map[string]interface{}{"name": model, "stream": true})
-
-	ctx, cancel := context.WithTimeout(r.Context(), 600*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, "POST", baseURL+"/api/pull", bytes.NewReader(body))
-	if err != nil {
-		fmt.Fprintf(w, "data: %s\n\n", jsonErr(err.Error()))
-		flusher.Flush()
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		fmt.Fprintf(w, "data: %s\n\n", jsonErr(err.Error()))
-		flusher.Flush()
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		fmt.Fprintf(w, "data: %s\n\n", jsonErr(fmt.Sprintf("Ollama returned %d", resp.StatusCode)))
-		flusher.Flush()
-		return
-	}
-
-	scanner := bufio.NewScanner(resp.Body)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		fmt.Fprintf(w, "data: %s\n\n", line)
-		flusher.Flush()
-	}
-	fmt.Fprintf(w, "data: [DONE]\n\n")
-	flusher.Flush()
+	ollamaPullStream(w, r, model)
 }
 
 // ─────────────────────────────── Password change ──────────────────────────────
@@ -513,8 +405,13 @@ func handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slog.Info("Admin password changed")
-	addFlash(w, r, "success", "Password updated successfully")
-	http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
+	// Invalidate session so the admin must re-authenticate with the new password.
+	sess := getSession(r)
+	sess.Values["admin"] = false
+	b, _ := json.Marshal([]FlashMsg{{"success", "Password updated. Please log in again."}})
+	sess.Values["flashes"] = string(b)
+	sess.Save(r, w)
+	http.Redirect(w, r, "/", http.StatusFound)
 }
 
 // ─────────────────────────────── User management ──────────────────────────────
@@ -663,22 +560,27 @@ func handleAdminLogsData(w http.ResponseWriter, r *http.Request) {
 		jsonResponse(w, 401, map[string]string{"error": "Unauthorized"})
 		return
 	}
+	const pageSize = 10
 	search := strings.TrimSpace(r.URL.Query().Get("q"))
 	page := maxInt(1, queryInt(r, "page", 1))
 
-	rows, err := getLogs(search, 10_000)
+	total, err := getLogsCount(search)
 	if err != nil {
-		slog.Error("getLogs", "err", err)
+		slog.Error("getLogsCount", "err", err)
 		jsonResponse(w, 500, map[string]string{"error": "Internal server error"})
 		return
 	}
 
-	total := len(rows)
-	pages := maxInt(1, (total+9)/10)
+	pages := maxInt(1, (total+pageSize-1)/pageSize)
 	page = minInt(page, pages)
-	start := (page - 1) * 10
-	end := minInt(start+10, total)
-	slice := rows[start:end]
+	offset := (page - 1) * pageSize
+
+	slice, err := getLogsPage(search, pageSize, offset)
+	if err != nil {
+		slog.Error("getLogsPage", "err", err)
+		jsonResponse(w, 500, map[string]string{"error": "Internal server error"})
+		return
+	}
 
 	jsonResponse(w, 200, map[string]interface{}{
 		"logs":   slice,
@@ -814,12 +716,16 @@ func handleExportAllLogs(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
-	rows, err := getLogs("", 10_000_000)
+
+	sqlRows, err := db.QueryContext(r.Context(),
+		`SELECT l.id, u.name, COALESCE(l.model,''), l.prompt, l.response, l.ts
+		FROM logs l JOIN users u ON u.id=l.user_id ORDER BY l.ts DESC`)
 	if err != nil {
 		slog.Error("getLogs all", "err", err)
 		http.Error(w, "Internal server error", 500)
 		return
 	}
+	defer sqlRows.Close()
 
 	w.Header().Set("Content-Type", "text/csv")
 	w.Header().Set("Content-Disposition", "attachment; filename=all_logs.csv")
@@ -827,7 +733,9 @@ func handleExportAllLogs(w http.ResponseWriter, r *http.Request) {
 
 	cw := csv.NewWriter(w)
 	cw.Write([]string{"log_id", "client_name", "model", "prompt", "response", "timestamp"})
-	for _, row := range rows {
+	for sqlRows.Next() {
+		var row LogRow
+		sqlRows.Scan(&row.ID, &row.Name, &row.Model, &row.Prompt, &row.Response, &row.TS)
 		cw.Write([]string{
 			strconv.Itoa(row.ID), row.Name, row.Model,
 			row.Prompt, row.Response, row.TS,
