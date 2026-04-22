@@ -39,6 +39,7 @@ docker_build.sh
 docker_push.sh
 docker_run.sh
 dist/
+run.sh
 
 # build artifacts
 gw42-server

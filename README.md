@@ -18,7 +18,7 @@ flowchart LR
 
     subgraph LAN["LAN / Team / Automation"]
         USERS["Human Users"]
-        SCRIPTS["Scripts (Python, Bash)"]
+        SCRIPTS["Scripts (OpenAI API consumers)"]
         AGENTS["AI Agents"]
         CHAT["Chat clients"]
     end
@@ -52,8 +52,14 @@ flowchart LR
 - Rate limits **protect system stability**
 - The admin UI exists for **governance only**, not inference
 
-## Quick start (native)
-**Prerequisites:** Go 1.2x, [Ollama](https://ollama.com/download) running on the host.
+## Quick start (not for production)
+**Prerequisites:**   
+
+- Go 1.2x. 
+- [Ollama](https://ollama.com/download) running on the host.  
+
+To get started quickly, follow these steps:
+
 ```bash
 # 1. Make sure Ollama is running
 ollama serve
@@ -69,9 +75,9 @@ open http://localhost:7000
 > Default admin password is `admin123`. Change it after first login via the admin UI.
 
 
-## macOS Service (launchd)
+## Installing Gateway42. as a service (launchd)
 
-Install gateway42 as a persistent background service that starts automatically at login:
+Install Gateway42. as a persistent background service that starts automatically at login:
 
 ```bash
 ./install.sh
@@ -105,7 +111,8 @@ The service restarts automatically on crash. It stops cleanly on `launchctl stop
 
 ## API reference
 
-Gateway42 exposes an **OpenAI-compatible API**. Point any OpenAI client at Gateway42 by changing the base URL and providing a Gateway42 API key.
+Gateway42 exposes an **OpenAI-compatible API**.  
+Point any OpenAI client at Gateway42 by changing the base URL and providing a Gateway42 API key.
 
 ### Base URL
 
@@ -224,6 +231,7 @@ New users are registered with a unique API key and start in **DISABLED** status.
 | New API key | Generates a fresh key and immediately invalidates the old one. Displayed once — copy it before leaving the page. |
 | Export CSV | Downloads all audit log entries for this user. Required before deletion. |
 | Delete | Permanently removes the user and their log entries. CSV export must be done first. |
+
 <img width="1555" height="906" alt="Image" src="https://github.com/user-attachments/assets/370260c3-4222-4f07-a983-c4e7bdf73713" />
 
 ### Model Management (Settings page)
@@ -231,7 +239,8 @@ New users are registered with a unique API key and start in **DISABLED** status.
 - View all models installed on the Ollama instance with their disk size
 - **Delete** a model to free disk space
 - **Search** for models on ollama.com and download them with live progress tracking
-- Supports both standard models (e.g. `llama3.2`) and namespaced models (e.g. `batiai/qwen3.6-35b`)
+- Supports both standard models (e.g. `llama3.2`) and namespaced models (e.g. `batiai/qwen3.6-35b`)  
+
 <img width="1554" height="806" alt="Image" src="https://github.com/user-attachments/assets/d99401c0-f270-4da4-837f-9a7568643520" />
 
 
