@@ -491,6 +491,8 @@ func (a *OpenAICompatAdapter) ChatStream(w http.ResponseWriter, r *http.Request,
 		}
 	}
 	flusher.Flush()
+
+	go logInteraction(userID, fmt.Sprintf("%v", req["messages"]), "streamed", modelName)
 }
 
 // ── Ollama-only helpers (search, pull, delete) ────────────────────────────────

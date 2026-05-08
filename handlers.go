@@ -759,9 +759,9 @@ func handleAdminLogsData(w http.ResponseWriter, r *http.Request) {
 	search := strings.TrimSpace(r.URL.Query().Get("q"))
 	page := maxInt(1, queryInt(r, "page", 1))
 
-	total, err := getLogsCount(search)
+	total, err := getRequestLogsCount(search)
 	if err != nil {
-		slog.Error("getLogsCount", "err", err)
+		slog.Error("getRequestLogsCount", "err", err)
 		jsonResponse(w, 500, map[string]string{"error": "Internal server error"})
 		return
 	}
@@ -770,9 +770,9 @@ func handleAdminLogsData(w http.ResponseWriter, r *http.Request) {
 	page = minInt(page, pages)
 	offset := (page - 1) * pageSize
 
-	slice, err := getLogsPage(search, pageSize, offset)
+	slice, err := getRequestLogsPage(search, pageSize, offset)
 	if err != nil {
-		slog.Error("getLogsPage", "err", err)
+		slog.Error("getRequestLogsPage", "err", err)
 		jsonResponse(w, 500, map[string]string{"error": "Internal server error"})
 		return
 	}
@@ -913,31 +913,30 @@ func handleExportAllLogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sqlRows, err := db.QueryContext(r.Context(),
-		`SELECT l.id, u.name, COALESCE(l.model,''), l.prompt, l.response, l.ts
-		FROM logs l JOIN users u ON u.id=l.user_id ORDER BY l.ts DESC`)
+		`SELECT id, ts, method, path, client_ip, user_name, status_code FROM request_logs ORDER BY ts DESC`)
 	if err != nil {
-		slog.Error("getLogs all", "err", err)
+		slog.Error("request_logs export", "err", err)
 		http.Error(w, "Internal server error", 500)
 		return
 	}
 	defer sqlRows.Close()
 
 	w.Header().Set("Content-Type", "text/csv")
-	w.Header().Set("Content-Disposition", "attachment; filename=all_logs.csv")
+	w.Header().Set("Content-Disposition", "attachment; filename=request_logs.csv")
 	w.Header().Set("Cache-Control", "no-store")
 
 	cw := csv.NewWriter(w)
-	cw.Write([]string{"log_id", "client_name", "model", "prompt", "response", "timestamp"})
+	cw.Write([]string{"id", "timestamp", "method", "path", "client_ip", "client_name", "status_code"})
 	for sqlRows.Next() {
-		var row LogRow
-		sqlRows.Scan(&row.ID, &row.Name, &row.Model, &row.Prompt, &row.Response, &row.TS)
+		var row RequestLogRow
+		sqlRows.Scan(&row.ID, &row.TS, &row.Method, &row.Path, &row.ClientIP, &row.UserName, &row.StatusCode)
 		cw.Write([]string{
-			strconv.Itoa(row.ID), row.Name, row.Model,
-			row.Prompt, row.Response, row.TS,
+			strconv.Itoa(row.ID), row.TS, row.Method, row.Path,
+			row.ClientIP, row.UserName, strconv.Itoa(row.StatusCode),
 		})
 	}
 	cw.Flush()
-	slog.Info("CSV export all logs")
+	slog.Info("CSV export request logs")
 }
 
 // ─────────────────────────────── Delete user ──────────────────────────────────
