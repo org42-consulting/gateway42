@@ -14,6 +14,7 @@ import (
 	"html/template"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -141,6 +142,17 @@ type SysLogEntry struct {
 	Level string `json:"level"`
 	Name  string `json:"name"`
 	Msg   string `json:"msg"`
+}
+
+// RequestLogRow represents a row in the HTTP request log
+type RequestLogRow struct {
+	ID         int    `json:"ID"`
+	TS         string `json:"TS"`
+	Method     string `json:"Method"`
+	Path       string `json:"Path"`
+	ClientIP   string `json:"ClientIP"`
+	UserName   string `json:"Name"`
+	StatusCode int    `json:"Status"`
 }
 
 // ─── Template data structs ────────────────────────────────────────────────────
@@ -348,9 +360,19 @@ func createSchema() error {
 			user_id   INTEGER NOT NULL,
 			timestamp REAL NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS request_logs(
+			id          INTEGER PRIMARY KEY AUTOINCREMENT,
+			ts          TEXT NOT NULL,
+			method      TEXT NOT NULL,
+			path        TEXT NOT NULL,
+			client_ip   TEXT NOT NULL,
+			user_name   TEXT NOT NULL DEFAULT '',
+			status_code INTEGER NOT NULL
+		)`,
 		`CREATE INDEX IF NOT EXISTS idx_logs_user_id ON logs(user_id)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_api_key ON users(api_key)`,
 		`CREATE INDEX IF NOT EXISTS idx_rate_limit_user_timestamp ON rate_limit_entries(user_id, timestamp)`,
+		`CREATE INDEX IF NOT EXISTS idx_request_logs_ts ON request_logs(ts)`,
 	}
 
 	for _, s := range stmts {
@@ -712,6 +734,66 @@ func getLogsPage(search string, limit, offset int) ([]LogRow, error) {
 	return out, sqlRows.Err()
 }
 
+// ── Request log queries ───────────────────────────────────────────────────────
+
+func insertRequestLog(method, path, clientIP, userName string, status int) {
+	_, err := db.Exec(
+		"INSERT INTO request_logs(ts, method, path, client_ip, user_name, status_code) VALUES(?,?,?,?,?,?)",
+		time.Now().UTC().Format(time.RFC3339), method, path, clientIP, userName, status,
+	)
+	if err != nil {
+		slog.Error("insertRequestLog", "err", err)
+	}
+}
+
+func getRequestLogsCount(search string) (int, error) {
+	var count int
+	var err error
+	if search != "" {
+		p := "%" + search + "%"
+		err = db.QueryRow(
+			`SELECT COUNT(*) FROM request_logs WHERE user_name LIKE ? OR path LIKE ? OR client_ip LIKE ?`,
+			p, p, p,
+		).Scan(&count)
+	} else {
+		err = db.QueryRow(`SELECT COUNT(*) FROM request_logs`).Scan(&count)
+	}
+	return count, err
+}
+
+func getRequestLogsPage(search string, limit, offset int) ([]RequestLogRow, error) {
+	var (
+		sqlRows *sql.Rows
+		err     error
+	)
+	if search != "" {
+		p := "%" + search + "%"
+		sqlRows, err = db.Query(
+			`SELECT id, ts, method, path, client_ip, user_name, status_code FROM request_logs
+			WHERE user_name LIKE ? OR path LIKE ? OR client_ip LIKE ?
+			ORDER BY ts DESC LIMIT ? OFFSET ?`,
+			p, p, p, limit, offset,
+		)
+	} else {
+		sqlRows, err = db.Query(
+			`SELECT id, ts, method, path, client_ip, user_name, status_code FROM request_logs
+			ORDER BY ts DESC LIMIT ? OFFSET ?`,
+			limit, offset,
+		)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer sqlRows.Close()
+	var out []RequestLogRow
+	for sqlRows.Next() {
+		var r RequestLogRow
+		sqlRows.Scan(&r.ID, &r.TS, &r.Method, &r.Path, &r.ClientIP, &r.UserName, &r.StatusCode)
+		out = append(out, r)
+	}
+	return out, sqlRows.Err()
+}
+
 // ── Admin queries ─────────────────────────────────────────────────────────────
 
 type AdminUser struct {
@@ -763,6 +845,7 @@ func resetSystem() error {
 	}
 	defer tx.Rollback()
 	tx.Exec("DELETE FROM logs")
+	tx.Exec("DELETE FROM request_logs")
 	tx.Exec("DELETE FROM rate_limit_entries")
 	return tx.Commit()
 }
@@ -993,6 +1076,56 @@ var corsHeaders = map[string]string{
 	"Access-Control-Max-Age":       "86400",
 }
 
+// ─────────────────────────────── Request logging ──────────────────────────────
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func newStatusRecorder(w http.ResponseWriter) *statusRecorder {
+	return &statusRecorder{ResponseWriter: w, status: 200}
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func requestLoggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/v1/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		clientIP := r.RemoteAddr
+		if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+			clientIP = host
+		}
+		if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+			clientIP = strings.TrimSpace(strings.SplitN(forwarded, ",", 2)[0])
+		}
+
+		var userName string
+		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+			if u, err := getUserByAPIKey(auth[7:]); err == nil && u != nil {
+				userName = u.Name
+			}
+		}
+
+		rec := newStatusRecorder(w)
+		next.ServeHTTP(rec, r)
+		go insertRequestLog(r.Method, r.URL.Path, clientIP, userName, rec.status)
+	})
+}
+
 // ─────────────────────────────── Router ───────────────────────────────────────
 
 func setupRouter() *mux.Router {
@@ -1008,6 +1141,7 @@ func setupRouter() *mux.Router {
 	r.PathPrefix("/v1/").Methods("OPTIONS").HandlerFunc(handleCorsPreflight)
 
 	// Middleware applied to all routes
+	r.Use(requestLoggingMiddleware)
 	r.Use(recoveryMiddleware)
 	r.Use(corsMiddleware)
 

@@ -75,15 +75,20 @@
 <div class="card help-section">
     <h2>Overview</h2>
     <p>
-        Gateway42 is a secure, multi-user proxy gateway for <a class="link" href="https://ollama.com" target="_blank">Ollama</a>.
-        It sits between your users and a shared Ollama instance, providing:
+        Gateway42 is a secure, multi-user API gateway for local and remote AI inference backends.
+        It sits between your users and your inference engines, exposing an <strong>OpenAI-compatible API</strong>
+        while adding authentication, logging, and rate limiting. Supported backends:
+        <a class="link" href="https://ollama.com" target="_blank">Ollama</a> (local) and any
+        <strong>OpenAI-compatible endpoint</strong> — LM Studio, oMLX, or the real OpenAI API.
     </p>
     <ul>
-        <li><strong>OpenAI-compatible API</strong> — clients built for the OpenAI API work with Gateway42 without modification.</li>
+        <li><strong>OpenAI-compatible API</strong> — clients built for the OpenAI API work with Gateway42 without modification — just swap the base URL and API key.</li>
+        <li><strong>Multiple engine backends</strong> — connect Ollama instances and OpenAI-compatible endpoints; manage them from the Settings page without restarting.</li>
         <li><strong>API key authentication</strong> — every user receives a unique key; only active users can send requests.</li>
         <li><strong>Per-user rate limiting</strong> — configurable maximum requests per minute per user.</li>
-        <li><strong>Audit logging</strong> — every prompt and response is stored with a timestamp, user, and model name.</li>
-        <li><strong>Admin dashboard</strong> — manage users, configure Ollama, search for and download models, and review logs.</li>
+        <li><strong>HTTP request logging</strong> — every API request is recorded with timestamp, client, IP, method, path, and status code.</li>
+        <li><strong>AI interaction logging</strong> — prompt and response for each chat completion, stored per user and exportable as CSV.</li>
+        <li><strong>Admin dashboard</strong> — manage users, configure engines, search for and download models, and review logs.</li>
     </ul>
 </div>
 
@@ -92,11 +97,12 @@
     <h2>Dashboard</h2>
     <p>The Dashboard is the main landing page after login. It shows two panels:</p>
 
-    <h3>Ollama Status</h3>
+    <h3>Engine Status</h3>
     <p>
-        Displays whether the configured Ollama instance is reachable, its base URL and port, and the list
-        of currently installed models. This panel is refreshed every time the page loads. If Ollama is
-        unreachable, the status shows <strong>INACTIVE</strong> and the model list is unavailable.
+        Displays whether the configured inference engines are reachable, along with their connection
+        details and the list of available models. This panel is refreshed every time the page loads.
+        If an engine is unreachable, its status shows <strong>INACTIVE</strong> and its model list
+        is unavailable. Configure engines on the <strong>Settings</strong> page.
     </p>
 
     <h3>Registered Users</h3>
@@ -118,8 +124,8 @@
                 is displayed once — copy it before closing the page.
             </td></tr>
             <tr><td>Export CSV</td><td>
-                Downloads all audit log entries for this user as a CSV file. This export is also required
-                before the user can be deleted.
+                Downloads all AI interaction log entries for this user as a CSV file. This export is also
+                required before the user can be deleted.
             </td></tr>
             <tr><td>Delete</td><td>
                 Permanently removes the user and all their log entries. You must export the user's CSV first.
@@ -137,8 +143,9 @@
 
     <h3>Reset System</h3>
     <p>
-        Permanently deletes <strong>all audit logs</strong> and <strong>all rate-limit counters</strong>.
-        User accounts and application settings are not affected. A confirmation dialog is shown first.
+        Permanently deletes <strong>all HTTP request logs</strong>, <strong>all AI interaction logs</strong>,
+        and <strong>all rate-limit counters</strong>.
+        User accounts and engine configurations are not affected. A confirmation dialog is shown first.
         This action cannot be undone.
     </p>
 </div>
@@ -146,32 +153,59 @@
 <!-- Settings -->
 <div class="card help-section" style="margin-top:24px;">
     <h2>Settings</h2>
-
-    <h3>Ollama Settings</h3>
     <p>
-        Configure the base URL and port of your Ollama instance. The gateway connects to
-        <code>{base_url}:{port}/api/chat</code> for completions and <code>/api/tags</code> for model discovery.
+        The Settings page is where you configure your inference backends. Two engine types are supported.
+        Changes take effect immediately — no restart required.
     </p>
+
+    <h3>Engine Types</h3>
+    <table class="help-table">
+        <thead><tr><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+            <tr>
+                <td><strong>Ollama</strong></td>
+                <td>
+                    A local (or LAN-accessible) <a class="link" href="https://ollama.com" target="_blank">Ollama</a>
+                    instance. Provide the host address and port (default: <code>11434</code>). The gateway
+                    translates OpenAI-format requests to Ollama's native API automatically.
+                </td>
+            </tr>
+            <tr>
+                <td><strong>OpenAI-compatible</strong></td>
+                <td>
+                    Any endpoint that speaks the OpenAI API — oMLX, LM Studio, vLLM, or the real OpenAI API.
+                    Provide the base URL and an API key if required. Requests pass through without translation.
+                </td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>Engine Management</h3>
+    <p>For each engine you can:</p>
     <ul>
-        <li><strong>Ollama Base URL</strong> — scheme and hostname, e.g. <code>http://127.0.0.1</code>.</li>
-        <li><strong>Port Number</strong> — typically <code>11434</code> (Ollama default). Valid range: 1–65535.</li>
-        <li><strong>Test Connectivity</strong> — sends a quick probe to Ollama and reports the version number.</li>
-        <li><strong>Save Settings</strong> — persists the URL and port to the database, overriding environment defaults.</li>
+        <li><strong>Add</strong> — name it, select the type, and provide the URL/host, port (Ollama), and API key (OpenAI-compatible).</li>
+        <li><strong>Edit</strong> — update an existing engine's connection details or API key.</li>
+        <li><strong>Remove</strong> — delete an engine you no longer need.</li>
+        <li><strong>Test</strong> — probe connectivity and see which models the engine reports.</li>
     </ul>
 
-    <h3>Model Management</h3>
+    <h3>Engine Selection</h3>
     <p>
-        Displays all models currently installed on the Ollama instance, including their disk size.
-        This panel is greyed out when Ollama is unreachable.
+        When a request arrives at <code>/v1/chat/completions</code>, Gateway42 routes it to the first
+        configured Ollama engine. If no Ollama engine is configured, it falls back to the first engine
+        of any type.
+    </p>
+
+    <h3>Model Management (Ollama engines)</h3>
+    <p>
+        Displays all models currently installed on an Ollama engine, including their disk size.
+        This panel is greyed out when the engine is unreachable.
     </p>
     <ul>
-        <li>
-            <strong>Delete</strong> — removes a model from the Ollama instance. A confirmation dialog is shown first.
-            This frees disk space but does not affect audit logs that referenced that model.
-        </li>
+        <li><strong>Delete</strong> — removes a model from the Ollama instance. A confirmation dialog is shown first. This frees disk space but does not affect logs that referenced that model.</li>
     </ul>
 
-    <h3>Search Models</h3>
+    <h3>Search Models (Ollama engines)</h3>
     <p>
         Search for available models on <a class="link" href="https://ollama.com/search" target="_blank">ollama.com</a>.
         Enter a model name or keyword and click <em>Search</em>. Results show matching models from the Ollama library,
@@ -199,38 +233,42 @@
 <div class="card help-section" style="margin-top:24px;">
     <h2>Logs</h2>
     <p>
-        Every API request processed by Gateway42 is recorded. The Logs page shows the most recent
-        200 entries by default.
+        Gateway42 maintains two layers of logs. The Logs page shows the <strong>HTTP request log</strong> —
+        every request to <code>/v1/</code> endpoints, most recent first (200 entries by default).
+        The <strong>AI interaction log</strong> (prompt and response per completion) is stored per user
+        and accessible via the <em>Export CSV</em> button on each user's row in the Dashboard.
     </p>
 
-    <h3>Columns</h3>
+    <h3>HTTP Request Log Columns</h3>
     <table class="help-table">
         <thead><tr><th>Column</th><th>Description</th></tr></thead>
         <tbody>
-            <tr><td>Time</td><td>UTC timestamp of the request (YYYY-MM-DD HH:MM:SS).</td></tr>
+            <tr><td>Time</td><td>UTC timestamp of the request.</td></tr>
             <tr><td>Client</td><td>Name of the client whose API key was used.</td></tr>
-            <tr><td>Model</td><td>The Ollama model name specified in the request. Shows <em>—</em> for older entries recorded before model tracking was added.</td></tr>
-            <tr><td>Prompt</td><td>The full message list sent to the model, truncated for display. Hover to see more.</td></tr>
-            <tr><td>Response</td><td>The model's reply, truncated for display. Streaming responses are recorded as <em>streamed</em>.</td></tr>
+            <tr><td>IP</td><td>Client IP address.</td></tr>
+            <tr><td>Method</td><td>HTTP method (e.g. <code>POST</code>, <code>GET</code>).</td></tr>
+            <tr><td>Path</td><td>Request path (e.g. <code>/v1/chat/completions</code>).</td></tr>
+            <tr><td>Status</td><td>HTTP response status code. Color-coded: green for 2xx, amber for 4xx, red for 5xx.</td></tr>
         </tbody>
     </table>
 
     <h3>Search</h3>
     <p>
-        The search field filters logs by prompt text, response text, or client name. Results update on
+        The search field filters logs by username, path, or IP address. Results update on
         submission. Click <em>Clear</em> to reset the filter.
     </p>
 
     <h3>Auto-refresh</h3>
     <p>
         The auto-refresh dropdown polls the server in the background and updates the log table in place
-        without a full page reload. Options: Off, 5 s, 10 s (default), 30 s, 60 s.
+        without a full page reload. Options: Off, 5 s, 10 s, 30 s, 60 s.
     </p>
 
     <h3>Export CSV</h3>
     <p>
-        Downloads <strong>all</strong> log entries (not just the current 200) as a CSV file with columns:
-        <code>log_id</code>, <code>client_name</code>, <code>model</code>, <code>prompt</code>, <code>response</code>, <code>timestamp</code>.
+        Downloads <strong>all</strong> HTTP request log entries (not just the current 200) as a CSV file with columns:
+        <code>id</code>, <code>timestamp</code>, <code>method</code>, <code>path</code>,
+        <code>client_ip</code>, <code>client_name</code>, <code>status_code</code>.
     </p>
 
     <h3>Reset System</h3>
@@ -261,7 +299,7 @@
             <tr>
                 <td><code>/v1/models</code></td>
                 <td><span class="pill pill-get">GET</span></td>
-                <td>Returns the list of models installed on Ollama in OpenAI format.</td>
+                <td>Returns models from the first configured engine in OpenAI format.</td>
             </tr>
             <tr>
                 <td><code>/v1/chat/completions</code></td>
@@ -302,8 +340,8 @@ response = client.chat.completions.create(
 )
 print(response.choices[0].message.content)</pre>
 
-    <h3>Supported Parameters</h3>
-    <p>The following OpenAI request parameters are translated to Ollama equivalents:</p>
+    <h3>Parameters — Ollama engine</h3>
+    <p>When routing to an Ollama engine, Gateway42 translates standard OpenAI parameters to their Ollama equivalents:</p>
     <table class="help-table">
         <thead><tr><th>OpenAI parameter</th><th>Ollama parameter</th><th>Notes</th></tr></thead>
         <tbody>
@@ -320,13 +358,22 @@ print(response.choices[0].message.content)</pre>
         </tbody>
     </table>
 
+    <h3>Parameters — OpenAI-compatible engine</h3>
+    <p>
+        When routing to an OpenAI-compatible engine, all standard OpenAI parameters pass through directly
+        with no translation: <code>temperature</code>, <code>top_p</code>, <code>seed</code>,
+        <code>max_tokens</code>, <code>max_completion_tokens</code>, <code>frequency_penalty</code>,
+        <code>presence_penalty</code>, <code>stop</code>, <code>response_format</code>,
+        <code>tools</code>, <code>tool_choice</code>, and others.
+    </p>
+
     <h3>Error Codes</h3>
     <table class="help-table">
         <thead><tr><th>HTTP Status</th><th>Meaning</th></tr></thead>
         <tbody>
             <tr><td><code>401</code></td><td>Missing, invalid, or deactivated API key.</td></tr>
             <tr><td><code>429</code></td><td>Rate limit exceeded. Wait before retrying.</td></tr>
-            <tr><td><code>502</code></td><td>Gateway42 could not reach the Ollama instance.</td></tr>
+            <tr><td><code>502</code></td><td>Gateway42 could not reach the configured engine.</td></tr>
             <tr><td><code>500</code></td><td>Internal server error.</td></tr>
         </tbody>
     </table>
@@ -350,18 +397,20 @@ print(response.choices[0].message.content)</pre>
 <!-- Configuration -->
 <div class="card help-section" style="margin-top:24px;">
     <h2>Configuration</h2>
-    <p>Gateway42 is configured via environment variables. The two marked <strong>required</strong> must be set or the application will refuse to start.</p>
+    <p>Gateway42 is configured via environment variables. No variables are strictly required — sensible defaults are applied. Engine connections are managed through the admin UI, not environment variables.</p>
     <table class="help-table">
-        <thead><tr><th>Variable</th><th>Required</th><th>Default</th><th>Description</th></tr></thead>
+        <thead><tr><th>Variable</th><th>Default</th><th>Description</th></tr></thead>
         <tbody>
-            <tr><td><code>ADMIN_PASSWORD</code></td><td>Yes</td><td>—</td><td>Password for the admin login page.</td></tr>
-            <tr><td><code>OLLAMA_URL</code></td><td>No</td><td><code>http://127.0.0.1:11434/api/chat</code></td><td>Default Ollama endpoint. Can be overridden via the Settings page.</td></tr>
-            <tr><td><code>GW42_DB_PATH</code></td><td>No</td><td><code>./db/gateway.db</code></td><td>Path to the SQLite database file.</td></tr>
-            <tr><td><code>DEFAULT_RATE_LIMIT</code></td><td>No</td><td><code>10</code></td><td>Default requests-per-minute for newly registered users.</td></tr>
-            <tr><td><code>SESSION_TIMEOUT</code></td><td>No</td><td><code>3600</code></td><td>Admin session lifetime in seconds.</td></tr>
-            <tr><td><code>MAX_MESSAGE_LENGTH</code></td><td>No</td><td><code>10000</code></td><td>Maximum characters stored per prompt or response in the audit log.</td></tr>
-            <tr><td><code>LOG_LEVEL</code></td><td>No</td><td><code>INFO</code></td><td>Logging level (<code>DEBUG</code>, <code>INFO</code>).</td></tr>
-            <tr><td><code>LOG_FILE</code></td><td>No</td><td><code>./logs/gateway.log</code></td><td>Path to the application log file (directory is created automatically).</td></tr>
+            <tr><td><code>ADMIN_PASSWORD</code></td><td><code>admin123</code></td><td>Password for the admin login page. <strong>Change after first login.</strong></td></tr>
+            <tr><td><code>PORT</code></td><td><code>7000</code></td><td>Port the HTTP/HTTPS server listens on.</td></tr>
+            <tr><td><code>GW42_DB_PATH</code></td><td><code>./db/gateway.db</code></td><td>Path to the SQLite database file. Avoid network-mounted filesystems.</td></tr>
+            <tr><td><code>DEFAULT_RATE_LIMIT</code></td><td><code>10</code></td><td>Default requests-per-minute for newly registered users.</td></tr>
+            <tr><td><code>SESSION_TIMEOUT</code></td><td><code>3600</code></td><td>Admin session lifetime in seconds.</td></tr>
+            <tr><td><code>MAX_MESSAGE_LENGTH</code></td><td><code>262144</code></td><td>Maximum characters stored per prompt or response in the AI interaction log (~256 KB).</td></tr>
+            <tr><td><code>LOG_LEVEL</code></td><td><code>INFO</code></td><td>Log verbosity: <code>DEBUG</code>, <code>INFO</code>, <code>WARNING</code>, <code>ERROR</code>.</td></tr>
+            <tr><td><code>LOG_FILE</code></td><td><code>./logs/gateway.log</code></td><td>Path to the application log file (directory is created automatically).</td></tr>
+            <tr><td><code>TLS_CERT</code></td><td>—</td><td>Path to TLS certificate file. When set with <code>TLS_KEY</code>, enables HTTPS.</td></tr>
+            <tr><td><code>TLS_KEY</code></td><td>—</td><td>Path to TLS private key file. When set with <code>TLS_CERT</code>, enables HTTPS.</td></tr>
         </tbody>
     </table>
 </div>

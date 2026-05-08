@@ -5,20 +5,22 @@
 SERVICE_NAME="com.gateway42.service"
 SERVICE_PLIST="$HOME/Library/LaunchAgents/gateway42.plist"
 
+DOMAIN="gui/$(id -u)"
+
 case "$1" in
     start)
         echo "Starting gateway42 service..."
-        launchctl load "$SERVICE_PLIST"
+        launchctl bootstrap "$DOMAIN" "$SERVICE_PLIST"
         ;;
     stop)
         echo "Stopping gateway42 service..."
-        launchctl unload "$SERVICE_PLIST"
+        launchctl bootout "$DOMAIN/$SERVICE_NAME"
         ;;
     restart)
         echo "Restarting gateway42 service..."
-        launchctl unload "$SERVICE_PLIST"
-        sleep 2
-        launchctl load "$SERVICE_PLIST"
+        launchctl bootout "$DOMAIN/$SERVICE_NAME" 2>/dev/null
+        sleep 1
+        launchctl bootstrap "$DOMAIN" "$SERVICE_PLIST"
         ;;
     status)
         echo "Checking gateway42 service status..."
