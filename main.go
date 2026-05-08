@@ -15,7 +15,6 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -45,7 +44,6 @@ var imageFS embed.FS
 // Config holds the application configuration
 type Config struct {
 	DBPath        string
-	OllamaURL     string
 	AdminPassword string
 	DefaultRL     int
 	SessionTTL    int
@@ -81,11 +79,10 @@ func getEnvInt(key string, fallback int) int {
 func loadConfig() Config {
 	c := Config{
 		DBPath:        getEnv("GW42_DB_PATH", "./db/gateway.db"),
-		OllamaURL:     getEnv("OLLAMA_URL", "http://127.0.0.1:11434/api/chat"),
 		AdminPassword: getEnv("ADMIN_PASSWORD", ""),
 		DefaultRL:     getEnvInt("DEFAULT_RATE_LIMIT", 10),
 		SessionTTL:    getEnvInt("SESSION_TIMEOUT", 3600),
-		MaxMsgLen:     getEnvInt("MAX_MESSAGE_LENGTH", 10000),
+		MaxMsgLen:     getEnvInt("MAX_MESSAGE_LENGTH", 262144), // ~256KB
 		LogLevel:      getEnv("LOG_LEVEL", "INFO"),
 		LogFile:       getEnv("LOG_FILE", "./logs/gateway.log"),
 		Port:          getEnv("PORT", "7000"),
@@ -157,21 +154,20 @@ type BaseData struct {
 // DashboardData holds data for the dashboard page
 type DashboardData struct {
 	BaseData
-	Users        []User
-	OllamaURL    string
-	OllamaPort   int
-	OllamaStatus bool
-	OllamaModels []string
+	Users      []User
+	Engines    []EngineConfig
+	EngineURLs   map[string]string   // engineID → "host:port"
+	EngineStatus map[string]bool     // engineID → reachable
+	EngineModels map[string][]string // engineID → model names
 }
 
 // SettingsData holds data for the settings page
 type SettingsData struct {
 	BaseData
-	OllamaURL          string
-	OllamaPort         int
-	OllamaStatus       bool
-	OllamaModels       []string
-	OllamaModelDetails []ModelDetail
+	Engines            []EngineConfig
+	EngineURLs         map[string]string
+	EngineStatus       map[string]bool
+	EngineModelDetails map[string][]ModelDetail // engineID → model details
 	SearchResults      []ModelDetail
 }
 
@@ -907,49 +903,33 @@ func consumeFlashes(w http.ResponseWriter, r *http.Request, sess *sessions.Sessi
 	return flashes
 }
 
-// ─────────────────────────────── Ollama URL helper ─────────────────────────────
+// ── Engine helpers ─────────────────────────────────────────────────────────────
 
-func getOllamaBaseURL() string {
-	savedURL := getSetting("ollama_url", "")
-	if savedURL != "" {
-		savedPort := getSetting("ollama_port", "11434")
-		return savedURL + ":" + savedPort
+// getEngineURLs returns a map of engineID → "host:port" for all configured engines.
+func getEngineURLs(engines []EngineConfig) map[string]string {
+	urls := make(map[string]string)
+	for _, e := range engines {
+		urls[fmt.Sprintf("%d", e.ID)] = engineEndpoint(e)
 	}
-	parsed, err := url.Parse(cfg.OllamaURL)
-	if err != nil {
-		return "http://127.0.0.1:11434"
-	}
-	scheme := parsed.Scheme
-	if scheme == "" {
-		scheme = "http"
-	}
-	host := parsed.Hostname()
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	port := parsed.Port()
-	if port == "" {
-		port = "11434"
-	}
-	return fmt.Sprintf("%s://%s:%s", scheme, host, port)
+	return urls
 }
 
-func parseOllamaSettings() (string, int) {
-	savedURL := getSetting("ollama_url", "")
-	if savedURL != "" {
-		port, _ := strconv.Atoi(getSetting("ollama_port", "11434"))
+// engineEndpoint returns the full endpoint for an engine config.
+func engineEndpoint(cfg EngineConfig) string {
+	host := cfg.BaseURL
+	if cfg.Type == EngineOllama {
+		u := strings.TrimRight(host, "/")
+		port := cfg.Port
 		if port == 0 {
 			port = 11434
 		}
-		return savedURL, port
+		return fmt.Sprintf("%s:%d", u, port)
 	}
-	parsed, _ := url.Parse(cfg.OllamaURL)
-	host := "http://" + parsed.Hostname()
-	port := 11434
-	if p := parsed.Port(); p != "" {
-		port, _ = strconv.Atoi(p)
+	// OpenAI-compatible: include port if non-standard
+	if !strings.HasPrefix(host, "http://") && !strings.HasPrefix(host, "https://") {
+		host = "http://" + host
 	}
-	return host, port
+	return strings.TrimRight(host, "/")
 }
 
 // ─────────────────────────────── Templates ────────────────────────────────────
@@ -990,84 +970,6 @@ func renderPage(w http.ResponseWriter, page string, data interface{}) {
 	if err := t.ExecuteTemplate(w, name, data); err != nil {
 		slog.Error("template error", "page", page, "err", err)
 	}
-}
-
-// ─────────────────────────── Ollama probe cache ───────────────────────────────
-
-type ollamaProbeData struct {
-	status  bool
-	models  []string
-	details []ModelDetail
-	url     string
-	port    int
-}
-
-var (
-	ollamaProbeMu    sync.Mutex
-	ollamaProbeState ollamaProbeData
-	ollamaProbeExpiry time.Time
-)
-
-const ollamaProbeTTL = 15 * time.Second
-
-// probeOllamaCached returns Ollama status, model names, and model details,
-// caching the result for ollamaProbeTTL to avoid blocking every page load.
-func probeOllamaCached(baseURL string, port int) (bool, []string, []ModelDetail) {
-	ollamaProbeMu.Lock()
-	defer ollamaProbeMu.Unlock()
-	if time.Now().Before(ollamaProbeExpiry) &&
-		ollamaProbeState.url == baseURL &&
-		ollamaProbeState.port == port {
-		return ollamaProbeState.status, ollamaProbeState.models, ollamaProbeState.details
-	}
-	status, models, details := probeOllamaFull(baseURL, port)
-	ollamaProbeState = ollamaProbeData{
-		status: status, models: models, details: details,
-		url: baseURL, port: port,
-	}
-	ollamaProbeExpiry = time.Now().Add(ollamaProbeTTL)
-	return status, models, details
-}
-
-// probeOllamaFull checks Ollama connectivity and returns status, model names,
-// and model details in a single pair of HTTP calls.
-func probeOllamaFull(baseURL string, port int) (bool, []string, []ModelDetail) {
-	endpoint := fmt.Sprintf("%s:%d", baseURL, port)
-	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get(endpoint + "/api/version")
-	if err != nil || resp.StatusCode != 200 {
-		return false, nil, nil
-	}
-	resp.Body.Close()
-
-	client2 := &http.Client{Timeout: 5 * time.Second}
-	resp2, err := client2.Get(endpoint + "/api/tags")
-	if err != nil || resp2.StatusCode != 200 {
-		return true, nil, nil
-	}
-	defer resp2.Body.Close()
-	var tags map[string]interface{}
-	json.NewDecoder(resp2.Body).Decode(&tags)
-	models, _ := tags["models"].([]interface{})
-	var names []string
-	var details []ModelDetail
-	for _, m := range models {
-		mm, ok := m.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		name, _ := mm["name"].(string)
-		names = append(names, name)
-		sizeB := toInt(mm["size"])
-		var sizeStr string
-		if sizeB >= 1_000_000_000 {
-			sizeStr = fmt.Sprintf("%.1f GB", float64(sizeB)/1e9)
-		} else {
-			sizeStr = fmt.Sprintf("%d MB", sizeB/1_000_000)
-		}
-		details = append(details, ModelDetail{Name: name, Size: sizeStr})
-	}
-	return true, names, details
 }
 
 // ─────────────────────────────── Background tasks ─────────────────────────────
@@ -1118,11 +1020,12 @@ func setupRouter() *mux.Router {
 	// Admin UI
 	r.HandleFunc("/admin/panel", handleAdminPanel).Methods("GET")
 	r.HandleFunc("/admin/settings-page", handleAdminSettingsPage).Methods("GET")
-	r.HandleFunc("/admin/ollama-test", handleOllamaTest).Methods("GET")
+	r.HandleFunc("/admin/engine-test", handleEngineTest).Methods("GET")
 	r.HandleFunc("/admin/ollama-pull-stream", handleOllamaPullStream).Methods("GET")
 	r.HandleFunc("/admin/ollama-pull-search-stream", handleOllamaPullSearchStream).Methods("GET")
 	r.HandleFunc("/admin/ollama-delete-model", handleOllamaDeleteModel).Methods("POST")
-	r.HandleFunc("/admin/ollama-settings", handleOllamaSettings).Methods("POST")
+	r.HandleFunc("/admin/engine-settings", handleEngineSettings).Methods("POST")
+	r.HandleFunc("/admin/engine-remove", handleRemoveEngine).Methods("POST")
 	r.HandleFunc("/admin/ollama-search", handleOllamaSearch).Methods("GET")
 	r.HandleFunc("/admin/change-password", handleChangePassword).Methods("POST")
 	r.HandleFunc("/admin/help", handleAdminHelp).Methods("GET")

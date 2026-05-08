@@ -4,49 +4,48 @@
 <div class="flash flash-{{.Category}}">{{.Message}}</div>
 {{end}}
 
-<!-- Ollama Status -->
-<div id="ollama-status" class="card mb-6">
-    <h2>Ollama Status</h2>
+<!-- Engine Status -->
+<div id="engine-status" class="card mb-6">
+    <h2>Engine Status</h2>
     <div class="table-wrap">
         <div class="scroll-x">
             <table class="data-table">
                 <thead>
                     <tr>
-                        <th style="width:120px;">Property</th>
-                        <th>Value</th>
+                        <th style="width:100px;">Type</th>
+                        <th>Name</th>
+                        <th style="width:180px;">Endpoint</th>
+                        <th style="width:100px;">Status</th>
+                        <th>Models</th>
                     </tr>
                 </thead>
                 <tbody>
+                    {{range .Engines}}
                     <tr>
-                        <td>Status</td>
+                        <td><span class="model-tag">{{.Type}}</span></td>
+                        <td>{{.Name}}</td>
+                        <td class="text-hint" style="white-space:normal;">{{index $.EngineURLs (printf "%d" .ID)}}</td>
                         <td>
-                            {{if .OllamaStatus}}
+                            {{if index $.EngineStatus (printf "%d" .ID)}}
                                 <span class="badge badge-active">ACTIVE</span>
                             {{else}}
                                 <span class="badge badge-disabled">INACTIVE</span>
                             {{end}}
                         </td>
-                    </tr>
-                    <tr>
-                        <td>Endpoint</td>
-                        <td>{{.OllamaURL}}:{{.OllamaPort}}</td>
-                    </tr>
-                    <tr>
-                        <td>Models</td>
                         <td>
-                            {{if .OllamaModels}}
-                            <div class="flex-row" style="gap:6px;">
-                                {{range .OllamaModels}}
-                                <span class="model-tag">{{.}}</span>
-                                {{end}}
-                            </div>
-                            {{else}}
-                            <span class="text-hint" style="font-weight:700;">
-                                {{if .OllamaStatus}}No models found.{{else}}Unavailable — Ollama is not reachable.{{end}}
-                            </span>
+                            {{range index $.EngineModels (printf "%d" .ID)}}
+                            <span class="model-tag">{{.}}</span>
+                            {{end}}
+                            {{if not (index $.EngineModels (printf "%d" .ID))}}
+                                {{if $.Engines}}<span class="text-hint">No models</span>{{else}}<span class="text-hint">No engines configured</span>{{end}}
                             {{end}}
                         </td>
                     </tr>
+                    {{else}}
+                    <tr>
+                        <td colspan="5" class="text-hint" style="text-align:center;padding:20px;">No engines configured. Add one in Settings.</td>
+                    </tr>
+                    {{end}}
                 </tbody>
             </table>
         </div>

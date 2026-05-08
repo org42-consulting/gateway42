@@ -4,51 +4,84 @@
 <div class="flash flash-{{.Category}}">{{.Message}}</div>
 {{end}}
 
-<div id="ollama-settings" class="card">
-    <h2>Ollama Settings</h2>
-    <form action="/admin/ollama-settings" method="post" class="space-y-3">
+<div id="engine-settings" class="card">
+    <h2>Engine Settings</h2>
+    <form action="/admin/engine-settings" method="post" class="space-y-3">
         <div>
-            <label>Ollama Base URL</label>
-            <input type="text" name="ollama_url" value="{{.OllamaURL}}" placeholder="e.g., http://127.0.0.1">
+            <label>Engine Type</label>
+            <select name="engine_type" id="engine-type" class="select-sm">
+                <option value="ollama">Ollama</option>
+                <option value="openai_compat">OpenAI-Compatible</option>
+            </select>
         </div>
         <div>
+            <label>Engine Name</label>
+            <input type="text" name="engine_name" placeholder="e.g., Local Ollama">
+        </div>
+        <div>
+            <label>Base URL</label>
+            <input type="text" name="base_url" id="base-url" placeholder="e.g., http://127.0.0.1">
+        </div>
+        <div id="port-field">
             <label>Port Number</label>
-            <input type="number" name="port" value="{{.OllamaPort}}" placeholder="e.g., 11434">
+            <input type="number" name="port" id="port-input" value="11434" placeholder="e.g., 11434">
         </div>
+        <div id="api-key-field">
+            <label>API Key (optional)</label>
+            <input type="password" name="api_key" placeholder="e.g., sk-...">
+        </div>
+        <input type="hidden" name="engine_id" id="engine-id" value="">
         <div class="flex-row" style="padding-top:4px;">
-            <button class="btn btn-primary" type="submit">Save Settings</button>
-            <a href="/admin/ollama-test" class="btn btn-ghost">Test Connectivity</a>
+            <button class="btn btn-primary" type="submit" id="save-btn">Add Engine</button>
+            <a href="/admin/engine-test" class="btn btn-ghost">Test Connectivity</a>
         </div>
     </form>
 </div>
 
 <!-- Model Management Card -->
 <style>.card-inactive { opacity:.45; pointer-events:none; }</style>
-<div class="card card-mt {{if not .OllamaStatus}}card-inactive{{end}}">
+<div class="card card-mt">
     <h2>Model Management</h2>
 
-    {{if .OllamaModelDetails}}
+    {{if .Engines}}
     <div class="table-wrap" style="margin-bottom:20px;">
         <div class="scroll-x">
             <table class="data-table">
                 <thead>
                     <tr>
-                        <th>Model</th>
-                        <th style="width:90px;">Size</th>
-                        <th style="width:80px;"></th>
+                        <th>Engine</th>
+                        <th>Status</th>
+                        <th>Models</th>
                     </tr>
                 </thead>
                 <tbody>
-                    {{range .OllamaModelDetails}}
+                    {{range .Engines}}
                     <tr>
-                        <td>{{.Name}}</td>
-                        <td class="text-hint" style="white-space:normal;">{{.Size}}</td>
+                        <td><span class="model-tag">{{.Type}}</span> {{.Name}}</td>
                         <td>
-                            <form action="/admin/ollama-delete-model" method="post"
-                                  onsubmit="return confirm('Delete {{.Name}}? This cannot be undone.');">
-                                <input type="hidden" name="model" value="{{.Name}}">
-                                <button type="submit" class="btn btn-danger btn-small">Delete</button>
+                            {{if index $.EngineStatus (printf "%d" .ID)}}
+                                <span class="badge badge-active">ACTIVE</span>
+                            {{else}}
+                                <span class="badge badge-disabled">INACTIVE</span>
+                            {{end}}
+                        </td>
+                        <td>
+                            <form action="/admin/engine-remove" method="post" class="form-inline"
+                                  onsubmit="return confirm('Remove this engine? This cannot be undone.');">
+                                <input type="hidden" name="engine_id" value="{{.ID}}">
+                                <button type="submit" class="btn btn-danger btn-small">Remove</button>
                             </form>
+                        </td>
+                        <td>
+                            {{if index $.EngineModelDetails (printf "%d" .ID)}}
+                                <div class="flex-row" style="gap:4px;">
+                                    {{range index $.EngineModelDetails (printf "%d" .ID)}}
+                                    <span class="model-tag">{{.Name}}{{if .Size}} ({{.Size}}){{end}}</span>
+                                    {{end}}
+                                </div>
+                            {{else}}
+                                <span class="text-hint">No models</span>
+                            {{end}}
                         </td>
                     </tr>
                     {{end}}
@@ -57,7 +90,7 @@
         </div>
     </div>
     {{else}}
-    <p class="text-hint" style="margin-bottom:16px; white-space:normal;">No models installed.</p>
+    <p class="text-hint" style="margin-bottom:16px; white-space:normal;">No engines configured. Add one above.</p>
     {{end}}
 
     <!-- Search Models Section -->
@@ -141,6 +174,23 @@
 
 {{define "scripts"}}
 <script>
+(function() {
+    const sel = document.getElementById('engine-type');
+    const portField = document.getElementById('port-field');
+    const apiKeyField = document.getElementById('api-key-field');
+    const baseUrlInput = document.getElementById('base-url');
+
+    function update() {
+        const isOllama = sel.value === 'ollama';
+        portField.style.display = isOllama ? '' : 'none';
+        apiKeyField.style.display = isOllama ? 'none' : '';
+        baseUrlInput.placeholder = isOllama ? 'e.g., http://127.0.0.1' : 'e.g., http://127.0.0.1:8000';
+    }
+
+    sel.addEventListener('change', update);
+    update();
+})();
+
 function startSearch() {
     const query = document.getElementById('search-model-name').value.trim();
     if (!query) return;
