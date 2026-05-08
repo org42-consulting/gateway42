@@ -47,4 +47,5 @@ gateway42
 
 # SSL certificates and scripts
 ssl/
+tls/
 

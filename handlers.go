@@ -98,16 +98,30 @@ func handleAdminPanel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ollamaURL, ollamaPort := parseOllamaSettings()
-	ollamaStatus, ollamaModels, _ := probeOllamaCached(ollamaURL, ollamaPort)
+	engines, err := getEngines()
+	if err != nil {
+		engines = nil
+	}
+	enginesURLs := getEngineURLs(engines)
+	enginesStatus := make(map[string]bool)
+	enginesModels := make(map[string][]string)
+	for _, e := range engines {
+		adapter, err := newEngine(e)
+		if err != nil {
+			continue
+		}
+		status, models, _ := probeEngineFull(adapter)
+		enginesStatus[fmt.Sprintf("%d", e.ID)] = status
+		enginesModels[fmt.Sprintf("%d", e.ID)] = models
+	}
 
 	renderPage(w, "dashboard", DashboardData{
 		BaseData:     BaseData{Flashes: flashes, CurrentPath: r.URL.Path},
 		Users:        users,
-		OllamaURL:    ollamaURL,
-		OllamaPort:   ollamaPort,
-		OllamaStatus: ollamaStatus,
-		OllamaModels: ollamaModels,
+		Engines:      engines,
+		EngineURLs:   enginesURLs,
+		EngineStatus: enginesStatus,
+		EngineModels: enginesModels,
 	})
 }
 
@@ -121,42 +135,68 @@ func handleAdminSettingsPage(w http.ResponseWriter, r *http.Request) {
 	sess := getSession(r)
 	flashes := consumeFlashes(w, r, sess)
 
-	ollamaURL, ollamaPort := parseOllamaSettings()
-	ollamaStatus, ollamaModels, modelDetails := probeOllamaCached(ollamaURL, ollamaPort)
+	engines, err := getEngines()
+	if err != nil {
+		engines = nil
+	}
+	engineURLs := getEngineURLs(engines)
+	engineStatus := make(map[string]bool)
+	engineModelDetails := make(map[string][]ModelDetail)
+	for _, e := range engines {
+		adapter, err := newEngine(e)
+		if err != nil {
+			continue
+		}
+		status, _, details := probeEngineFull(adapter)
+		engineStatus[fmt.Sprintf("%d", e.ID)] = status
+		engineModelDetails[fmt.Sprintf("%d", e.ID)] = details
+	}
 
 	renderPage(w, "settings", SettingsData{
 		BaseData:           BaseData{Flashes: flashes, CurrentPath: r.URL.Path},
-		OllamaURL:          ollamaURL,
-		OllamaPort:         ollamaPort,
-		OllamaStatus:       ollamaStatus,
-		OllamaModels:       ollamaModels,
-		OllamaModelDetails: modelDetails,
+		Engines:            engines,
+		EngineURLs:         engineURLs,
+		EngineStatus:       engineStatus,
+		EngineModelDetails: engineModelDetails,
 		SearchResults:      []ModelDetail{}, // Will be populated by search
 	})
 }
 
 
-// ─────────────────────────────── Ollama management ────────────────────────────
-
-func handleOllamaTest(w http.ResponseWriter, r *http.Request) {
+func handleEngineTest(w http.ResponseWriter, r *http.Request) {
 	if !isAdminSession(r) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
-	baseURL := getOllamaBaseURL()
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(baseURL + "/api/version")
-	if err != nil {
-		addFlash(w, r, "error", fmt.Sprintf("Could not reach Ollama: %v", err))
-	} else {
-		defer resp.Body.Close()
-		var ver map[string]interface{}
-		json.NewDecoder(resp.Body).Decode(&ver)
-		version, _ := ver["version"].(string)
-		if version == "" {
-			version = "unknown"
+	engines, _ := getEngines()
+	if len(engines) == 0 {
+		addFlash(w, r, "error", "No engines configured")
+		http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
+		return
+	}
+	var results []string
+	for _, e := range engines {
+		adapter, err := newEngine(e)
+		if err != nil {
+			results = append(results, fmt.Sprintf("%s: error (%v)", e.Name, err))
+			continue
 		}
-		addFlash(w, r, "success", fmt.Sprintf("Connected — Ollama version %s", version))
+		status, err := adapter.Status()
+		if err != nil {
+			results = append(results, fmt.Sprintf("%s: unreachable (%v)", e.Name, err))
+			continue
+		}
+		if status {
+			results = append(results, fmt.Sprintf("%s: OK (%s)", e.Name, e.Type))
+		} else {
+			results = append(results, fmt.Sprintf("%s: not responding", e.Name))
+		}
+	}
+	msg := strings.Join(results, "; ")
+	if len(results) == 1 && strings.Contains(results[0], "OK") {
+		addFlash(w, r, "success", results[0])
+	} else {
+		addFlash(w, r, "info", msg)
 	}
 	http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
 }
@@ -169,17 +209,34 @@ func ollamaPullStream(w http.ResponseWriter, r *http.Request, model string) {
 		return
 	}
 
+	engines, _ := getEngines()
+	var adapter Engine
+	for _, e := range engines {
+		if e.Type == EngineOllama {
+			a, err := newEngine(e)
+			if err == nil {
+				adapter = a
+				break
+			}
+		}
+	}
+	if adapter == nil {
+		fmt.Fprintf(w, "data: %s\n\n", jsonErr("No Ollama engine configured"))
+		flusher.Flush()
+		return
+	}
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.Header().Set("Cache-Control", "no-cache")
 
-	baseURL := getOllamaBaseURL()
+	endpoint := adapter.baseURL()
 	body, _ := json.Marshal(map[string]interface{}{"name": model, "stream": true})
 
 	ctx, cancel := context.WithTimeout(r.Context(), 600*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, "POST", baseURL+"/api/pull", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint+"/api/pull", bytes.NewReader(body))
 	if err != nil {
 		fmt.Fprintf(w, "data: %s\n\n", jsonErr(err.Error()))
 		flusher.Flush()
@@ -248,54 +305,192 @@ func handleOllamaDeleteModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	baseURL := getOllamaBaseURL()
-	body, _ := json.Marshal(map[string]string{"name": model})
-
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
-
-	req, _ := http.NewRequestWithContext(ctx, "DELETE", baseURL+"/api/delete", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		addFlash(w, r, "error", fmt.Sprintf("Could not delete model: %v", err))
-	} else {
-		resp.Body.Close()
-		if resp.StatusCode == 200 || resp.StatusCode == 404 {
-			addFlash(w, r, "success", fmt.Sprintf("Model '%s' deleted.", model))
-		} else {
-			addFlash(w, r, "error", fmt.Sprintf("Ollama returned %d", resp.StatusCode))
+	engines, _ := getEngines()
+	var baseURL string
+	var port int
+	for _, e := range engines {
+		if e.Type == EngineOllama {
+			baseURL = e.BaseURL
+			port = e.Port
+			break
 		}
 	}
+	if port == 0 {
+		port = 11434
+	}
+	OllamaDeleteModel(baseURL, port, model)
+	addFlash(w, r, "success", fmt.Sprintf("Model '%s' deleted.", model))
+
 	http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
 }
 
-func handleOllamaSettings(w http.ResponseWriter, r *http.Request) {
+func handleEngineSettings(w http.ResponseWriter, r *http.Request) {
 	if !isAdminSession(r) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
 	r.ParseForm()
-	ollamaURL := strings.TrimSpace(r.FormValue("ollama_url"))
-	port := strings.TrimSpace(r.FormValue("port"))
 
-	if ollamaURL == "" || port == "" {
-		addFlash(w, r, "error", "URL and port are required")
+	engineType := r.FormValue("engine_type")
+	engineName := strings.TrimSpace(r.FormValue("engine_name"))
+	baseURL := strings.TrimSpace(r.FormValue("base_url"))
+	portStr := strings.TrimSpace(r.FormValue("port"))
+	apiKey := r.FormValue("api_key")
+	editIDStr := r.FormValue("engine_id")
+
+	// Validate type.
+	if engineType != EngineOllama && engineType != EngineOpenAICompat {
+		addFlash(w, r, "error", "Invalid engine type")
 		http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
 		return
 	}
-	portInt, err := strconv.Atoi(port)
-	if err != nil || portInt < 1 || portInt > 65535 {
-		addFlash(w, r, "error", "Port must be a number between 1 and 65535")
+
+	// URL is required for all types.
+	if baseURL == "" {
+		addFlash(w, r, "error", "Base URL is required")
 		http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
 		return
 	}
 
-	setSetting("ollama_url", ollamaURL)
-	setSetting("ollama_port", port)
-	slog.Info("Ollama settings updated", "url", ollamaURL, "port", port)
-	addFlash(w, r, "success", "Ollama settings saved")
+	// Port required for Ollama, default 11434.
+	portInt := 11434
+	if engineType == EngineOllama {
+		if portStr == "" {
+			addFlash(w, r, "error", "Port is required for Ollama engines")
+			http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
+			return
+		}
+		var err error
+		portInt, err = strconv.Atoi(portStr)
+		if err != nil || portInt < 1 || portInt > 65535 {
+			addFlash(w, r, "error", "Port must be a number between 1 and 65535")
+			http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
+			return
+		}
+	}
+
+	// Determine if editing existing or creating new.
+	isEdit := editIDStr != ""
+	var editID int
+	if isEdit {
+		var err error
+		editID, err = strconv.Atoi(editIDStr)
+		if err != nil {
+			addFlash(w, r, "error", "Invalid engine ID")
+			http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
+			return
+		}
+	}
+
+	engines, _ := getEngines()
+
+	if isEdit {
+		// Update existing engine.
+		found := false
+		for i := range engines {
+			if engines[i].ID == editID {
+				engines[i].Type = engineType
+				engines[i].BaseURL = baseURL
+				engines[i].APIKey = apiKey
+				if engineName != "" {
+					engines[i].Name = engineName
+				}
+				if engineType == EngineOllama {
+					engines[i].Port = portInt
+				}
+				found = true
+				break
+			}
+		}
+		if !found {
+			addFlash(w, r, "error", "Engine not found")
+			http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
+			return
+		}
+	} else {
+		if engineName == "" {
+			addFlash(w, r, "error", "Engine name is required")
+			http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
+			return
+		}
+		newID := 1
+		for _, e := range engines {
+			if e.ID >= newID {
+				newID = e.ID + 1
+			}
+		}
+		cfg := EngineConfig{
+			ID:       newID,
+			Name:     engineName,
+			Type:     engineType,
+			BaseURL:  baseURL,
+			APIKey:   apiKey,
+		}
+		if engineType == EngineOllama {
+			cfg.Port = portInt
+		}
+		engines = append(engines, cfg)
+	}
+
+	if err := saveEngines(engines); err != nil {
+		slog.Error("saveEngines", "err", err)
+		addFlash(w, r, "error", "Failed to save engine config")
+		http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
+		return
+	}
+
+	action := "created"
+	if isEdit {
+		action = "updated"
+	}
+	slog.Info("Engine " + action, "id", editID, "type", engineType, "url", baseURL)
+	addFlash(w, r, "success", "Engine "+action)
+	http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
+}
+
+func handleRemoveEngine(w http.ResponseWriter, r *http.Request) {
+	if !isAdminSession(r) {
+		http.Redirect(w, r, "/", http.StatusFound)
+		return
+	}
+	r.ParseForm()
+
+	editIDStr := r.FormValue("engine_id")
+	if editIDStr == "" {
+		addFlash(w, r, "error", "Engine ID required")
+		http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
+		return
+	}
+
+	editID, err := strconv.Atoi(editIDStr)
+	if err != nil {
+		addFlash(w, r, "error", "Invalid engine ID")
+		http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
+		return
+	}
+
+	engines, _ := getEngines()
+	var filtered []EngineConfig
+	for _, e := range engines {
+		if e.ID != editID {
+			filtered = append(filtered, e)
+		}
+	}
+
+	if len(filtered) == len(engines) {
+		addFlash(w, r, "error", "Engine not found")
+		http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
+		return
+	}
+
+	if err := saveEngines(filtered); err != nil {
+		slog.Error("saveEngines", "err", err)
+		addFlash(w, r, "error", "Failed to remove engine")
+		http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
+		return
+	}
+	slog.Info("Engine removed", "id", editID)
+	addFlash(w, r, "success", "Engine removed")
 	http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
 }
 
@@ -831,22 +1026,45 @@ func handleListModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	baseURL := getOllamaBaseURL()
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(baseURL + "/api/tags")
+	engines, _ := getEngines()
+	if len(engines) == 0 {
+		jsonResponse(w, 502, openaiError("No engines configured", "api_error"))
+		return
+	}
+	adapter, err := newEngine(engines[0])
 	if err != nil {
-		slog.Error("Ollama /api/tags", "err", err)
-		jsonResponse(w, 502, openaiError("Could not reach Ollama", "api_error"))
+		jsonResponse(w, 502, openaiError("No engine configured", "api_error"))
 		return
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		jsonResponse(w, 502, openaiError("Upstream error", "api_error"))
+
+	models, err := adapter.ListModels()
+	if err != nil {
+		slog.Error("engine ListModels", "err", err)
+		jsonResponse(w, 502, openaiError("Could not reach engine", "api_error"))
 		return
 	}
-	var tags map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&tags)
-	jsonResponse(w, 200, ollamaTagsToOpenAIModels(tags))
+
+	// Convert engine models to OpenAI format
+	modelList := make([]map[string]interface{}, 0, len(models))
+	for _, m := range models {
+		name := modelName(m)
+		if name == "" {
+			continue
+		}
+		sizeB := toInt(m["size"])
+		modelList = append(modelList, map[string]interface{}{
+			"id":       name,
+			"object":   "model",
+			"created":  int64(0),
+			"owned_by": engines[0].Type,
+			"size":     sizeB,
+		})
+	}
+
+	jsonResponse(w, 200, map[string]interface{}{
+		"object": "list",
+		"data":   modelList,
+	})
 }
 
 // ─────────────────────────────── API: chat completions ────────────────────────
@@ -875,110 +1093,80 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	rawMsgs, _ := data["messages"].([]interface{})
 	messages := sanitizeMessages(rawMsgs)
-	ollamaReq := openAIToOllama(data, messages)
-	baseURL := getOllamaBaseURL()
-	chatURL := baseURL + "/api/chat"
-	model, _ := ollamaReq["model"].(string)
+	model, _ := data["model"].(string)
+
+	// Use the first Ollama engine, or fall back to the first configured engine.
+	var adapter Engine
+	engines, _ := getEngines()
+	for _, e := range engines {
+		if e.Type == EngineOllama {
+			a, err := newEngine(e)
+			if err == nil {
+				adapter = a
+				break
+			}
+		}
+	}
+	if adapter == nil && len(engines) > 0 {
+		a, err := newEngine(engines[0])
+		if err != nil {
+			jsonResponse(w, 502, openaiError("No engine configured", "api_error"))
+			return
+		}
+		adapter = a
+	}
+	if adapter == nil {
+		jsonResponse(w, 502, openaiError("No engines configured", "api_error"))
+		return
+	}
+
+	// Build the request for the engine — translate only for Ollama adapters.
+	var engineReq map[string]interface{}
+	if adapter.Type() == EngineOllama {
+		engineReq = openAIToOllama(data, messages)
+	} else {
+		engineReq = map[string]interface{}{
+			"model":    data["model"],
+			"messages": messages,
+			"stream":   data["stream"],
+		}
+		// pass through recognized OpenAI params
+		for key := range data {
+			switch key {
+			case "model", "messages", "stream", "temperature", "top_p", "seed", "max_tokens",
+				"max_completion_tokens", "frequency_penalty", "presence_penalty", "stop",
+				"provider_options", "response_format", "service_tier", "logit_bias", "tools",
+				"tool_choice", "logprobs", "top_logprobs", "parallel_tool_calls",
+				"user", "n":
+				engineReq[key] = data[key]
+			}
+		}
+	}
 
 	streaming, _ := data["stream"].(bool)
 	if streaming {
-		streamCompletions(w, r, chatURL, ollamaReq, user.ID, model)
+		wrapper, ok := adapter.(*OllamaAdapter)
+		if ok {
+			wrapper.ChatStream(w, r, engineReq, user.ID, model)
+			return
+		}
+		// Fallback: use the adapter's ChatStream method
+		adapter.ChatStream(w, r, engineReq, user.ID, model)
 		return
 	}
 
 	// Non-streaming
-	body, _ := json.Marshal(ollamaReq)
-	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
-	defer cancel()
-
-	req, _ := http.NewRequestWithContext(ctx, "POST", chatURL, bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
+	result, err := adapter.Chat(engineReq)
 	if err != nil {
-		slog.Error("Ollama request", "err", err)
-		jsonResponse(w, 502, openaiError("Could not reach Ollama", "api_error"))
+		slog.Error("engine request", "err", err)
+		jsonResponse(w, 502, openaiError("Could not reach engine", "api_error"))
 		return
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		slog.Error("Ollama HTTP error", "status", resp.StatusCode)
-		jsonResponse(w, 502, openaiError("Upstream error", "api_error"))
-		return
-	}
-
-	var ollamaResp map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&ollamaResp)
-	result := ollamaToOpenAI(ollamaResp)
 
 	go logInteraction(user.ID, fmt.Sprintf("%v", messages), fmt.Sprintf("%v", result), model)
 	jsonResponse(w, 200, result)
 }
 
-func streamCompletions(w http.ResponseWriter, r *http.Request, chatURL string, ollamaReq map[string]interface{}, userID int, model string) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "streaming not supported", 500)
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.Header().Set("Cache-Control", "no-cache")
-
-	body, _ := json.Marshal(ollamaReq)
-	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
-	defer cancel()
-
-	req, _ := http.NewRequestWithContext(ctx, "POST", chatURL, bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		slog.Error("stream request", "err", err)
-		b, _ := json.Marshal(openaiError("Internal error", "api_error"))
-		fmt.Fprintf(w, "data: %s\n\n", string(b))
-		flusher.Flush()
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		b, _ := json.Marshal(openaiError("Upstream error", "api_error"))
-		fmt.Fprintf(w, "data: %s\n\n", string(b))
-		flusher.Flush()
-		return
-	}
-
-	completionID := newCompletionID()
-	isFirst := true
-
-	scanner := bufio.NewScanner(resp.Body)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		var chunk map[string]interface{}
-		if err := json.Unmarshal([]byte(line), &chunk); err != nil {
-			continue
-		}
-		openaiChunk := formatStreamChunk(chunk, completionID, isFirst)
-		isFirst = false
-		b, _ := json.Marshal(openaiChunk)
-		fmt.Fprintf(w, "data: %s\n\n", string(b))
-		flusher.Flush()
-
-		if done, _ := chunk["done"].(bool); done {
-			break
-		}
-	}
-
-	fmt.Fprintf(w, "data: [DONE]\n\n")
-	flusher.Flush()
-
-	go logInteraction(userID, fmt.Sprintf("%v", ollamaReq["messages"]), "streamed", model)
-}
 
 // ─────────────────────────────── Auth helper ──────────────────────────────────
 
