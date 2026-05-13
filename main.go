@@ -3,13 +3,10 @@ package main
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
-	"crypto/subtle"
 	"database/sql"
 	"embed"
-	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io/fs"
@@ -17,16 +14,15 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
-	"regexp"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/gorilla/sessions"
-	gocrypto "golang.org/x/crypto/pbkdf2"
 	_ "modernc.org/sqlite"
 )
 
@@ -44,16 +40,17 @@ var imageFS embed.FS
 
 // Config holds the application configuration
 type Config struct {
-	DBPath        string
-	AdminPassword string
-	DefaultRL     int
-	SessionTTL    int
-	MaxMsgLen     int
-	LogLevel      string
-	LogFile       string
-	Port          string
-	TLSCert       string
-	TLSKey        string
+	DBPath               string
+	AdminPassword        string
+	DefaultRL            int
+	SessionTTL           int
+	MaxMsgLen            int
+	LogLevel             string
+	LogFile              string
+	Port                 string
+	TLSCert              string
+	TLSKey               string
+	UpstreamConcurrency  int
 }
 
 var cfg Config
@@ -87,8 +84,9 @@ func loadConfig() Config {
 		LogLevel:      getEnv("LOG_LEVEL", "INFO"),
 		LogFile:       getEnv("LOG_FILE", "./logs/gateway.log"),
 		Port:          getEnv("PORT", "7000"),
-		TLSCert:       getEnv("TLS_CERT", ""),
-		TLSKey:        getEnv("TLS_KEY", ""),
+		TLSCert:             getEnv("TLS_CERT", ""),
+		TLSKey:              getEnv("TLS_KEY", ""),
+		UpstreamConcurrency: getEnvInt("GW42_UPSTREAM_CONCURRENCY", 8),
 	}
 	return c
 }
@@ -203,8 +201,15 @@ type ConfirmDeleteData struct {
 // ─────────────────────────────── Global vars ───────────────────────────────────
 
 // Global variables
+//
+// db     — writer pool, single connection. All Exec/INSERT/UPDATE/DELETE and
+//          tx.Begin() that mutates state must go through this handle.
+// dbRead — reader pool, multi-connection, opened with mode=ro. All Query/
+//          QueryRow that does not need write semantics goes here. Attempting
+//          to write via dbRead returns SQLITE_READONLY.
 var (
 	db           *sql.DB
+	dbRead       *sql.DB
 	sessionStore *sessions.CookieStore
 	syslogBuf    *SyslogBuffer
 	tmpls        map[string]*template.Template
@@ -291,661 +296,7 @@ func (m *multiSlogHandler) WithGroup(name string) slog.Handler {
 	return &multiSlogHandler{m.a.WithGroup(name), m.b.WithGroup(name)}
 }
 
-// ─────────────────────────────── Database ──────────────────────────────────────
-
-// initDB initializes the database connection and creates the schema
-// This function also handles cleanup of stale WAL/SHM files that could cause SQLite errors
-func initDB() error {
-	if err := os.MkdirAll(filepath.Dir(cfg.DBPath), 0755); err != nil {
-		return err
-	}
-	// Remove zero-byte WAL/SHM files left by a previous crash before any data
-	// was written; a 0-byte WAL causes SQLITE_IOERR_SHORT_READ (522).
-	// Non-zero WAL files contain committed data and must be left for SQLite to recover.
-	if fi, err := os.Stat(cfg.DBPath + "-wal"); err == nil && fi.Size() == 0 {
-		os.Remove(cfg.DBPath + "-wal")
-		os.Remove(cfg.DBPath + "-shm")
-	}
-	var err error
-	dsn := cfg.DBPath + "?_pragma=journal_mode%3DWAL&_pragma=busy_timeout%3D5000"
-	db, err = sql.Open("sqlite", dsn)
-	if err != nil {
-		return err
-	}
-	// SQLite requires a single connection; multiple concurrent connections
-	// cause SQLITE_IOERR_SHORT_READ (522) and similar I/O errors.
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-	db.SetConnMaxLifetime(0)
-
-	return createSchema()
-}
-
-func createSchema() error {
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	stmts := []string{
-		`CREATE TABLE IF NOT EXISTS users(
-			id         INTEGER PRIMARY KEY AUTOINCREMENT,
-			name       TEXT UNIQUE NOT NULL,
-			api_key    TEXT UNIQUE NOT NULL,
-			status     TEXT NOT NULL DEFAULT 'pending',
-			rate_limit INTEGER NOT NULL DEFAULT 10,
-			created_at TEXT NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS admin_user(
-			id            INTEGER PRIMARY KEY AUTOINCREMENT,
-			email         TEXT UNIQUE NOT NULL,
-			password_hash TEXT NOT NULL,
-			created_at    TEXT NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS logs(
-			id       INTEGER PRIMARY KEY AUTOINCREMENT,
-			user_id  INTEGER NOT NULL,
-			model    TEXT,
-			prompt   TEXT,
-			response TEXT,
-			ts       TEXT NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS settings(
-			key   TEXT PRIMARY KEY,
-			value TEXT NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS rate_limit_entries(
-			id        INTEGER PRIMARY KEY AUTOINCREMENT,
-			user_id   INTEGER NOT NULL,
-			timestamp REAL NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS request_logs(
-			id          INTEGER PRIMARY KEY AUTOINCREMENT,
-			ts          TEXT NOT NULL,
-			method      TEXT NOT NULL,
-			path        TEXT NOT NULL,
-			client_ip   TEXT NOT NULL,
-			user_name   TEXT NOT NULL DEFAULT '',
-			status_code INTEGER NOT NULL
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_logs_user_id ON logs(user_id)`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_api_key ON users(api_key)`,
-		`CREATE INDEX IF NOT EXISTS idx_rate_limit_user_timestamp ON rate_limit_entries(user_id, timestamp)`,
-		`CREATE INDEX IF NOT EXISTS idx_request_logs_ts ON request_logs(ts)`,
-	}
-
-	for _, s := range stmts {
-		if _, err := tx.Exec(s); err != nil {
-			return fmt.Errorf("schema: %w", err)
-		}
-	}
-
-	// Migration: rename users.email to users.name
-	urows, err := tx.Query("PRAGMA table_info(users)")
-	if err != nil {
-		return err
-	}
-	hasNameCol := false
-	for urows.Next() {
-		var cid int
-		var colname, typ string
-		var notNull, pk int
-		var dflt sql.NullString
-		urows.Scan(&cid, &colname, &typ, &notNull, &dflt, &pk)
-		if colname == "name" {
-			hasNameCol = true
-		}
-	}
-	urows.Close()
-	if !hasNameCol {
-		if _, err := tx.Exec("ALTER TABLE users RENAME COLUMN email TO name"); err != nil {
-			return err
-		}
-	}
-
-	// Migration: add model column to existing logs tables
-	rows, err := tx.Query("PRAGMA table_info(logs)")
-	if err != nil {
-		return err
-	}
-	hasModel := false
-	for rows.Next() {
-		var cid int
-		var name, typ string
-		var notNull, pk int
-		var dflt sql.NullString
-		rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk)
-		if name == "model" {
-			hasModel = true
-		}
-	}
-	rows.Close()
-	if !hasModel {
-		if _, err := tx.Exec("ALTER TABLE logs ADD COLUMN model TEXT"); err != nil {
-			return err
-		}
-	}
-
-	// Seed admin user only if none exists yet
-	var exists int
-	tx.QueryRow("SELECT COUNT(*) FROM admin_user").Scan(&exists)
-	if exists == 0 {
-		pw := cfg.AdminPassword
-		if pw == "" {
-			pw = "admin123"
-		}
-		hash := hashPassword(pw)
-		if _, err := tx.Exec(
-			"INSERT INTO admin_user(email, password_hash, created_at) VALUES(?,?,?)",
-			"admin", hash, time.Now().UTC().Format(time.RFC3339),
-		); err != nil {
-			return err
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	slog.Info("Database initialized")
-	return nil
-}
-
-// ── User queries ──────────────────────────────────────────────────────────────
-
-var (
-	userCache    = map[interface{}]*User{}
-	userCacheMu  sync.RWMutex
-	userCacheTTL = 5 * time.Minute
-	userCacheExp = map[interface{}]time.Time{}
-)
-
-func getUserByAPIKey(apiKey string) (*User, error) {
-	key := "api:" + apiKey
-	if u := userCacheGet(key); u != nil {
-		return u, nil
-	}
-	row := db.QueryRow("SELECT id, name, api_key, status, rate_limit, created_at FROM users WHERE api_key=?", apiKey)
-	u, err := scanUser(row)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	userCacheSet(key, u)
-	return u, nil
-}
-
-func getUserByID(id int) (*User, error) {
-	key := fmt.Sprintf("id:%d", id)
-	if u := userCacheGet(key); u != nil {
-		return u, nil
-	}
-	row := db.QueryRow("SELECT id, name, api_key, status, rate_limit, created_at FROM users WHERE id=?", id)
-	u, err := scanUser(row)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	userCacheSet(key, u)
-	return u, nil
-}
-
-func getUserByName(name string) (*User, error) {
-	row := db.QueryRow("SELECT id, name, api_key, status, rate_limit, created_at FROM users WHERE name=?", name)
-	u, err := scanUser(row)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	return u, err
-}
-
-func scanUser(row *sql.Row) (*User, error) {
-	var u User
-	err := row.Scan(&u.ID, &u.Name, &u.APIKey, &u.Status, &u.RateLimit, &u.CreatedAt)
-	if err != nil {
-		return nil, err
-	}
-	return &u, nil
-}
-
-func userCacheGet(key interface{}) *User {
-	userCacheMu.RLock()
-	defer userCacheMu.RUnlock()
-	if exp, ok := userCacheExp[key]; ok && time.Now().Before(exp) {
-		return userCache[key]
-	}
-	return nil
-}
-
-func userCacheSet(key interface{}, u *User) {
-	userCacheMu.Lock()
-	defer userCacheMu.Unlock()
-	userCache[key] = u
-	userCacheExp[key] = time.Now().Add(userCacheTTL)
-}
-
-func invalidateUserCache(userID int) {
-	userCacheMu.Lock()
-	defer userCacheMu.Unlock()
-	// Delete the id: entry explicitly.
-	idKey := fmt.Sprintf("id:%d", userID)
-	delete(userCache, idKey)
-	delete(userCacheExp, idKey)
-	// Find and delete any api: entry that belongs to this user.
-	for k, u := range userCache {
-		if s, ok := k.(string); ok && strings.HasPrefix(s, "api:") && u.ID == userID {
-			delete(userCache, s)
-			delete(userCacheExp, s)
-		}
-	}
-}
-
-func getAllUsers() ([]User, error) {
-	rows, err := db.Query("SELECT id, name, api_key, status, rate_limit, created_at FROM users ORDER BY created_at DESC")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var users []User
-	for rows.Next() {
-		var u User
-		rows.Scan(&u.ID, &u.Name, &u.APIKey, &u.Status, &u.RateLimit, &u.CreatedAt)
-		users = append(users, u)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return users, nil
-}
-
-func createUser(name, apiKey string, rateLimit int) error {
-	_, err := db.Exec(
-		"INSERT INTO users(name, api_key, status, rate_limit, created_at) VALUES(?,?,?,?,?)",
-		name, apiKey, "disabled", rateLimit, time.Now().UTC().Format(time.RFC3339),
-	)
-	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
-			return fmt.Errorf("user already exists")
-		}
-		return err
-	}
-	slog.Info("User created", "name", name)
-	return nil
-}
-
-func updateUserStatus(userID int, status string) error {
-	_, err := db.Exec("UPDATE users SET status=? WHERE id=?", status, userID)
-	if err == nil {
-		invalidateUserCache(userID)
-	}
-	return err
-}
-
-func resetUserAPIKey(userID int, newKey string) error {
-	_, err := db.Exec("UPDATE users SET api_key=? WHERE id=?", newKey, userID)
-	if err == nil {
-		invalidateUserCache(userID)
-	}
-	return err
-}
-
-func updateUserRateLimit(userID, rateLimit int) error {
-	_, err := db.Exec("UPDATE users SET rate_limit=? WHERE id=?", rateLimit, userID)
-	if err == nil {
-		invalidateUserCache(userID)
-	}
-	return err
-}
-
-func deleteUser(userID int) error {
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	tx.Exec("DELETE FROM logs WHERE user_id=?", userID)
-	tx.Exec("DELETE FROM users WHERE id=?", userID)
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	invalidateUserCache(userID)
-	return nil
-}
-
-// ── Log queries ───────────────────────────────────────────────────────────────
-
-func logInteraction(userID int, prompt, response, model string) {
-	_, err := db.Exec(
-		"INSERT INTO logs(user_id, model, prompt, response, ts) VALUES(?,?,?,?,?)",
-		userID, model, truncateInput(prompt), truncateInput(response),
-		time.Now().UTC().Format(time.RFC3339),
-	)
-	if err != nil {
-		slog.Error("log_interaction failed", "err", err)
-	}
-}
-
-func getUserLogs(userID int) ([]UserLogRow, error) {
-	rows, err := db.Query(
-		"SELECT id, model, prompt, response, ts FROM logs WHERE user_id=? ORDER BY ts ASC", userID,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []UserLogRow
-	for rows.Next() {
-		var r UserLogRow
-		var model sql.NullString
-		rows.Scan(&r.ID, &model, &r.Prompt, &r.Response, &r.TS)
-		r.Model = model.String
-		out = append(out, r)
-	}
-	return out, nil
-}
-
-func getLogs(search string, limit int) ([]LogRow, error) {
-	var (
-		sqlRows *sql.Rows
-		err     error
-	)
-	if search != "" {
-		p := "%" + search + "%"
-		sqlRows, err = db.Query(
-			`SELECT l.id, u.name, COALESCE(l.model,''), l.prompt, l.response, l.ts
-			FROM logs l JOIN users u ON u.id=l.user_id
-			WHERE l.prompt LIKE ? OR l.response LIKE ? OR u.name LIKE ?
-			ORDER BY l.ts DESC LIMIT ?`,
-			p, p, p, limit,
-		)
-	} else {
-		sqlRows, err = db.Query(
-			`SELECT l.id, u.name, COALESCE(l.model,''), l.prompt, l.response, l.ts
-			FROM logs l JOIN users u ON u.id=l.user_id
-			ORDER BY l.ts DESC LIMIT ?`,
-			limit,
-		)
-	}
-	if err != nil {
-		return nil, err
-	}
-	defer sqlRows.Close()
-	var out []LogRow
-	for sqlRows.Next() {
-		var r LogRow
-		sqlRows.Scan(&r.ID, &r.Name, &r.Model, &r.Prompt, &r.Response, &r.TS)
-		out = append(out, r)
-	}
-	return out, nil
-}
-
-func getLogsCount(search string) (int, error) {
-	var count int
-	var err error
-	if search != "" {
-		p := "%" + search + "%"
-		err = db.QueryRow(
-			`SELECT COUNT(*) FROM logs l JOIN users u ON u.id=l.user_id
-			WHERE l.prompt LIKE ? OR l.response LIKE ? OR u.name LIKE ?`,
-			p, p, p,
-		).Scan(&count)
-	} else {
-		err = db.QueryRow(`SELECT COUNT(*) FROM logs l JOIN users u ON u.id=l.user_id`).Scan(&count)
-	}
-	return count, err
-}
-
-func getLogsPage(search string, limit, offset int) ([]LogRow, error) {
-	var (
-		sqlRows *sql.Rows
-		err     error
-	)
-	if search != "" {
-		p := "%" + search + "%"
-		sqlRows, err = db.Query(
-			`SELECT l.id, u.name, COALESCE(l.model,''), l.prompt, l.response, l.ts
-			FROM logs l JOIN users u ON u.id=l.user_id
-			WHERE l.prompt LIKE ? OR l.response LIKE ? OR u.name LIKE ?
-			ORDER BY l.ts DESC LIMIT ? OFFSET ?`,
-			p, p, p, limit, offset,
-		)
-	} else {
-		sqlRows, err = db.Query(
-			`SELECT l.id, u.name, COALESCE(l.model,''), l.prompt, l.response, l.ts
-			FROM logs l JOIN users u ON u.id=l.user_id
-			ORDER BY l.ts DESC LIMIT ? OFFSET ?`,
-			limit, offset,
-		)
-	}
-	if err != nil {
-		return nil, err
-	}
-	defer sqlRows.Close()
-	var out []LogRow
-	for sqlRows.Next() {
-		var r LogRow
-		sqlRows.Scan(&r.ID, &r.Name, &r.Model, &r.Prompt, &r.Response, &r.TS)
-		out = append(out, r)
-	}
-	return out, sqlRows.Err()
-}
-
-// ── Request log queries ───────────────────────────────────────────────────────
-
-func insertRequestLog(method, path, clientIP, userName string, status int) {
-	_, err := db.Exec(
-		"INSERT INTO request_logs(ts, method, path, client_ip, user_name, status_code) VALUES(?,?,?,?,?,?)",
-		time.Now().UTC().Format(time.RFC3339), method, path, clientIP, userName, status,
-	)
-	if err != nil {
-		slog.Error("insertRequestLog", "err", err)
-	}
-}
-
-func getRequestLogsCount(search string) (int, error) {
-	var count int
-	var err error
-	if search != "" {
-		p := "%" + search + "%"
-		err = db.QueryRow(
-			`SELECT COUNT(*) FROM request_logs WHERE user_name LIKE ? OR path LIKE ? OR client_ip LIKE ?`,
-			p, p, p,
-		).Scan(&count)
-	} else {
-		err = db.QueryRow(`SELECT COUNT(*) FROM request_logs`).Scan(&count)
-	}
-	return count, err
-}
-
-func getRequestLogsPage(search string, limit, offset int) ([]RequestLogRow, error) {
-	var (
-		sqlRows *sql.Rows
-		err     error
-	)
-	if search != "" {
-		p := "%" + search + "%"
-		sqlRows, err = db.Query(
-			`SELECT id, ts, method, path, client_ip, user_name, status_code FROM request_logs
-			WHERE user_name LIKE ? OR path LIKE ? OR client_ip LIKE ?
-			ORDER BY ts DESC LIMIT ? OFFSET ?`,
-			p, p, p, limit, offset,
-		)
-	} else {
-		sqlRows, err = db.Query(
-			`SELECT id, ts, method, path, client_ip, user_name, status_code FROM request_logs
-			ORDER BY ts DESC LIMIT ? OFFSET ?`,
-			limit, offset,
-		)
-	}
-	if err != nil {
-		return nil, err
-	}
-	defer sqlRows.Close()
-	var out []RequestLogRow
-	for sqlRows.Next() {
-		var r RequestLogRow
-		sqlRows.Scan(&r.ID, &r.TS, &r.Method, &r.Path, &r.ClientIP, &r.UserName, &r.StatusCode)
-		out = append(out, r)
-	}
-	return out, sqlRows.Err()
-}
-
-// ── Admin queries ─────────────────────────────────────────────────────────────
-
-type AdminUser struct {
-	ID           int
-	Email        string
-	PasswordHash string
-}
-
-func getAdmin() (*AdminUser, error) {
-	var a AdminUser
-	err := db.QueryRow("SELECT id, email, password_hash FROM admin_user LIMIT 1").
-		Scan(&a.ID, &a.Email, &a.PasswordHash)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	return &a, err
-}
-
-func updateAdminPassword(adminID int, hash string) error {
-	_, err := db.Exec("UPDATE admin_user SET password_hash=? WHERE id=?", hash, adminID)
-	return err
-}
-
-// ── Settings ──────────────────────────────────────────────────────────────────
-
-func getSetting(key, def string) string {
-	var val string
-	err := db.QueryRow("SELECT value FROM settings WHERE key=?", key).Scan(&val)
-	if err != nil {
-		return def
-	}
-	return val
-}
-
-func setSetting(key, value string) error {
-	_, err := db.Exec(
-		"INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-		key, value,
-	)
-	return err
-}
-
-// ── System reset ──────────────────────────────────────────────────────────────
-
-func resetSystem() error {
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	tx.Exec("DELETE FROM logs")
-	tx.Exec("DELETE FROM request_logs")
-	tx.Exec("DELETE FROM rate_limit_entries")
-	return tx.Commit()
-}
-
-// ── Rate limiter ──────────────────────────────────────────────────────────────
-
-const rateLimitWindow = 60.0 // seconds
-
-func isAllowed(userID, limit int) bool {
-	cutoff := float64(time.Now().Unix()) - rateLimitWindow
-	db.Exec("DELETE FROM rate_limit_entries WHERE timestamp < ?", cutoff)
-	var count int
-	db.QueryRow("SELECT COUNT(*) FROM rate_limit_entries WHERE user_id=?", userID).Scan(&count)
-	if count >= limit {
-		return false
-	}
-	db.Exec("INSERT INTO rate_limit_entries(user_id, timestamp) VALUES(?,?)",
-		userID, float64(time.Now().Unix()))
-	return true
-}
-
-func cleanupRateLimitEntries() {
-	cutoff := float64(time.Now().Unix()) - rateLimitWindow
-	db.Exec("DELETE FROM rate_limit_entries WHERE timestamp < ?", cutoff)
-}
-
-// ─────────────────────────────── Auth utilities ────────────────────────────────
-
-// hashPassword creates a Werkzeug-compatible pbkdf2:sha256 hash.
-func hashPassword(password string) string {
-	saltBytes := make([]byte, 16)
-	rand.Read(saltBytes)
-	salt := hex.EncodeToString(saltBytes) // 32-char hex string
-	iterations := 260000
-	dk := gocrypto.Key([]byte(password), []byte(salt), iterations, 32, sha256.New)
-	hash := hex.EncodeToString(dk)
-	return fmt.Sprintf("pbkdf2:sha256:%d$%s$%s", iterations, salt, hash)
-}
-
-// verifyPassword checks a Werkzeug pbkdf2:sha256 hash.
-func verifyPassword(hashStr, password string) bool {
-	parts := strings.SplitN(hashStr, "$", 3)
-	if len(parts) != 3 {
-		return false
-	}
-	methodParts := strings.Split(parts[0], ":")
-	if len(methodParts) < 3 || methodParts[0] != "pbkdf2" || methodParts[1] != "sha256" {
-		return false
-	}
-	iterations, err := strconv.Atoi(methodParts[2])
-	if err != nil || iterations <= 0 {
-		return false
-	}
-	salt := parts[1]
-	expectedHash := parts[2]
-	dk := gocrypto.Key([]byte(password), []byte(salt), iterations, 32, sha256.New)
-	computed := hex.EncodeToString(dk)
-	return subtle.ConstantTimeCompare([]byte(computed), []byte(expectedHash)) == 1
-}
-
-// generateAPIKey returns a URL-safe random API key (~27 chars).
-func generateAPIKey() string {
-	b := make([]byte, 20)
-	rand.Read(b)
-	return base64.RawURLEncoding.EncodeToString(b)
-}
-
-func validateName(name string) bool {
-	n := strings.TrimSpace(name)
-	return len(n) >= 1 && len(n) <= 100
-}
-
-var (
-	reUppercase = regexp.MustCompile(`[A-Z]`)
-	reLowercase = regexp.MustCompile(`[a-z]`)
-	reDigit     = regexp.MustCompile(`\d`)
-)
-
-func validatePassword(password string) (bool, string) {
-	if len(password) < 8 {
-		return false, "Password must be at least 8 characters"
-	}
-	if !reUppercase.MatchString(password) {
-		return false, "Password must contain at least one uppercase letter"
-	}
-	if !reLowercase.MatchString(password) {
-		return false, "Password must contain at least one lowercase letter"
-	}
-	if !reDigit.MatchString(password) {
-		return false, "Password must contain at least one digit"
-	}
-	return true, ""
-}
-
-func truncateInput(text string) string {
-	if len(text) <= cfg.MaxMsgLen {
-		return text
-	}
-	return text[:cfg.MaxMsgLen]
-}
+// DB, user/admin queries, rate limiter, and auth helpers live in db.go and auth.go.
 
 // ─────────────────────────────── Session / flash ───────────────────────────────
 
@@ -1058,11 +409,15 @@ func renderPage(w http.ResponseWriter, page string, data interface{}) {
 // ─────────────────────────────── Background tasks ─────────────────────────────
 
 func startBackgroundTasks() {
+	// One-shot: drain the legacy DB-backed rate-limit table left over from
+	// prior versions. The new limiter is in-memory.
+	truncateLegacyRateLimitTable()
+
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
 		for range ticker.C {
-			cleanupRateLimitEntries()
+			sweepIdleLimiters()
 		}
 	}()
 }
@@ -1098,6 +453,42 @@ func (r *statusRecorder) Flush() {
 	}
 }
 
+// userCtxKey is the context key under which the authenticated User is stored
+// by apiAuthMiddleware. Handlers retrieve via userFromContext.
+type userCtxKey struct{}
+
+func userFromContext(r *http.Request) *User {
+	u, _ := r.Context().Value(userCtxKey{}).(*User)
+	return u
+}
+
+// apiAuthMiddleware resolves the Bearer-token user once for /v1/* routes and
+// stores it in the request context. Downstream handlers and the request
+// logger read it back from context instead of re-resolving — halving DB/cache
+// lookups on the hot path.
+func apiAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/v1/") || r.Method == http.MethodOptions {
+			next.ServeHTTP(w, r)
+			return
+		}
+		auth := r.Header.Get("Authorization")
+		if !strings.HasPrefix(auth, "Bearer ") {
+			jsonResponse(w, http.StatusUnauthorized,
+				openaiError("Missing or malformed Bearer token", "authentication_error"))
+			return
+		}
+		u, err := getUserByAPIKey(auth[7:])
+		if err != nil || u == nil || u.Status != "active" {
+			jsonResponse(w, http.StatusUnauthorized,
+				openaiError("Invalid API key", "authentication_error"))
+			return
+		}
+		ctx := context.WithValue(r.Context(), userCtxKey{}, u)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
 func requestLoggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/v1/") {
@@ -1113,16 +504,17 @@ func requestLoggingMiddleware(next http.Handler) http.Handler {
 			clientIP = strings.TrimSpace(strings.SplitN(forwarded, ",", 2)[0])
 		}
 
-		var userName string
-		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
-			if u, err := getUserByAPIKey(auth[7:]); err == nil && u != nil {
-				userName = u.Name
-			}
-		}
-
 		rec := newStatusRecorder(w)
 		next.ServeHTTP(rec, r)
-		go insertRequestLog(r.Method, r.URL.Path, clientIP, userName, rec.status)
+
+		var userName string
+		if u := userFromContext(r); u != nil {
+			userName = u.Name
+		}
+
+		// Non-blocking: enqueueRequestLog drops on overflow rather than
+		// spawning unbounded goroutines.
+		insertRequestLog(r.Method, r.URL.Path, clientIP, userName, rec.status)
 	})
 }
 
@@ -1140,10 +532,15 @@ func setupRouter() *mux.Router {
 	// CORS preflight
 	r.PathPrefix("/v1/").Methods("OPTIONS").HandlerFunc(handleCorsPreflight)
 
-	// Middleware applied to all routes
-	r.Use(requestLoggingMiddleware)
+	// Middleware applied to all routes.
+	// Order matters: recovery is outermost (catches all panics), then
+	// metrics (so we measure everything including recoveries), then cors,
+	// then auth (so logging can read user from context), then logging.
 	r.Use(recoveryMiddleware)
+	r.Use(metricsMiddleware)
 	r.Use(corsMiddleware)
+	r.Use(apiAuthMiddleware)
+	r.Use(requestLoggingMiddleware)
 
 	// Public
 	r.HandleFunc("/", handleIndex).Methods("GET")
@@ -1183,6 +580,9 @@ func setupRouter() *mux.Router {
 	// OpenAI-compatible API
 	r.HandleFunc("/v1/models", handleListModels).Methods("GET")
 	r.HandleFunc("/v1/chat/completions", handleChatCompletions).Methods("POST")
+
+	// Prometheus metrics (admin session required).
+	r.Handle("/metrics", handleMetrics()).Methods("GET")
 
 	return r
 }
@@ -1243,27 +643,72 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Engine cache (engines + their HTTP adapters). It is fine for this to
+	// return an error: it just means no engines are configured yet.
+	if err := reloadEngineCache(); err != nil {
+		slog.Info("Engine cache empty on startup", "err", err)
+	}
+
 	// Templates
 	initTemplates()
 
 	// Background tasks
 	startBackgroundTasks()
 
+	// Log writers (batched, async). Cancelling the context drains the
+	// in-flight buffers and exits cleanly.
+	writersCtx, writersCancel := context.WithCancel(context.Background())
+	waitWriters := startLogWriters(writersCtx)
+
 	// Router
 	router := setupRouter()
 
 	addr := "0.0.0.0:" + cfg.Port
-	if cfg.TLSCert != "" && cfg.TLSKey != "" {
-		slog.Info("Gateway42 listening (HTTPS)", "addr", addr, "cert", cfg.TLSCert)
-		if err := http.ListenAndServeTLS(addr, cfg.TLSCert, cfg.TLSKey, router); err != nil {
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           router,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1 MiB
+		// No WriteTimeout: SSE streaming responses can legitimately exceed any fixed bound.
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		if cfg.TLSCert != "" && cfg.TLSKey != "" {
+			slog.Info("Gateway42 listening (HTTPS)", "addr", addr, "cert", cfg.TLSCert)
+			serverErr <- srv.ListenAndServeTLS(cfg.TLSCert, cfg.TLSKey)
+		} else {
+			slog.Info("Gateway42 listening (HTTP)", "addr", addr)
+			serverErr <- srv.ListenAndServe()
+		}
+	}()
+
+	select {
+	case err := <-serverErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("server error", "err", err)
 			os.Exit(1)
 		}
-	} else {
-		slog.Info("Gateway42 listening (HTTP)", "addr", addr)
-		if err := http.ListenAndServe(addr, router); err != nil {
-			slog.Error("server error", "err", err)
-			os.Exit(1)
+	case <-ctx.Done():
+		slog.Info("Shutdown signal received, draining connections...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			slog.Error("graceful shutdown failed", "err", err)
 		}
+		// Stop log writers and wait for them to drain in-flight batches.
+		writersCancel()
+		waitWriters()
+		if dbRead != nil {
+			dbRead.Close()
+		}
+		if db != nil {
+			db.Close()
+		}
+		slog.Info("Shutdown complete")
 	}
 }

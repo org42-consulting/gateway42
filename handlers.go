@@ -1,11 +1,11 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -98,19 +98,23 @@ func handleAdminPanel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	engines, err := getEngines()
-	if err != nil {
-		engines = nil
-	}
+	engines := cachedEngines()
 	enginesURLs := getEngineURLs(engines)
 	enginesStatus := make(map[string]bool)
 	enginesModels := make(map[string][]string)
+
+	// Warm the probe cache concurrently with a hard 3s budget so a dead
+	// engine cannot wedge the dashboard.
+	warmCtx, warmCancel := context.WithTimeout(r.Context(), 3*time.Second)
+	warmProbeCache(warmCtx)
+	warmCancel()
+
 	for _, e := range engines {
-		adapter, err := newEngine(e)
-		if err != nil {
+		adapter := cachedAdapter(e.ID)
+		if adapter == nil {
 			continue
 		}
-		status, models, _ := probeEngineFull(adapter)
+		status, models, _ := probeEngineCached(e.ID, adapter)
 		enginesStatus[fmt.Sprintf("%d", e.ID)] = status
 		enginesModels[fmt.Sprintf("%d", e.ID)] = models
 	}
@@ -135,19 +139,21 @@ func handleAdminSettingsPage(w http.ResponseWriter, r *http.Request) {
 	sess := getSession(r)
 	flashes := consumeFlashes(w, r, sess)
 
-	engines, err := getEngines()
-	if err != nil {
-		engines = nil
-	}
+	engines := cachedEngines()
 	engineURLs := getEngineURLs(engines)
 	engineStatus := make(map[string]bool)
 	engineModelDetails := make(map[string][]ModelDetail)
+
+	warmCtx, warmCancel := context.WithTimeout(r.Context(), 3*time.Second)
+	warmProbeCache(warmCtx)
+	warmCancel()
+
 	for _, e := range engines {
-		adapter, err := newEngine(e)
-		if err != nil {
+		adapter := cachedAdapter(e.ID)
+		if adapter == nil {
 			continue
 		}
-		status, _, details := probeEngineFull(adapter)
+		status, _, details := probeEngineCached(e.ID, adapter)
 		engineStatus[fmt.Sprintf("%d", e.ID)] = status
 		engineModelDetails[fmt.Sprintf("%d", e.ID)] = details
 	}
@@ -168,7 +174,7 @@ func handleEngineTest(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
-	engines, _ := getEngines()
+	engines := cachedEngines()
 	if len(engines) == 0 {
 		addFlash(w, r, "error", "No engines configured")
 		http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
@@ -176,9 +182,9 @@ func handleEngineTest(w http.ResponseWriter, r *http.Request) {
 	}
 	var results []string
 	for _, e := range engines {
-		adapter, err := newEngine(e)
-		if err != nil {
-			results = append(results, fmt.Sprintf("%s: error (%v)", e.Name, err))
+		adapter := cachedAdapter(e.ID)
+		if adapter == nil {
+			results = append(results, fmt.Sprintf("%s: error (cached adapter missing)", e.Name))
 			continue
 		}
 		status, err := adapter.Status()
@@ -209,16 +215,9 @@ func ollamaPullStream(w http.ResponseWriter, r *http.Request, model string) {
 		return
 	}
 
-	engines, _ := getEngines()
 	var adapter Engine
-	for _, e := range engines {
-		if e.Type == EngineOllama {
-			a, err := newEngine(e)
-			if err == nil {
-				adapter = a
-				break
-			}
-		}
+	if ollamas := cachedAdaptersByType(EngineOllama); len(ollamas) > 0 {
+		adapter = ollamas[0]
 	}
 	if adapter == nil {
 		fmt.Fprintf(w, "data: %s\n\n", jsonErr("No Ollama engine configured"))
@@ -244,7 +243,7 @@ func ollamaPullStream(w http.ResponseWriter, r *http.Request, model string) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := sharedClient.Do(req)
 	if err != nil {
 		fmt.Fprintf(w, "data: %s\n\n", jsonErr(err.Error()))
 		flusher.Flush()
@@ -258,7 +257,7 @@ func ollamaPullStream(w http.ResponseWriter, r *http.Request, model string) {
 		return
 	}
 
-	scanner := bufio.NewScanner(resp.Body)
+	scanner := newStreamScanner(resp.Body)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.TrimSpace(line) == "" {
@@ -305,10 +304,9 @@ func handleOllamaDeleteModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	engines, _ := getEngines()
 	var baseURL string
 	var port int
-	for _, e := range engines {
+	for _, e := range cachedEngines() {
 		if e.Type == EngineOllama {
 			baseURL = e.BaseURL
 			port = e.Port
@@ -912,7 +910,7 @@ func handleExportAllLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sqlRows, err := db.QueryContext(r.Context(),
+	sqlRows, err := dbRead.QueryContext(r.Context(),
 		`SELECT id, ts, method, path, client_ip, user_name, status_code FROM request_logs ORDER BY ts DESC`)
 	if err != nil {
 		slog.Error("request_logs export", "err", err)
@@ -1019,19 +1017,20 @@ func handleUsers(w http.ResponseWriter, r *http.Request) {
 // ─────────────────────────────── API: models ──────────────────────────────────
 
 func handleListModels(w http.ResponseWriter, r *http.Request) {
-	user, err := getAuthenticatedUser(r)
-	if err != nil || user == nil {
+	// Auth already resolved by apiAuthMiddleware; if user is nil here, the
+	// middleware was bypassed (programming error).
+	if userFromContext(r) == nil {
 		jsonResponse(w, 401, openaiError("Invalid API key", "authentication_error"))
 		return
 	}
 
-	engines, _ := getEngines()
+	engines := cachedEngines()
 	if len(engines) == 0 {
 		jsonResponse(w, 502, openaiError("No engines configured", "api_error"))
 		return
 	}
-	adapter, err := newEngine(engines[0])
-	if err != nil {
+	adapter := cachedAdapter(engines[0].ID)
+	if adapter == nil {
 		jsonResponse(w, 502, openaiError("No engine configured", "api_error"))
 		return
 	}
@@ -1069,19 +1068,29 @@ func handleListModels(w http.ResponseWriter, r *http.Request) {
 // ─────────────────────────────── API: chat completions ────────────────────────
 
 func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
-	user, err := getAuthenticatedUser(r)
-	if err != nil || user == nil {
+	user := userFromContext(r)
+	if user == nil {
 		jsonResponse(w, 401, openaiError("Invalid API key", "authentication_error"))
 		return
 	}
 
 	if !isAllowed(user.ID, user.RateLimit) {
+		metricRateLimited.Inc()
 		jsonResponse(w, 429, openaiError("Rate limit exceeded", "rate_limit_error"))
 		return
 	}
 
+	// Bound the request body. Allow ~8× MaxMsgLen so a multi-turn conversation
+	// of bounded-length messages still fits; truncateInput then trims each field.
+	r.Body = http.MaxBytesReader(w, r.Body, int64(cfg.MaxMsgLen)*8)
+
 	var data map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&data); err != nil || data == nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			jsonResponse(w, 413, openaiError("Request body too large", "invalid_request_error"))
+			return
+		}
 		jsonResponse(w, 400, openaiError("Invalid JSON body", "invalid_request_error"))
 		return
 	}
@@ -1096,28 +1105,29 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// Use the first Ollama engine, or fall back to the first configured engine.
 	var adapter Engine
-	engines, _ := getEngines()
-	for _, e := range engines {
-		if e.Type == EngineOllama {
-			a, err := newEngine(e)
-			if err == nil {
-				adapter = a
-				break
-			}
-		}
-	}
-	if adapter == nil && len(engines) > 0 {
-		a, err := newEngine(engines[0])
-		if err != nil {
-			jsonResponse(w, 502, openaiError("No engine configured", "api_error"))
-			return
-		}
-		adapter = a
+	if ollamas := cachedAdaptersByType(EngineOllama); len(ollamas) > 0 {
+		adapter = ollamas[0]
+	} else if engines := cachedEngines(); len(engines) > 0 {
+		adapter = cachedAdapter(engines[0].ID)
 	}
 	if adapter == nil {
 		jsonResponse(w, 502, openaiError("No engines configured", "api_error"))
 		return
 	}
+
+	// Cap upstream concurrency. Wait up to 250ms for a slot before giving
+	// up — long enough to absorb a momentary spike, short enough that
+	// clients see a clear backpressure signal.
+	acqCtx, acqCancel := context.WithTimeout(r.Context(), 250*time.Millisecond)
+	gotSlot := adapter.TryAcquire(acqCtx)
+	acqCancel()
+	if !gotSlot {
+		metricUpstreamBusy.WithLabelValues(adapter.Type()).Inc()
+		w.Header().Set("Retry-After", "2")
+		jsonResponse(w, 503, openaiError("Engine busy, please retry", "api_error"))
+		return
+	}
+	defer adapter.Release()
 
 	// Build the request for the engine — translate only for Ollama adapters.
 	var engineReq map[string]interface{}
@@ -1162,20 +1172,20 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	go logInteraction(user.ID, fmt.Sprintf("%v", messages), fmt.Sprintf("%v", result), model)
+	logInteraction(user.ID, marshalAudit(messages), marshalAudit(result), model)
 	jsonResponse(w, 200, result)
 }
 
 
-// ─────────────────────────────── Auth helper ──────────────────────────────────
-
+// getAuthenticatedUser is retained for any caller that still resolves a
+// /v1/* user outside the middleware. Prefer userFromContext when running
+// inside the middleware-protected request pipeline.
 func getAuthenticatedUser(r *http.Request) (*User, error) {
 	auth := r.Header.Get("Authorization")
 	if !strings.HasPrefix(auth, "Bearer ") {
 		return nil, nil
 	}
-	apiKey := auth[7:]
-	user, err := getUserByAPIKey(apiKey)
+	user, err := getUserByAPIKey(auth[7:])
 	if err != nil {
 		return nil, err
 	}
