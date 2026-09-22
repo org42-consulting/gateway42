@@ -67,9 +67,13 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - uses: golangci/golangci-lint-action@v6
-        with:
-          version: latest
+      # The action major selects the golangci-lint line, and `version: latest`
+      # does not override it — it means the newest release that major supports.
+      # @v6 installs the latest v1.x, which is built with Go 1.24 and refuses to
+      # start against go.mod's 1.25.0 ("the Go language version used to build
+      # golangci-lint is lower than the targeted Go version"), and cannot parse
+      # a version: "2" .golangci.yml either. @v8 installs v2.x, which does both.
+      - uses: golangci/golangci-lint-action@v8
 
   scripts:
     name: Shell and plist
