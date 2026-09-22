@@ -923,11 +923,19 @@ func main() {
 		// Stop log writers and wait for them to drain in-flight batches.
 		writersCancel()
 		waitWriters()
+		// Not deferred: these run only on the clean-shutdown path, after the
+		// writers have drained, and the errors are the last chance to learn
+		// that the WAL did not checkpoint cleanly — which is exactly the
+		// state the zero-byte-WAL recovery in initDB exists to clean up after.
 		if dbRead != nil {
-			dbRead.Close()
+			if err := dbRead.Close(); err != nil {
+				slog.Error("closing reader pool", "err", err)
+			}
 		}
 		if db != nil {
-			db.Close()
+			if err := db.Close(); err != nil {
+				slog.Error("closing writer pool", "err", err)
+			}
 		}
 		slog.Info("Shutdown complete")
 	}

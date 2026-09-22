@@ -76,7 +76,13 @@ func flushInteractionBatch(batch []interactionLogEntry) {
 			slog.Error("interaction log exec", "err", err)
 		}
 	}
-	stmt.Close()
+	// Commit closes statements prepared on the transaction anyway, so this is
+	// belt and braces — but on a pool pinned to one connection a close that
+	// fails is the first sign that connection is unhealthy, and the commit
+	// error that follows will not say why.
+	if err := stmt.Close(); err != nil {
+		slog.Warn("interaction log stmt close", "err", err)
+	}
 	if err := tx.Commit(); err != nil {
 		slog.Error("interaction log commit", "err", err)
 	}
@@ -135,7 +141,13 @@ func flushRequestBatch(batch []requestLogEntry) {
 			slog.Error("request log exec", "err", err)
 		}
 	}
-	stmt.Close()
+	// Commit closes statements prepared on the transaction anyway, so this is
+	// belt and braces — but on a pool pinned to one connection a close that
+	// fails is the first sign that connection is unhealthy, and the commit
+	// error that follows will not say why.
+	if err := stmt.Close(); err != nil {
+		slog.Warn("request log stmt close", "err", err)
+	}
 	if err := tx.Commit(); err != nil {
 		slog.Error("request log commit", "err", err)
 	}

@@ -44,6 +44,21 @@ linters:
         linters:
           - errcheck
 
+      # A *deferred* Close is a release, not an operation. It runs after the
+      # value has been fully read, there is no caller left to return to, and
+      # the failure that actually costs something — a response body never
+      # closed at all, which strands a pooled connection per request — is
+      # bodyclose's job and bodyclose is enabled above.
+      #
+      # This is deliberately keyed on `defer` rather than on the closer types,
+      # so a Close that is *not* deferred stays checked: writing one is a
+      # decision about ordering (release this cursor before the next write,
+      # close this body before returning the error) and those calls are the
+      # ones where a failure says something.
+      - source: '^\s*defer .*\.Close\(\)$'
+        linters:
+          - errcheck
+
 issues:
   # Report everything rather than the default per-linter cap; the codebase is
   # small enough that a truncated list would hide real findings.

@@ -3,7 +3,8 @@ package main
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"fmt"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -253,9 +254,16 @@ func toInt(v interface{}) int {
 	case float64:
 		return int(n)
 	case string:
-		var result int
-		fmt.Sscanf(n, "%d", &result)
-		return result
+		// Atoi rather than Sscanf: Sscanf stops at the first non-digit and
+		// reports success, so "12abc" parsed as 12 and "abc" left the result
+		// at its zero value with the error dropped. Anything that is not a
+		// whole number is not a count, and 0 is the same answer the rest of
+		// this switch gives for an unusable value.
+		parsed, err := strconv.Atoi(strings.TrimSpace(n))
+		if err != nil {
+			return 0
+		}
+		return parsed
 	}
 	return 0
 }

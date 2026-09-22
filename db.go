@@ -80,7 +80,9 @@ func looksHashed(s string) bool {
 		return false
 	}
 	for _, c := range s {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+		isDigit := c >= '0' && c <= '9'
+		isLowerHex := c >= 'a' && c <= 'f'
+		if !isDigit && !isLowerHex {
 			return false
 		}
 	}
@@ -96,8 +98,17 @@ func initDB() error {
 	// Remove zero-byte WAL/SHM files left by a previous crash before any data
 	// was written; a 0-byte WAL causes SQLITE_IOERR_SHORT_READ (522).
 	if fi, err := os.Stat(cfg.DBPath + "-wal"); err == nil && fi.Size() == 0 {
-		os.Remove(cfg.DBPath + "-wal")
-		os.Remove(cfg.DBPath + "-shm")
+		// Failing here is worth aborting for: leaving the truncated WAL in
+		// place means SQLite opens it and fails with SQLITE_IOERR_SHORT_READ,
+		// whose message mentions neither the file nor the reason it is bad.
+		if err := os.Remove(cfg.DBPath + "-wal"); err != nil {
+			return fmt.Errorf("removing zero-byte WAL: %w", err)
+		}
+		// The -shm only exists while something has the database mapped, so its
+		// absence here is the normal case rather than a problem.
+		if err := os.Remove(cfg.DBPath + "-shm"); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("removing stale SHM: %w", err)
+		}
 	}
 
 	// Writer pool: single connection. SQLite supports one writer at a time;
@@ -240,7 +251,13 @@ func createSchema() error {
 			}
 		}
 	}
-	krows.Close()
+	// Closed explicitly rather than deferred: the UPDATEs below run on the same
+	// single-writer connection, and SQLite will not let them proceed while this
+	// cursor still holds it. A failure here therefore predicts a failure there,
+	// so report it at the point that explains it.
+	if err := krows.Close(); err != nil {
+		return fmt.Errorf("api key migration: releasing scan cursor: %w", err)
+	}
 	for _, k := range toHash {
 		if _, err := tx.Exec("UPDATE users SET api_key=? WHERE id=?", sha256Hex(k.raw), k.id); err != nil {
 			return fmt.Errorf("api key migration: %w", err)

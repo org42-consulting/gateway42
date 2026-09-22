@@ -614,7 +614,11 @@ func (a *OllamaAdapter) StreamChat(ctx context.Context, req map[string]interface
 		return nil, err
 	}
 	if resp.StatusCode != 200 {
-		resp.Body.Close()
+		// Not deferred because the success path hands this body to the stream
+		// below and must not close it. The close error is dropped on purpose:
+		// we are already returning the failure the caller needs to see, and
+		// replacing it with a close error would hide the status code.
+		_ = resp.Body.Close()
 		return nil, fmt.Errorf("engine returned %d", resp.StatusCode)
 	}
 	return &ollamaStream{
@@ -745,7 +749,11 @@ func (a *OpenAICompatAdapter) StreamChat(ctx context.Context, req map[string]int
 		return nil, err
 	}
 	if resp.StatusCode != 200 {
-		resp.Body.Close()
+		// Not deferred because the success path hands this body to the stream
+		// below and must not close it. The close error is dropped on purpose:
+		// we are already returning the failure the caller needs to see, and
+		// replacing it with a close error would hide the status code.
+		_ = resp.Body.Close()
 		return nil, fmt.Errorf("engine returned %d", resp.StatusCode)
 	}
 	return &passthroughStream{body: resp.Body, scanner: newStreamScanner(resp.Body)}, nil
@@ -805,6 +813,6 @@ func OllamaDeleteModel(baseURL string, port int, model string) error {
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
 	return nil
 }

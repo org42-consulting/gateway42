@@ -1091,5 +1091,11 @@ func minInt(a, b int) int {
 func jsonResponse(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		// The status is already on the wire, so this cannot become an error
+		// response. It is still worth a line, because unlike a plain Write this
+		// also fails on values that cannot be marshalled at all — a bug in the
+		// caller rather than a client that hung up.
+		slog.Warn("json response encode", "status", status, "err", err)
+	}
 }
