@@ -814,5 +814,46 @@ func OllamaDeleteModel(baseURL string, port int, model string) error {
 		return err
 	}
 	defer resp.Body.Close()
+
+	// Ollama answers a refused delete with a non-2xx and a reason in the body.
+	// Discarding the status made every rejection — unknown model, model in
+	// use, read-only store — look like a successful delete to the caller, and
+	// the admin UI reported one.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("ollama delete %q: %s%s", model, resp.Status, upstreamErrDetail(resp.Body))
+	}
 	return nil
+}
+
+// upstreamErrDetail reads a bounded excerpt of an error response body and
+// formats it for appending to an error message, or returns "" when the body
+// adds nothing the status has not already said.
+//
+// Bounded twice on purpose. These strings reach the admin through a flash, and
+// flashes are serialised into the session *cookie*, so an engine that answers
+// an error with a page of HTML would push the cookie past the ~4KB browsers
+// accept — turning a readable error into a failed session save.
+func upstreamErrDetail(body io.Reader) string {
+	raw, err := io.ReadAll(io.LimitReader(body, 2048))
+	if err != nil || len(raw) == 0 {
+		return ""
+	}
+	// Ollama puts the reason in a JSON "error" field. Anything that does not
+	// parse is shown as-is, so an unexpected upstream is still diagnosable.
+	var payload struct {
+		Error string `json:"error"`
+	}
+	msg := string(raw)
+	if json.Unmarshal(raw, &payload) == nil && payload.Error != "" {
+		msg = payload.Error
+	}
+	// Collapse to a single line: this ends up in a one-line flash.
+	msg = strings.Join(strings.Fields(msg), " ")
+	if msg == "" {
+		return ""
+	}
+	if r := []rune(msg); len(r) > 200 {
+		msg = string(r[:200]) + "…"
+	}
+	return ": " + msg
 }
