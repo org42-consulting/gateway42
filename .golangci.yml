@@ -1,0 +1,41 @@
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    # Unchecked errors are the failure mode this codebase is most exposed to:
+    # log writes, session saves and upstream reads all return errors that are
+    # easy to drop silently.
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    # bodyclose catches a leaked http.Response.Body, which in a gateway leaks
+    # a pooled connection per request rather than just memory.
+    - bodyclose
+
+  settings:
+    errcheck:
+      # These are deliberate: a failed Flush or a failed write to an already
+      # disconnected client has no recovery path, and rolling back an
+      # already-committed transaction is the standard defer idiom.
+      exclude-functions:
+        - (net/http.Flusher).Flush
+        - (database/sql.Tx).Rollback
+    staticcheck:
+      checks:
+        - all
+
+  exclusions:
+    rules:
+      # Tests may ignore errors where the assertion is the point.
+      - path: _test\.go
+        linters:
+          - errcheck
+
+issues:
+  # Report everything rather than the default per-linter cap; the codebase is
+  # small enough that a truncated list would hide real findings.
+  max-issues-per-linter: 0
+  max-same-issues: 0

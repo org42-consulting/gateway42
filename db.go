@@ -338,9 +338,9 @@ type userCacheEntry struct {
 }
 
 var (
-	userCacheMu   sync.Mutex
-	userCacheLRU  = list.New()                  // front = most recently used
-	userCacheIdx  = map[interface{}]*list.Element{}
+	userCacheMu  sync.Mutex
+	userCacheLRU = list.New() // front = most recently used
+	userCacheIdx = map[interface{}]*list.Element{}
 )
 
 func userCacheGet(key interface{}) *User {
@@ -519,8 +519,12 @@ func deleteUser(userID int) error {
 		return err
 	}
 	defer tx.Rollback()
-	tx.Exec("DELETE FROM logs WHERE user_id=?", userID)
-	tx.Exec("DELETE FROM users WHERE id=?", userID)
+	if _, err := tx.Exec("DELETE FROM logs WHERE user_id=?", userID); err != nil {
+		return fmt.Errorf("delete user logs: %w", err)
+	}
+	if _, err := tx.Exec("DELETE FROM users WHERE id=?", userID); err != nil {
+		return fmt.Errorf("delete user: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
@@ -745,18 +749,80 @@ func resetSystem() error {
 		return err
 	}
 	defer tx.Rollback()
-	tx.Exec("DELETE FROM logs")
-	tx.Exec("DELETE FROM request_logs")
-	tx.Exec("DELETE FROM rate_limit_entries")
+	if _, err := tx.Exec("DELETE FROM logs"); err != nil {
+		return fmt.Errorf("clear interaction logs: %w", err)
+	}
+	if _, err := tx.Exec("DELETE FROM request_logs"); err != nil {
+		return fmt.Errorf("clear request logs: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+
+	// Rate-limit state lives in memory (ratelimit.go), not in a table, so
+	// clearing it is a separate step from the DELETEs above.
+	resetAllLimiters()
+
 	// VACUUM reclaims the file space freed by the DELETEs. It cannot run
 	// inside a transaction. Best-effort — failure here is not fatal.
 	if _, err := db.Exec("VACUUM"); err != nil {
 		slog.Warn("VACUUM after reset failed", "err", err)
 	}
 	return nil
+}
+
+// ── Log retention ─────────────────────────────────────────────────────────────
+
+// pruneLogs deletes log rows older than cfg.LogRetentionDays and reports how
+// many went from each table. A retention of 0 disables pruning entirely.
+//
+// Deleting in bounded batches rather than one statement matters because the
+// writer pool is a single connection (db.SetMaxOpenConns(1)): a DELETE over
+// months of rows would hold that connection — and so block every log insert
+// and every admin write — for the whole duration. Each batch is its own
+// transaction, so a slow prune interleaves with live traffic.
+//
+// The AFTER DELETE triggers keep the contentless FTS tables in step, so no
+// separate index cleanup is needed; that also makes each batch more expensive
+// than a bare DELETE, which is another reason to keep them small.
+func pruneLogs() (logsDeleted, requestsDeleted int64, err error) {
+	if cfg.LogRetentionDays <= 0 {
+		return 0, 0, nil
+	}
+
+	// RFC3339 in UTC is fixed-width, so a string comparison against the ts
+	// column is chronological — no date parsing in SQLite, and the existing
+	// idx_logs_ts / idx_request_logs_ts indexes are usable.
+	cutoff := time.Now().UTC().AddDate(0, 0, -cfg.LogRetentionDays).Format(time.RFC3339)
+
+	const batchSize = 500
+	// maxBatches caps one sweep so a first run against a huge table cannot
+	// monopolise the writer indefinitely. The leftovers go on the next tick.
+	const maxBatches = 200
+
+	for _, t := range []struct {
+		name    string
+		deleted *int64
+	}{
+		{"logs", &logsDeleted},
+		{"request_logs", &requestsDeleted},
+	} {
+		stmt := fmt.Sprintf(
+			"DELETE FROM %s WHERE id IN (SELECT id FROM %s WHERE ts < ? ORDER BY ts LIMIT %d)",
+			t.name, t.name, batchSize)
+		for i := 0; i < maxBatches; i++ {
+			res, execErr := db.Exec(stmt, cutoff)
+			if execErr != nil {
+				return logsDeleted, requestsDeleted, fmt.Errorf("prune %s: %w", t.name, execErr)
+			}
+			n, _ := res.RowsAffected()
+			*t.deleted += n
+			if n < batchSize {
+				break
+			}
+		}
+	}
+	return logsDeleted, requestsDeleted, nil
 }
 
 // Rate limiter moved to ratelimit.go (in-memory token bucket).

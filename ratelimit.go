@@ -61,6 +61,21 @@ func dropUserLimiter(userID int) {
 	delete(rlReg.m, userID)
 }
 
+// resetAllLimiters discards every in-memory bucket, so the next request from
+// each user starts from a full burst allowance. Called by the admin "Reset
+// System" action, whose label promises exactly that — before this existed the
+// button only truncated a legacy table that nothing writes to, and live
+// throttling survived the reset untouched.
+//
+// Note the trade-off: a client currently being throttled is immediately free
+// to burst again, which is the point of a manual reset but also means it can
+// be used to wave a misbehaving client through.
+func resetAllLimiters() {
+	rlReg.mu.Lock()
+	defer rlReg.mu.Unlock()
+	rlReg.m = make(map[int]*userLimiter)
+}
+
 // sweepIdleLimiters evicts entries unused for idleEvictAfter.
 func sweepIdleLimiters() {
 	cutoff := time.Now().Add(-idleEvictAfter)

@@ -7,6 +7,7 @@
 <div id="engine-settings" class="card">
     <h2>Engine Settings</h2>
     <form action="/admin/engine-settings" method="post" class="space-y-3">
+        <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
         <div>
             <label>Engine Type</label>
             <select name="engine_type" id="engine-type" class="select-sm">
@@ -39,7 +40,6 @@
 </div>
 
 <!-- Model Management Card -->
-<style>.card-inactive { opacity:.45; pointer-events:none; }</style>
 <div class="card card-mt">
     <h2>Model Management</h2>
 
@@ -52,6 +52,7 @@
                         <th>Engine</th>
                         <th>Status</th>
                         <th>Models</th>
+                        <th>Actions</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -66,22 +67,35 @@
                             {{end}}
                         </td>
                         <td>
-                            <form action="/admin/engine-remove" method="post" class="form-inline"
-                                  onsubmit="return confirm('Remove this engine? This cannot be undone.');">
-                                <input type="hidden" name="engine_id" value="{{.ID}}">
-                                <button type="submit" class="btn btn-danger btn-small">Remove</button>
-                            </form>
-                        </td>
-                        <td>
                             {{if index $.EngineModelDetails (printf "%d" .ID)}}
-                                <div class="flex-row" style="gap:4px;">
-                                    {{range index $.EngineModelDetails (printf "%d" .ID)}}
-                                    <span class="model-tag">{{.Name}}{{if .Size}} ({{.Size}}){{end}}</span>
+                                <div class="flex-row" style="gap:4px; flex-wrap:wrap;">
+                                    {{$engineID := .ID}}
+                                    {{$isOllama := eq .Type "ollama"}}
+                                    {{range index $.EngineModelDetails (printf "%d" $engineID)}}
+                                    <span class="model-tag">{{.Name}}{{if .Size}} ({{.Size}}){{end}}{{if $isOllama}}
+                                        <form action="/admin/ollama-delete-model" method="post" class="form-inline"
+                                              style="display:inline;"
+                                              onsubmit="return confirm('Delete model {{.Name}}? This removes the weights from disk and cannot be undone.');">
+                                            <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
+                                            <input type="hidden" name="engine_id" value="{{$engineID}}">
+                                            <input type="hidden" name="model" value="{{.Name}}">
+                                            <button type="submit" class="tag-del" title="Delete {{.Name}}"
+                                                    aria-label="Delete {{.Name}}">&times;</button>
+                                        </form>
+                                    {{end}}</span>
                                     {{end}}
                                 </div>
                             {{else}}
                                 <span class="text-hint">No models</span>
                             {{end}}
+                        </td>
+                        <td>
+                            <form action="/admin/engine-remove" method="post" class="form-inline"
+                                  onsubmit="return confirm('Remove this engine? This cannot be undone.');">
+                                <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
+                                <input type="hidden" name="engine_id" value="{{.ID}}">
+                                <button type="submit" class="btn btn-danger btn-small">Remove</button>
+                            </form>
                         </td>
                     </tr>
                     {{end}}
@@ -142,6 +156,7 @@
 <div class="card card-mt">
     <h2>Change Admin Password</h2>
     <form action="/admin/change-password" method="post" class="space-y-3">
+        <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
         <div>
             <label>Current Password</label>
             <input type="password" name="current" placeholder="Current password">
@@ -166,6 +181,8 @@
     </p>
     <form action="/admin/reset-system" method="post"
           onsubmit="return confirm('This will permanently delete all logs and reset all rate-limit counters. This cannot be undone. Continue?');">
+        <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
+        <input type="hidden" name="next" value="settings_page">
         <button type="submit" class="btn btn-danger">Reset System</button>
     </form>
 </div>
@@ -246,7 +263,7 @@ function startSearch() {
 
                 pullBtn.className = 'btn btn-primary btn-small';
                 pullBtn.textContent = 'Pull';
-                pullBtn.onclick = function() { startPullSearchResult(model.Name); };
+                pullBtn.onclick = function() { startPullSearchResult(model.Name, pullBtn); };
 
                 actionCell.appendChild(pullBtn);
                 row.appendChild(nameCell);
@@ -265,8 +282,10 @@ function startSearch() {
         });
 }
 
-function startPullSearchResult(modelName) {
-    const btn        = document.getElementById('search-btn');
+// btn is the row's own Pull button, passed in by the click handler. Looking it
+// up by id here would grab the Search button instead, disabling that and
+// leaving it relabelled "Pull" once the download finished.
+function startPullSearchResult(modelName, btn) {
     const status     = document.getElementById('pull-status');
     const statusText = document.getElementById('pull-status-text');
     const fill       = document.getElementById('pull-progress-fill');

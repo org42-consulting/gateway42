@@ -143,10 +143,11 @@
 
     <h3>Reset System</h3>
     <p>
-        Permanently deletes <strong>all HTTP request logs</strong>, <strong>all AI interaction logs</strong>,
-        and <strong>all rate-limit counters</strong>.
+        Permanently deletes <strong>all HTTP request logs</strong> and <strong>all AI interaction logs</strong>,
+        then discards <strong>every in-memory rate-limit bucket</strong>, so any user currently being
+        throttled is immediately free to burst again.
         User accounts and engine configurations are not affected. A confirmation dialog is shown first.
-        This action cannot be undone.
+        The log deletion cannot be undone.
     </p>
 </div>
 
@@ -191,18 +192,26 @@
 
     <h3>Engine Selection</h3>
     <p>
-        When a request arrives at <code>/v1/chat/completions</code>, Gateway42 routes it to the first
-        configured Ollama engine. If no Ollama engine is configured, it falls back to the first engine
-        of any type.
+        When a request arrives at <code>/v1/chat/completions</code>, Gateway42 routes it to an engine
+        that actually holds the requested model. The routing table is built from the same health
+        probes shown on this page, so adding a model to an engine makes it routable without any
+        configuration. When two engines report the same model, the one added first wins.
+    </p>
+    <p>
+        A model that no reachable engine reports gets <code>404</code> rather than being forwarded
+        somewhere it will fail. A request with no <code>model</code> falls back to the first
+        configured Ollama engine, or the first engine of any type if none is Ollama.
     </p>
 
     <h3>Model Management (Ollama engines)</h3>
     <p>
-        Displays all models currently installed on an Ollama engine, including their disk size.
-        This panel is greyed out when the engine is unreachable.
+        Lists every configured engine with its reachability status and, for reachable ones, the models
+        installed on it and their disk size. An engine that cannot be reached shows an
+        <strong>INACTIVE</strong> badge and an empty model list.
     </p>
     <ul>
-        <li><strong>Delete</strong> — removes a model from the Ollama instance. A confirmation dialog is shown first. This frees disk space but does not affect logs that referenced that model.</li>
+        <li><strong>Delete</strong> (the <code>&times;</code> on a model tag, Ollama engines only) — removes that model from that engine. A confirmation dialog is shown first. This frees disk space but does not affect logs that referenced the model.</li>
+        <li><strong>Remove</strong> — deletes the engine from Gateway42's configuration. It does not touch the engine itself or any models on it.</li>
     </ul>
 
     <h3>Search Models (Ollama engines)</h3>
@@ -222,9 +231,6 @@
         one lowercase letter, and one digit. You must provide the current password to confirm the change.
     </p>
 
-    <h3>Register New User</h3>
-    <p>Same as the Register New User panel on the Dashboard — provided here for convenience.</p>
-
     <h3>Reset System</h3>
     <p>Same as the Reset System action on the Dashboard — see above for details.</p>
 </div>
@@ -234,9 +240,16 @@
     <h2>Logs</h2>
     <p>
         Gateway42 maintains two layers of logs. The Logs page shows the <strong>HTTP request log</strong> —
-        every request to <code>/v1/</code> endpoints, most recent first (200 entries by default).
+        every request to <code>/v1/</code> endpoints, most recent first, paginated 10 entries per page.
         The <strong>AI interaction log</strong> (prompt and response per completion) is stored per user
         and accessible via the <em>Export CSV</em> button on each user's row in the Dashboard.
+    </p>
+    <p>
+        Both tables are pruned automatically: rows older than <code>GW42_LOG_RETENTION_DAYS</code>
+        (default 30) are deleted by a sweep that runs at startup and hourly thereafter. This matters
+        most for the AI interaction log, which holds full prompts and responses — without pruning it
+        grows with traffic and keeps user content indefinitely. Set the variable to <code>0</code> to
+        keep everything.
     </p>
 
     <h3>HTTP Request Log Columns</h3>
@@ -299,7 +312,7 @@
             <tr>
                 <td><code>/v1/models</code></td>
                 <td><span class="pill pill-get">GET</span></td>
-                <td>Returns models from the first configured engine in OpenAI format.</td>
+                <td>Returns the combined catalogue of every reachable engine, in OpenAI format.</td>
             </tr>
             <tr>
                 <td><code>/v1/chat/completions</code></td>
@@ -371,9 +384,13 @@ print(response.choices[0].message.content)</pre>
     <table class="help-table">
         <thead><tr><th>HTTP Status</th><th>Meaning</th></tr></thead>
         <tbody>
+            <tr><td><code>400</code></td><td>Body is not valid JSON, or <code>messages</code> is missing.</td></tr>
             <tr><td><code>401</code></td><td>Missing, invalid, or deactivated API key.</td></tr>
+            <tr><td><code>404</code></td><td>The requested model is not available on any configured engine.</td></tr>
+            <tr><td><code>413</code></td><td>Request body too large.</td></tr>
             <tr><td><code>429</code></td><td>Rate limit exceeded. Wait before retrying.</td></tr>
             <tr><td><code>502</code></td><td>Gateway42 could not reach the configured engine.</td></tr>
+            <tr><td><code>503</code></td><td>Engine is at its concurrency cap. Retry after the <code>Retry-After</code> interval.</td></tr>
             <tr><td><code>500</code></td><td>Internal server error.</td></tr>
         </tbody>
     </table>
@@ -383,14 +400,22 @@ print(response.choices[0].message.content)</pre>
 <div class="card help-section" style="margin-top:24px;">
     <h2>Rate Limiting</h2>
     <p>
-        Gateway42 enforces a <strong>sliding window rate limit</strong> per user. The window is 60 seconds.
-        If a user sends more requests than their configured limit within any 60-second window, the gateway
-        rejects further requests with <code>429 Too Many Requests</code> until the window clears.
+        Gateway42 enforces a per-user <strong>token bucket</strong>. A user configured for <em>N</em>
+        requests per minute gets a bucket holding <em>N</em> tokens that refills continuously at
+        <em>N</em>&nbsp;÷&nbsp;60 tokens per second. Each request spends one token; a request that
+        arrives with the bucket empty is rejected with <code>429 Too Many Requests</code>.
+    </p>
+    <p>
+        In practice that means an idle user can burst up to <em>N</em> requests back to back, and
+        thereafter sustains <em>N</em> per minute. There is no fixed window boundary to wait for —
+        capacity returns gradually, so a single token is available again roughly
+        60&nbsp;÷&nbsp;<em>N</em> seconds after the bucket empties.
     </p>
     <ul>
         <li>The default rate limit for new users is set by the <code>DEFAULT_RATE_LIMIT</code> environment variable (default: 10 req/min).</li>
-        <li>Each user's limit can be adjusted individually from the Dashboard.</li>
-        <li>Rate-limit counters are reset by the <em>Reset System</em> action or when a user is deleted.</li>
+        <li>Each user's limit can be adjusted individually from the Dashboard. Changing it rebuilds that user's bucket, which also refills it.</li>
+        <li>Buckets live in memory, not in the database, so they are also cleared by a gateway restart. A user's bucket is discarded when they are deleted, and the <em>Reset System</em> action discards every bucket at once.</li>
+        <li>Because buckets are per-process, running more than one Gateway42 instance behind a load balancer multiplies the effective limit by the number of instances.</li>
     </ul>
 </div>
 
@@ -411,6 +436,8 @@ print(response.choices[0].message.content)</pre>
             <tr><td><code>LOG_FILE</code></td><td><code>./logs/gateway.log</code></td><td>Path to the application log file (directory is created automatically).</td></tr>
             <tr><td><code>TLS_CERT</code></td><td>—</td><td>Path to TLS certificate file. When set with <code>TLS_KEY</code>, enables HTTPS.</td></tr>
             <tr><td><code>TLS_KEY</code></td><td>—</td><td>Path to TLS private key file. When set with <code>TLS_CERT</code>, enables HTTPS.</td></tr>
+            <tr><td><code>GW42_UPSTREAM_CONCURRENCY</code></td><td><code>8</code></td><td>Maximum simultaneous in-flight requests per engine. Requests beyond this are rejected with <code>503</code> and a <code>Retry-After</code> header rather than queued.</td></tr>
+            <tr><td><code>GW42_LOG_RETENTION_DAYS</code></td><td><code>30</code></td><td>Age after which log rows are deleted. A sweep runs at startup and hourly thereafter. <code>0</code> disables pruning and keeps everything.</td></tr>
         </tbody>
     </table>
 </div>

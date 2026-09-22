@@ -3,6 +3,8 @@
 <head>
     <script src="https://cdn.tailwindcss.com"></script>
     <title>Gateway42.</title>
+    <!-- Read by fetch() callers that POST without a form to build. -->
+    <meta name="csrf-token" content="{{$.CSRFToken}}">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Mulish:wght@400;600;700;800&display=swap" />
     <style>
@@ -419,6 +421,19 @@
             border-radius: 100px;
             color: rgba(255,255,255,.75);
         }
+        /* Inline "×" that deletes the model named by the tag it sits in. */
+        .tag-del {
+            appearance: none;
+            background: none;
+            border: 0;
+            padding: 0 0 0 6px;
+            margin: 0;
+            font: inherit;
+            line-height: 1;
+            color: rgba(255,255,255,.45);
+            cursor: pointer;
+        }
+        .tag-del:hover, .tag-del:focus-visible { color: #ff6b6b; }
 
         /* ── Dialog card ── */
         .dialog-card { width: 100%; max-width: 480px; }

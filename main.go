@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,17 +41,23 @@ var imageFS embed.FS
 
 // Config holds the application configuration
 type Config struct {
-	DBPath               string
-	AdminPassword        string
-	DefaultRL            int
-	SessionTTL           int
-	MaxMsgLen            int
-	LogLevel             string
-	LogFile              string
-	Port                 string
-	TLSCert              string
-	TLSKey               string
-	UpstreamConcurrency  int
+	DBPath              string
+	AdminPassword       string
+	DefaultRL           int
+	SessionTTL          int
+	MaxMsgLen           int
+	LogLevel            string
+	LogFile             string
+	Port                string
+	TLSCert             string
+	TLSKey              string
+	UpstreamConcurrency int
+
+	// LogRetentionDays bounds how long rows stay in the logs and request_logs
+	// tables. Interaction logs hold full prompts and responses (up to
+	// MaxMsgLen each), so an unbounded table grows with traffic and holds
+	// user content indefinitely. 0 disables pruning.
+	LogRetentionDays int
 }
 
 var cfg Config
@@ -76,17 +83,18 @@ func getEnvInt(key string, fallback int) int {
 // loadConfig loads the application configuration from environment variables
 func loadConfig() Config {
 	c := Config{
-		DBPath:        getEnv("GW42_DB_PATH", "./db/gateway.db"),
-		AdminPassword: getEnv("ADMIN_PASSWORD", ""),
-		DefaultRL:     getEnvInt("DEFAULT_RATE_LIMIT", 10),
-		SessionTTL:    getEnvInt("SESSION_TIMEOUT", 3600),
-		MaxMsgLen:     getEnvInt("MAX_MESSAGE_LENGTH", 262144), // ~256KB
-		LogLevel:      getEnv("LOG_LEVEL", "INFO"),
-		LogFile:       getEnv("LOG_FILE", "./logs/gateway.log"),
-		Port:          getEnv("PORT", "7000"),
+		DBPath:              getEnv("GW42_DB_PATH", "./db/gateway.db"),
+		AdminPassword:       getEnv("ADMIN_PASSWORD", ""),
+		DefaultRL:           getEnvInt("DEFAULT_RATE_LIMIT", 10),
+		SessionTTL:          getEnvInt("SESSION_TIMEOUT", 3600),
+		MaxMsgLen:           getEnvInt("MAX_MESSAGE_LENGTH", 262144), // ~256KB
+		LogLevel:            getEnv("LOG_LEVEL", "INFO"),
+		LogFile:             getEnv("LOG_FILE", "./logs/gateway.log"),
+		Port:                getEnv("PORT", "7000"),
 		TLSCert:             getEnv("TLS_CERT", ""),
 		TLSKey:              getEnv("TLS_KEY", ""),
 		UpstreamConcurrency: getEnvInt("GW42_UPSTREAM_CONCURRENCY", 8),
+		LogRetentionDays:    getEnvInt("GW42_LOG_RETENTION_DAYS", 30),
 	}
 	return c
 }
@@ -159,13 +167,21 @@ type RequestLogRow struct {
 type BaseData struct {
 	Flashes     []FlashMsg
 	CurrentPath string
+	CSRFToken   string
+}
+
+// LoginData holds data for the standalone login page. It carries BaseData for
+// the CSRF token alone — login.html does not extend base.html, so CurrentPath
+// and the nav it drives go unused there.
+type LoginData struct {
+	BaseData
 }
 
 // DashboardData holds data for the dashboard page
 type DashboardData struct {
 	BaseData
-	Users      []User
-	Engines    []EngineConfig
+	Users        []User
+	Engines      []EngineConfig
 	EngineURLs   map[string]string   // engineID → "host:port"
 	EngineStatus map[string]bool     // engineID → reachable
 	EngineModels map[string][]string // engineID → model names
@@ -203,10 +219,13 @@ type ConfirmDeleteData struct {
 // Global variables
 //
 // db     — writer pool, single connection. All Exec/INSERT/UPDATE/DELETE and
-//          tx.Begin() that mutates state must go through this handle.
+//
+//	tx.Begin() that mutates state must go through this handle.
+//
 // dbRead — reader pool, multi-connection, opened with mode=ro. All Query/
-//          QueryRow that does not need write semantics goes here. Attempting
-//          to write via dbRead returns SQLITE_READONLY.
+//
+//	QueryRow that does not need write semantics goes here. Attempting
+//	to write via dbRead returns SQLITE_READONLY.
 var (
 	db           *sql.DB
 	dbRead       *sql.DB
@@ -311,6 +330,18 @@ func isAdminSession(r *http.Request) bool {
 	sess := getSession(r)
 	v, _ := sess.Values["admin"].(bool)
 	return v
+}
+
+// newBaseData assembles the fields every rendered page needs. Going through one
+// constructor is what guarantees a CSRF token reaches every template — a page
+// that built BaseData by hand would render forms that the middleware then
+// rejects. It consumes flashes, so call it exactly once per response.
+func newBaseData(w http.ResponseWriter, r *http.Request) BaseData {
+	return BaseData{
+		Flashes:     consumeFlashes(w, r, getSession(r)),
+		CurrentPath: r.URL.Path,
+		CSRFToken:   csrfToken(w, r),
+	}
 }
 
 func addFlash(w http.ResponseWriter, r *http.Request, category, message string) {
@@ -420,6 +451,36 @@ func startBackgroundTasks() {
 			sweepIdleLimiters()
 		}
 	}()
+
+	if cfg.LogRetentionDays > 0 {
+		go func() {
+			// Prune once at startup so a gateway that is restarted more often
+			// than the interval still enforces retention, then hourly. Hourly
+			// rather than daily keeps each sweep small: a day's backlog would
+			// exceed the batch cap and spill to the next run anyway.
+			runLogPrune()
+			ticker := time.NewTicker(1 * time.Hour)
+			defer ticker.Stop()
+			for range ticker.C {
+				runLogPrune()
+			}
+		}()
+	}
+}
+
+// runLogPrune executes one retention sweep and logs the outcome. Failure is
+// not fatal: the next tick retries, and serving traffic matters more than
+// reclaiming disk.
+func runLogPrune() {
+	logs, requests, err := pruneLogs()
+	if err != nil {
+		slog.Error("log prune", "err", err)
+		return
+	}
+	if logs > 0 || requests > 0 {
+		slog.Info("log prune", "interaction_rows", logs, "request_rows", requests,
+			"retention_days", cfg.LogRetentionDays)
+	}
 }
 
 // ─────────────────────────────── CORS ─────────────────────────────────────────
@@ -433,9 +494,14 @@ var corsHeaders = map[string]string{
 
 // ─────────────────────────────── Request logging ──────────────────────────────
 
+// statusRecorder wraps an http.ResponseWriter to capture the status code for
+// metrics and request logging, and to record whether the response has been
+// committed. The commit flag is what lets recoveryMiddleware tell a panic it
+// can still answer with a status code from one it can only append to.
 type statusRecorder struct {
 	http.ResponseWriter
 	status int
+	wrote  bool
 }
 
 func newStatusRecorder(w http.ResponseWriter) *statusRecorder {
@@ -443,14 +509,58 @@ func newStatusRecorder(w http.ResponseWriter) *statusRecorder {
 }
 
 func (r *statusRecorder) WriteHeader(code int) {
-	r.status = code
+	// First call wins, matching net/http: a second WriteHeader is ignored there
+	// with a warning, so recording the later code would misreport the response.
+	if !r.wrote {
+		r.status = code
+		r.wrote = true
+	}
 	r.ResponseWriter.WriteHeader(code)
+}
+
+// Write marks the response committed. net/http sends an implicit 200 on the
+// first write, so a handler that never calls WriteHeader — a rendered template,
+// say — still leaves a panic handler nothing it can amend.
+func (r *statusRecorder) Write(b []byte) (int, error) {
+	r.wrote = true
+	return r.ResponseWriter.Write(b)
 }
 
 func (r *statusRecorder) Flush() {
 	if f, ok := r.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// ensureRecorder returns the statusRecorder already in play, or installs one.
+//
+// Three middlewares need the status: metrics, recovery and the request log.
+// Wrapping once each stacked three recorders per request, and only the
+// innermost saw the handler's own WriteHeader — the outer two recorded whatever
+// their child had passed through, which happened to agree only because the
+// wrapper is transparent. Sharing one makes the agreement structural instead of
+// accidental, and it is what lets metrics read the status recovery wrote.
+//
+// A writer that is not a recorder is wrapped, so calling any of these
+// middlewares standalone (as the tests do) still works.
+func ensureRecorder(w http.ResponseWriter) *statusRecorder {
+	if rec, ok := w.(*statusRecorder); ok {
+		return rec
+	}
+	return newStatusRecorder(w)
+}
+
+// panicStatus reports the status the client will actually observe for a
+// response that is unwinding a panic. writePanicResponse can only supply a
+// status while nothing has been written; once the response is committed the
+// status on the wire is already fixed and a panic can at most append to the
+// body. Both the response and the request log read this, so the two cannot
+// disagree about what the caller saw.
+func panicStatus(rec *statusRecorder) int {
+	if rec.wrote {
+		return rec.status
+	}
+	return http.StatusInternalServerError
 }
 
 // userCtxKey is the context key under which the authenticated User is stored
@@ -496,26 +606,46 @@ func requestLoggingMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		clientIP := r.RemoteAddr
-		if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-			clientIP = host
-		}
-		if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
-			clientIP = strings.TrimSpace(strings.SplitN(forwarded, ",", 2)[0])
-		}
+		rec := ensureRecorder(w)
 
-		rec := newStatusRecorder(w)
+		// Deferred, so a panic below still produces an audit row. This layer sits
+		// inside recoveryMiddleware, so at this point the 500 has not been written
+		// yet — panicStatus supplies the status recovery is about to present,
+		// rather than the 200 the recorder still holds.
+		panicking := true
+		defer func() {
+			status := rec.status
+			if panicking {
+				status = panicStatus(rec)
+			}
+
+			var userName string
+			if u := userFromContext(r); u != nil {
+				userName = u.Name
+			}
+
+			// Non-blocking: enqueueRequestLog drops on overflow rather than
+			// spawning unbounded goroutines.
+			insertRequestLog(r.Method, r.URL.Path, clientIP(r), userName, status)
+		}()
+
 		next.ServeHTTP(rec, r)
-
-		var userName string
-		if u := userFromContext(r); u != nil {
-			userName = u.Name
-		}
-
-		// Non-blocking: enqueueRequestLog drops on overflow rather than
-		// spawning unbounded goroutines.
-		insertRequestLog(r.Method, r.URL.Path, clientIP, userName, rec.status)
+		panicking = false
 	})
+}
+
+// clientIP extracts the caller's address for logging. X-Forwarded-For wins when
+// present, so a reverse-proxied deployment logs the real client rather than the
+// proxy — which also means it is spoofable when Gateway42 is exposed directly.
+// Treat the value as log metadata only, never as an authorization input.
+func clientIP(r *http.Request) string {
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		return strings.TrimSpace(strings.SplitN(forwarded, ",", 2)[0])
+	}
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
 }
 
 // ─────────────────────────────── Router ───────────────────────────────────────
@@ -532,15 +662,7 @@ func setupRouter() *mux.Router {
 	// CORS preflight
 	r.PathPrefix("/v1/").Methods("OPTIONS").HandlerFunc(handleCorsPreflight)
 
-	// Middleware applied to all routes.
-	// Order matters: recovery is outermost (catches all panics), then
-	// metrics (so we measure everything including recoveries), then cors,
-	// then auth (so logging can read user from context), then logging.
-	r.Use(recoveryMiddleware)
-	r.Use(metricsMiddleware)
-	r.Use(corsMiddleware)
-	r.Use(apiAuthMiddleware)
-	r.Use(requestLoggingMiddleware)
+	r.Use(middlewareChain()...)
 
 	// Public
 	r.HandleFunc("/", handleIndex).Methods("GET")
@@ -598,16 +720,97 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// middlewareChain is the middleware stack applied to every route, outermost
+// first. It is a function rather than inline r.Use calls so that tests can drive
+// requests through the real order instead of a hand-rebuilt copy of it —
+// the ordering here is load-bearing and its failure mode is silent.
+//
+// Order matters throughout, and the first two are ordered the way they are for
+// a reason that is easy to get backwards. Middleware defers unwind inside-out,
+// so the layer that writes the panic response has to sit inside the layer that
+// measures it. With recovery outermost — the intuitive arrangement — the panic
+// unwound through metricsMiddleware before recovery ever saw it and took that
+// layer's recording with it, so a recovered panic was missing from the request
+// count and the latency histogram entirely. Deferring the recording on its own
+// does not fix that, it only changes the symptom: metrics' defer would then run
+// before recovery's and read a status nobody had written yet. Metrics outermost
+// and recovery second is what makes the two agree.
+//
+// The cost is that a panic in metricsMiddleware itself is no longer caught here
+// and falls through to net/http's per-connection recovery, which drops that one
+// connection and logs it. That layer is a dozen lines of Prometheus calls with
+// label counts fixed at compile time, so the exposure is small and the process
+// still survives; keep it that way.
+//
+// Below those: cors, then auth (so logging can read the user from context), then
+// CSRF (which must reject before any handler mutates state), then logging.
+func middlewareChain() []mux.MiddlewareFunc {
+	return []mux.MiddlewareFunc{
+		metricsMiddleware,
+		recoveryMiddleware,
+		corsMiddleware,
+		apiAuthMiddleware,
+		csrfMiddleware,
+		requestLoggingMiddleware,
+	}
+}
+
+// recoveryMiddleware turns a panic in any handler below it into a response
+// instead of an abruptly closed connection. It runs inside metricsMiddleware so
+// that the status it writes is on the recorder before the metrics are read; see
+// the ordering comment on the middleware chain in setupRoutes.
 func recoveryMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec := ensureRecorder(w)
 		defer func() {
 			if err := recover(); err != nil {
-				slog.Error("panic recovered", "err", err, "path", r.URL.Path)
-				http.Error(w, "Internal server error", http.StatusInternalServerError)
+				// Counted separately because the status metric cannot carry this:
+				// a panic mid-stream is honestly recorded as the 200 the client
+				// received, so without its own counter it is invisible to metrics.
+				metricPanics.WithLabelValues(pathBucket(r.URL.Path)).Inc()
+
+				slog.Error("panic recovered", "err", err, "path", r.URL.Path,
+					"stack", string(debug.Stack()))
+				writePanicResponse(rec, r)
 			}
 		}()
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(rec, r)
 	})
+}
+
+// writePanicResponse reports a recovered panic in a form the client can
+// actually parse. The response's own state picks the shape, because a panic can
+// land at three different points:
+//
+//   - Nothing written yet. A real status code is still available, so a /v1/
+//     caller gets the same OpenAI error envelope it parses every other error
+//     with, and the admin UI gets plain text as before.
+//   - Mid-stream. The 200 and the text/event-stream headers are already out and
+//     the status cannot change, so an error frame followed by [DONE] is the only
+//     way to tell an accumulating client that its completion is truncated. This
+//     is deliberately the same shape streamCompletion emits for an upstream read
+//     failure, so a client needs one code path for both.
+//   - Committed as something else — a half-rendered admin page, say. Anything
+//     written now would append garbage to it, so the log entry above is the only
+//     report. Attempting a status here is what produced net/http's "superfluous
+//     WriteHeader call" noise before.
+func writePanicResponse(rec *statusRecorder, r *http.Request) {
+	switch {
+	case !rec.wrote:
+		if strings.HasPrefix(r.URL.Path, "/v1/") {
+			jsonResponse(rec, http.StatusInternalServerError,
+				openaiError("Internal server error", "api_error"))
+			return
+		}
+		http.Error(rec, "Internal server error", http.StatusInternalServerError)
+
+	case strings.HasPrefix(rec.Header().Get("Content-Type"), "text/event-stream"):
+		if b, err := json.Marshal(openaiError("Internal server error", "api_error")); err == nil {
+			fmt.Fprintf(rec, "data: %s\n\n", b)
+		}
+		fmt.Fprint(rec, "data: [DONE]\n\n")
+		rec.Flush()
+	}
 }
 
 // ─────────────────────────────── Main ─────────────────────────────────────────
@@ -635,6 +838,12 @@ func main() {
 		HttpOnly: true,
 		Secure:   cfg.TLSCert != "" && cfg.TLSKey != "",
 		Path:     "/",
+		// Lax, set explicitly: the zero value of http.SameSite omits the
+		// attribute entirely, which leaves the behaviour up to each browser's
+		// default. Lax stops the cookie riding along on cross-site POSTs,
+		// which is the CSRF vector, while still surviving ordinary top-level
+		// navigation to the admin panel.
+		SameSite: http.SameSiteLaxMode,
 	}
 
 	// DB

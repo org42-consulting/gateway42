@@ -54,6 +54,16 @@ var (
 		Name: "gw42_upstream_busy_total",
 		Help: "Requests rejected because the engine concurrency cap was full.",
 	}, []string{"engine"})
+
+	// Panics are counted apart from the status metric because the two answer
+	// different questions. A panic before anything is written shows up as a 500
+	// there; a panic mid-stream shows up as the 200 the client actually got,
+	// since that status was committed before the panic and cannot be rewritten.
+	// Only this counter sees both.
+	metricPanics = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "gw42_panics_total",
+		Help: "Handler panics recovered by recoveryMiddleware, by path bucket.",
+	}, []string{"path"})
 )
 
 // pathBucket collapses dynamic path segments so cardinality stays bounded.
@@ -81,15 +91,40 @@ func metricsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		bucket := pathBucket(r.URL.Path)
 		metricInFlight.WithLabelValues(bucket).Inc()
-		defer metricInFlight.WithLabelValues(bucket).Dec()
 
 		start := time.Now()
-		rec := newStatusRecorder(w)
-		next.ServeHTTP(rec, r)
-		dur := time.Since(start).Seconds()
+		rec := ensureRecorder(w)
 
-		metricRequestDuration.WithLabelValues(bucket, r.Method).Observe(dur)
-		metricRequestsTotal.WithLabelValues(bucket, r.Method, strconv.Itoa(rec.status)).Inc()
+		// What fixes the recovered-panic gap is the ordering, not this defer:
+		// recoveryMiddleware runs inside this layer now, so it absorbs the panic
+		// and writes its status before next.ServeHTTP returns here. Recording
+		// sequentially would in fact work for that case.
+		//
+		// The defer is here so that this layer does not *depend* on a middleware
+		// below it recovering panics. Sequential recording silently loses the
+		// request the moment anything unwinds past this frame — which is what the
+		// old outermost-recovery arrangement did on every single panic. Measuring
+		// in a defer is the property that made that bug possible to have.
+		//
+		// completed distinguishes the two: false means the panic got past
+		// recoveryMiddleware as well, the connection is about to be dropped by
+		// net/http, and the recorder still holds an untouched 200 that no client
+		// ever saw. panicStatus is the same answer the response and the audit log
+		// use.
+		completed := false
+		defer func() {
+			metricInFlight.WithLabelValues(bucket).Dec()
+
+			status := rec.status
+			if !completed {
+				status = panicStatus(rec)
+			}
+			metricRequestDuration.WithLabelValues(bucket, r.Method).Observe(time.Since(start).Seconds())
+			metricRequestsTotal.WithLabelValues(bucket, r.Method, strconv.Itoa(status)).Inc()
+		}()
+
+		next.ServeHTTP(rec, r)
+		completed = true
 	})
 }
 

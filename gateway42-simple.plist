@@ -1,12 +1,20 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Minimal variant of gateway42.plist: no environment overrides, so gateway42
+  falls back to its built-in defaults. See gateway42.plist for the annotated
+  version, and prefer ./install.sh over installing either by hand.
+
+  Replace /Users/org42 with your own home directory before copying this into
+  ~/Library/LaunchAgents — launchd does not expand ~ or $HOME.
+-->
 <plist version="1.0">
 <dict>
     <key>Label</key>
     <string>com.gateway42.service</string>
 
     <key>Program</key>
-    <string>/Users/org42/git/gateway42/service-run.sh</string>
+    <string>/usr/local/bin/gateway42</string>
 
     <key>RunAtLoad</key>
     <true/>
@@ -15,12 +23,12 @@
     <false/>
 
     <key>WorkingDirectory</key>
-    <string>/Users/org42/git/gateway42</string>
+    <string>/Users/org42/.gateway42</string>
 
     <key>StandardOutPath</key>
-    <string>/Users/org42/git/gateway42/logs/gateway42.log</string>
+    <string>/Users/org42/Library/Logs/gateway42/gateway42.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/org42/git/gateway42/logs/gateway42.log</string>
+    <string>/Users/org42/Library/Logs/gateway42/gateway42.err.log</string>
 </dict>
 </plist>

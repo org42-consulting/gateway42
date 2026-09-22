@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Allow running the suite by hand against any branch.
+  workflow_dispatch:
+
+# A new push to a PR makes the in-flight run obsolete.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # Read the version from go.mod so CI and the toolchain never drift.
+          go-version-file: go.mod
+          cache: true
+
+      # Fail on formatting before anything slower runs: it is the cheapest
+      # check and the one most likely to trip. `gofmt -l` exits 0 even when it
+      # finds files, so the file list has to be turned into the failure.
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      # modernc.org/sqlite is pure Go, so the race detector works without cgo
+      # and the SQLite-backed tests are covered by it too.
+      - name: Test
+        run: go test -race -count=1 ./...
+
+      # go.mod/go.sum drifting from the imports breaks builds for anyone who
+      # does not run `go mod tidy` first, so catch it here.
+      - name: go mod tidy is clean
+        run: |
+          go mod tidy
+          git diff --exit-code --stat -- go.mod go.sum
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+  scripts:
+    name: Shell and plist
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The installer and service wrapper are how this gets deployed; a syntax
+      # error in them is as breaking as one in the Go code.
+      - name: Shell syntax
+        run: |
+          for f in *.sh; do
+            echo "checking $f"
+            bash -n "$f"
+          done
+
+      # plutil is macOS-only, which is why this job is not on ubuntu: a
+      # malformed launchd plist fails silently at load time otherwise.
+      - name: launchd plists
+        run: |
+          for f in *.plist; do
+            echo "checking $f"
+            plutil -lint "$f"
+          done

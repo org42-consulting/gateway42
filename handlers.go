@@ -1,17 +1,21 @@
 package main
 
+// HTTP handlers for the admin web UI: session-cookie authenticated, HTML
+// rendering, CSRF-protected form posts.
+//
+// The OpenAI-compatible /v1 surface lives in api_handlers.go. Anything added
+// here should render a page or mutate admin state; anything that answers an SDK
+// client belongs there.
+
 import (
 	"bytes"
 	"context"
 	"encoding/csv"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
+	"html"
 	"log/slog"
 	"net/http"
-	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -19,33 +23,11 @@ import (
 	"github.com/gorilla/mux"
 )
 
-// ─────────────────────────────── CORS preflight ────────────────────────────────
-
-// handleCorsPreflight handles CORS preflight requests
-func handleCorsPreflight(w http.ResponseWriter, r *http.Request) {
-	for k, v := range corsHeaders {
-		w.Header().Set(k, v)
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// ─────────────────────────────── Health ───────────────────────────────────────
-
-// handleHealth returns a simple health check response
-func handleHealth(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(`{"status":"ok"}`))
-}
-
 // ─────────────────────────────── Index / login ────────────────────────────────
 
 // handleIndex renders the login page
 func handleIndex(w http.ResponseWriter, r *http.Request) {
-	sess := getSession(r)
-	flashes := consumeFlashes(w, r, sess)
-	renderPage(w, "login", struct {
-		Flashes []FlashMsg
-	}{Flashes: flashes})
+	renderPage(w, "login", LoginData{BaseData: newBaseData(w, r)})
 }
 
 // handleLogout logs out the admin user
@@ -88,9 +70,6 @@ func handleAdminPanel(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
-	sess := getSession(r)
-	flashes := consumeFlashes(w, r, sess)
-
 	users, err := getAllUsers()
 	if err != nil {
 		slog.Error("getAllUsers", "err", err)
@@ -114,13 +93,13 @@ func handleAdminPanel(w http.ResponseWriter, r *http.Request) {
 		if adapter == nil {
 			continue
 		}
-		status, models, _ := probeEngineCached(e.ID, adapter)
-		enginesStatus[fmt.Sprintf("%d", e.ID)] = status
-		enginesModels[fmt.Sprintf("%d", e.ID)] = models
+		pd := probeEngineCached(e.ID, adapter)
+		enginesStatus[fmt.Sprintf("%d", e.ID)] = pd.status
+		enginesModels[fmt.Sprintf("%d", e.ID)] = pd.models
 	}
 
 	renderPage(w, "dashboard", DashboardData{
-		BaseData:     BaseData{Flashes: flashes, CurrentPath: r.URL.Path},
+		BaseData:     newBaseData(w, r),
 		Users:        users,
 		Engines:      engines,
 		EngineURLs:   enginesURLs,
@@ -136,9 +115,6 @@ func handleAdminSettingsPage(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
-	sess := getSession(r)
-	flashes := consumeFlashes(w, r, sess)
-
 	engines := cachedEngines()
 	engineURLs := getEngineURLs(engines)
 	engineStatus := make(map[string]bool)
@@ -153,13 +129,13 @@ func handleAdminSettingsPage(w http.ResponseWriter, r *http.Request) {
 		if adapter == nil {
 			continue
 		}
-		status, _, details := probeEngineCached(e.ID, adapter)
-		engineStatus[fmt.Sprintf("%d", e.ID)] = status
-		engineModelDetails[fmt.Sprintf("%d", e.ID)] = details
+		pd := probeEngineCached(e.ID, adapter)
+		engineStatus[fmt.Sprintf("%d", e.ID)] = pd.status
+		engineModelDetails[fmt.Sprintf("%d", e.ID)] = pd.details
 	}
 
 	renderPage(w, "settings", SettingsData{
-		BaseData:           BaseData{Flashes: flashes, CurrentPath: r.URL.Path},
+		BaseData:           newBaseData(w, r),
 		Engines:            engines,
 		EngineURLs:         engineURLs,
 		EngineStatus:       engineStatus,
@@ -167,7 +143,6 @@ func handleAdminSettingsPage(w http.ResponseWriter, r *http.Request) {
 		SearchResults:      []ModelDetail{}, // Will be populated by search
 	})
 }
-
 
 func handleEngineTest(w http.ResponseWriter, r *http.Request) {
 	if !isAdminSession(r) {
@@ -304,20 +279,45 @@ func handleOllamaDeleteModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var baseURL string
-	var port int
+	// Target the engine the admin clicked on. Falling back to "first Ollama
+	// engine" is only correct when there is exactly one; with several, a
+	// missing engine_id would delete the model off the wrong host.
+	wantID, _ := strconv.Atoi(r.FormValue("engine_id"))
+	var target *EngineConfig
 	for _, e := range cachedEngines() {
-		if e.Type == EngineOllama {
-			baseURL = e.BaseURL
-			port = e.Port
+		if e.Type != EngineOllama {
+			continue
+		}
+		if e.ID == wantID {
+			target = &e
 			break
 		}
+		if target == nil && wantID == 0 {
+			target = &e
+		}
 	}
+	if target == nil {
+		addFlash(w, r, "error", "No Ollama engine available to delete from")
+		http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
+		return
+	}
+
+	port := target.Port
 	if port == 0 {
 		port = 11434
 	}
-	OllamaDeleteModel(baseURL, port, model)
-	addFlash(w, r, "success", fmt.Sprintf("Model '%s' deleted.", model))
+	if err := OllamaDeleteModel(target.BaseURL, port, model); err != nil {
+		slog.Error("delete model", "model", model, "engine", target.Name, "err", err)
+		addFlash(w, r, "error", fmt.Sprintf("Could not delete '%s': %v", model, err))
+		http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
+		return
+	}
+
+	// Drop the cached probe so the model list reflects the deletion now
+	// rather than up to probeCacheTTL later.
+	invalidateProbeCache()
+	slog.Info("Model deleted", "model", model, "engine", target.Name)
+	addFlash(w, r, "success", fmt.Sprintf("Model '%s' deleted from %s.", model, target.Name))
 
 	http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
 }
@@ -417,17 +417,19 @@ func handleEngineSettings(w http.ResponseWriter, r *http.Request) {
 				newID = e.ID + 1
 			}
 		}
-		cfg := EngineConfig{
-			ID:       newID,
-			Name:     engineName,
-			Type:     engineType,
-			BaseURL:  baseURL,
-			APIKey:   apiKey,
+		// Named ec, not cfg: cfg is the package-level Config global and
+		// shadowing it here silently breaks every later cfg.* reference.
+		ec := EngineConfig{
+			ID:      newID,
+			Name:    engineName,
+			Type:    engineType,
+			BaseURL: baseURL,
+			APIKey:  apiKey,
 		}
 		if engineType == EngineOllama {
-			cfg.Port = portInt
+			ec.Port = portInt
 		}
-		engines = append(engines, cfg)
+		engines = append(engines, ec)
 	}
 
 	if err := saveEngines(engines); err != nil {
@@ -441,7 +443,7 @@ func handleEngineSettings(w http.ResponseWriter, r *http.Request) {
 	if isEdit {
 		action = "updated"
 	}
-	slog.Info("Engine " + action, "id", editID, "type", engineType, "url", baseURL)
+	slog.Info("Engine "+action, "id", editID, "type", engineType, "url", baseURL)
 	addFlash(w, r, "success", "Engine "+action)
 	http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
 }
@@ -506,42 +508,11 @@ func handleOllamaSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Search ollama.com/search for the query
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(fmt.Sprintf("https://ollama.com/search?q=%s", url.QueryEscape(query)))
+	results, err := OllamaSearchModels(query)
 	if err != nil {
-		jsonResponse(w, 502, map[string]string{"error": fmt.Sprintf("Could not reach ollama.com: %v", err)})
+		slog.Warn("ollama.com search", "q", query, "err", err)
+		jsonResponse(w, 502, map[string]string{"error": err.Error()})
 		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		jsonResponse(w, 502, map[string]string{"error": fmt.Sprintf("Ollama search returned %d", resp.StatusCode)})
-		return
-	}
-
-	// Parse the HTML response to extract model names from /library/ links
-	var results []ModelDetail
-	bodyBytes, _ := io.ReadAll(resp.Body)
-	bodyStr := string(bodyBytes)
-
-	// Look for links matching /library/model-name and /namespace/model-name patterns
-	// e.g., <a href="/library/llama3.2" class="group w-full"> or
-	//       <a href="/batiai/qwen3.6-35b" class="group w-full">
-	re := regexp.MustCompile(`href="/(?:library/)?([^"/]+(?:/[^"/]+)?)\"[^>]*class="group w-full"`)
-	matches := re.FindAllStringSubmatch(bodyStr, -1)
-
-	// Use a map to deduplicate model names
-	modelMap := make(map[string]bool)
-	for _, m := range matches {
-		if len(m) > 1 {
-			modelName := m[1]
-			if !modelMap[modelName] {
-				modelMap[modelName] = true
-				// Size is unknown for search results, show placeholder
-				results = append(results, ModelDetail{Name: modelName, Size: "N/A"})
-			}
-		}
 	}
 
 	jsonResponse(w, 200, map[string][]ModelDetail{"results": results})
@@ -638,16 +609,8 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 			`<pre style='background:#111;color:#0f0;padding:12px'>%s</pre>`+
 			`<p>Save this key — it will not be shown again.</p>`+
 			`<p><a href='/admin/panel'>Back to admin panel</a></p>`,
-		htmlEscape(name), htmlEscape(apiKey),
+		html.EscapeString(name), html.EscapeString(apiKey),
 	)
-}
-
-func htmlEscape(s string) string {
-	s = strings.ReplaceAll(s, "&", "&amp;")
-	s = strings.ReplaceAll(s, "<", "&lt;")
-	s = strings.ReplaceAll(s, ">", "&gt;")
-	s = strings.ReplaceAll(s, `"`, "&quot;")
-	return s
 }
 
 func handleToggle(w http.ResponseWriter, r *http.Request) {
@@ -727,9 +690,7 @@ func handleAdminHelp(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
-	sess := getSession(r)
-	flashes := consumeFlashes(w, r, sess)
-	renderPage(w, "help", HelpData{BaseData: BaseData{Flashes: flashes, CurrentPath: r.URL.Path}})
+	renderPage(w, "help", HelpData{BaseData: newBaseData(w, r)})
 }
 
 // ─────────────────────────────── Logs ─────────────────────────────────────────
@@ -739,11 +700,9 @@ func handleAdminLogs(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
-	sess := getSession(r)
-	flashes := consumeFlashes(w, r, sess)
 	search := strings.TrimSpace(r.URL.Query().Get("q"))
 	renderPage(w, "logs", LogsData{
-		BaseData: BaseData{Flashes: flashes, CurrentPath: r.URL.Path},
+		BaseData: newBaseData(w, r),
 		Search:   search,
 	})
 }
@@ -945,10 +904,8 @@ func handleConfirmDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	uid := uidFromVars(r)
-	sess := getSession(r)
-	flashes := consumeFlashes(w, r, sess)
 	renderPage(w, "confirm_delete", ConfirmDeleteData{
-		BaseData: BaseData{Flashes: flashes, CurrentPath: r.URL.Path},
+		BaseData: newBaseData(w, r),
 		UID:      uid,
 	})
 }
@@ -993,13 +950,14 @@ func handleResetSystem(w http.ResponseWriter, r *http.Request) {
 	slog.Info("System reset: all logs and rate-limit entries cleared")
 	addFlash(w, r, "success", "System reset: all logs and rate-limit entries have been cleared.")
 	r.ParseForm()
-	next := r.FormValue("next")
-	if next != "admin_panel" && next != "admin_logs" {
-		next = "admin_panel"
-	}
+	// Allow-list, not a free-form path: "next" is attacker-controllable, and
+	// echoing it into a redirect unchecked is an open-redirect.
 	dest := "/admin/panel"
-	if next == "admin_logs" {
+	switch r.FormValue("next") {
+	case "admin_logs":
 		dest = "/admin/logs"
+	case "settings_page":
+		dest = "/admin/settings-page"
 	}
 	http.Redirect(w, r, dest, http.StatusFound)
 }
@@ -1012,204 +970,6 @@ func handleUsers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, "/admin/panel", http.StatusFound)
-}
-
-// ─────────────────────────────── API: models ──────────────────────────────────
-
-func handleListModels(w http.ResponseWriter, r *http.Request) {
-	// Auth already resolved by apiAuthMiddleware; if user is nil here, the
-	// middleware was bypassed (programming error).
-	if userFromContext(r) == nil {
-		jsonResponse(w, 401, openaiError("Invalid API key", "authentication_error"))
-		return
-	}
-
-	engines := cachedEngines()
-	if len(engines) == 0 {
-		jsonResponse(w, 502, openaiError("No engines configured", "api_error"))
-		return
-	}
-	adapter := cachedAdapter(engines[0].ID)
-	if adapter == nil {
-		jsonResponse(w, 502, openaiError("No engine configured", "api_error"))
-		return
-	}
-
-	models, err := adapter.ListModels()
-	if err != nil {
-		slog.Error("engine ListModels", "err", err)
-		jsonResponse(w, 502, openaiError("Could not reach engine", "api_error"))
-		return
-	}
-
-	// Convert engine models to OpenAI format
-	modelList := make([]map[string]interface{}, 0, len(models))
-	for _, m := range models {
-		name := modelName(m)
-		if name == "" {
-			continue
-		}
-		sizeB := toInt(m["size"])
-		modelList = append(modelList, map[string]interface{}{
-			"id":       name,
-			"object":   "model",
-			"created":  int64(0),
-			"owned_by": engines[0].Type,
-			"size":     sizeB,
-		})
-	}
-
-	jsonResponse(w, 200, map[string]interface{}{
-		"object": "list",
-		"data":   modelList,
-	})
-}
-
-// ─────────────────────────────── API: chat completions ────────────────────────
-
-func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
-	user := userFromContext(r)
-	if user == nil {
-		jsonResponse(w, 401, openaiError("Invalid API key", "authentication_error"))
-		return
-	}
-
-	if !isAllowed(user.ID, user.RateLimit) {
-		metricRateLimited.Inc()
-		jsonResponse(w, 429, openaiError("Rate limit exceeded", "rate_limit_error"))
-		return
-	}
-
-	// Bound the request body. Allow ~8× MaxMsgLen so a multi-turn conversation
-	// of bounded-length messages still fits; truncateInput then trims each field.
-	r.Body = http.MaxBytesReader(w, r.Body, int64(cfg.MaxMsgLen)*8)
-
-	var data map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&data); err != nil || data == nil {
-		var mbe *http.MaxBytesError
-		if errors.As(err, &mbe) {
-			jsonResponse(w, 413, openaiError("Request body too large", "invalid_request_error"))
-			return
-		}
-		jsonResponse(w, 400, openaiError("Invalid JSON body", "invalid_request_error"))
-		return
-	}
-	if _, ok := data["messages"]; !ok {
-		jsonResponse(w, 400, openaiError("'messages' is required", "invalid_request_error"))
-		return
-	}
-
-	rawMsgs, _ := data["messages"].([]interface{})
-	messages := sanitizeMessages(rawMsgs)
-	model, _ := data["model"].(string)
-
-	// Use the first Ollama engine, or fall back to the first configured engine.
-	var adapter Engine
-	if ollamas := cachedAdaptersByType(EngineOllama); len(ollamas) > 0 {
-		adapter = ollamas[0]
-	} else if engines := cachedEngines(); len(engines) > 0 {
-		adapter = cachedAdapter(engines[0].ID)
-	}
-	if adapter == nil {
-		jsonResponse(w, 502, openaiError("No engines configured", "api_error"))
-		return
-	}
-
-	// Cap upstream concurrency. Wait up to 250ms for a slot before giving
-	// up — long enough to absorb a momentary spike, short enough that
-	// clients see a clear backpressure signal.
-	acqCtx, acqCancel := context.WithTimeout(r.Context(), 250*time.Millisecond)
-	gotSlot := adapter.TryAcquire(acqCtx)
-	acqCancel()
-	if !gotSlot {
-		metricUpstreamBusy.WithLabelValues(adapter.Type()).Inc()
-		w.Header().Set("Retry-After", "2")
-		jsonResponse(w, 503, openaiError("Engine busy, please retry", "api_error"))
-		return
-	}
-	defer adapter.Release()
-
-	// Build the request for the engine — translate only for Ollama adapters.
-	var engineReq map[string]interface{}
-	if adapter.Type() == EngineOllama {
-		engineReq = openAIToOllama(data, messages)
-	} else {
-		engineReq = map[string]interface{}{
-			"model":    data["model"],
-			"messages": messages,
-			"stream":   data["stream"],
-		}
-		// pass through recognized OpenAI params
-		for key := range data {
-			switch key {
-			case "model", "messages", "stream", "temperature", "top_p", "seed", "max_tokens",
-				"max_completion_tokens", "frequency_penalty", "presence_penalty", "stop",
-				"provider_options", "response_format", "service_tier", "logit_bias", "tools",
-				"tool_choice", "logprobs", "top_logprobs", "parallel_tool_calls",
-				"user", "n":
-				engineReq[key] = data[key]
-			}
-		}
-	}
-
-	streaming, _ := data["stream"].(bool)
-	if streaming {
-		wrapper, ok := adapter.(*OllamaAdapter)
-		if ok {
-			wrapper.ChatStream(w, r, engineReq, user.ID, model)
-			return
-		}
-		// Fallback: use the adapter's ChatStream method
-		adapter.ChatStream(w, r, engineReq, user.ID, model)
-		return
-	}
-
-	// Non-streaming
-	result, err := adapter.Chat(engineReq)
-	if err != nil {
-		slog.Error("engine request", "err", err)
-		jsonResponse(w, 502, openaiError("Could not reach engine", "api_error"))
-		return
-	}
-
-	logInteraction(user.ID, marshalAudit(messages), marshalAudit(result), model)
-	jsonResponse(w, 200, result)
-}
-
-
-// getAuthenticatedUser is retained for any caller that still resolves a
-// /v1/* user outside the middleware. Prefer userFromContext when running
-// inside the middleware-protected request pipeline.
-func getAuthenticatedUser(r *http.Request) (*User, error) {
-	auth := r.Header.Get("Authorization")
-	if !strings.HasPrefix(auth, "Bearer ") {
-		return nil, nil
-	}
-	user, err := getUserByAPIKey(auth[7:])
-	if err != nil {
-		return nil, err
-	}
-	if user == nil || user.Status != "active" {
-		return nil, nil
-	}
-	return user, nil
-}
-
-func sanitizeMessages(messages []interface{}) []map[string]interface{} {
-	out := make([]map[string]interface{}, 0, len(messages))
-	for _, m := range messages {
-		msg, ok := m.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		role, _ := msg["role"].(string)
-		content, _ := msg["content"].(string)
-		out = append(out, map[string]interface{}{
-			"role":    role,
-			"content": truncateInput(content),
-		})
-	}
-	return out
 }
 
 // ─────────────────────────────── Helpers ──────────────────────────────────────

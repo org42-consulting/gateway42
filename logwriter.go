@@ -275,4 +275,3 @@ func startLogWriters(ctx context.Context) (waitDone func()) {
 		<-done
 	}
 }
-

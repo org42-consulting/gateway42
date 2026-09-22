@@ -7,6 +7,7 @@
             This action cannot be undone.
         </p>
         <form action="/delete/{{.UID}}" method="post">
+            <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
             <div style="display:flex; gap:10px; flex-wrap:wrap;">
                 <a href="/export/{{.UID}}" class="btn btn-primary">Download CSV</a>
                 <button type="submit" class="btn btn-danger">Delete Permanently</button>

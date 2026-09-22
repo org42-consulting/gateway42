@@ -114,8 +114,6 @@ cat > "${PLIST_PATH}" << PLIST
         <string>${LOG_DIR}/gateway.log</string>
         <key>PORT</key>
         <string>7000</string>
-        <key>OLLAMA_URL</key>
-        <string>http://127.0.0.1:11434/api/chat</string>
         <key>LOG_LEVEL</key>
         <string>INFO</string>
     </dict>

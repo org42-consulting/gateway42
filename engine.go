@@ -39,6 +39,12 @@ var sharedClient = &http.Client{Transport: sharedTransport}
 // the entire roundtrip including body read must complete quickly.
 var controlClient = &http.Client{Transport: sharedTransport, Timeout: 5 * time.Second}
 
+// upstreamChatTimeout caps a single completion. It is an upper bound for a
+// wedged engine, not a target: the request context is the primary deadline, so
+// a client that hangs up releases the engine's concurrency slot immediately
+// rather than holding it for the remainder of this budget.
+const upstreamChatTimeout = 120 * time.Second
+
 // maxStreamLineSize bounds a single SSE/JSONL line. The default bufio.Scanner
 // 64 KiB cap silently drops larger lines, which can happen when a model emits
 // a long token chunk or embedded base64.
@@ -133,12 +139,12 @@ const (
 
 // EngineConfig holds per-engine settings, stored as JSON in the settings table.
 type EngineConfig struct {
-	ID       int    `json:"id,omitempty"`
-	Name     string `json:"name"`
-	Type     string `json:"type"`
-	BaseURL  string `json:"base_url"`
-	Port     int    `json:"port,omitempty"`     // for Ollama, default 11434
-	APIKey   string `json:"api_key,omitempty"`  // for openai_compat engines
+	ID      int    `json:"id,omitempty"`
+	Name    string `json:"name"`
+	Type    string `json:"type"`
+	BaseURL string `json:"base_url"`
+	Port    int    `json:"port,omitempty"`    // for Ollama, default 11434
+	APIKey  string `json:"api_key,omitempty"` // for openai_compat engines
 }
 
 // Engine is the interface all model engine adapters must implement.
@@ -147,8 +153,8 @@ type Engine interface {
 	Name() string
 	Status() (bool, error)                                                                // health check
 	ListModels() ([]map[string]interface{}, error)                                        // list available models
-	Chat(req map[string]interface{}) (map[string]interface{}, error)                      // non-streaming
-	ChatStream(w http.ResponseWriter, r *http.Request, req map[string]interface{}, userID int, modelName string) // streaming
+	Chat(ctx context.Context, req map[string]interface{}) (map[string]interface{}, error) // non-streaming
+	StreamChat(ctx context.Context, req map[string]interface{}) (ChatStream, error)       // streaming
 	baseURL() string                                                                      // host:port for Ollama-only ops
 
 	// Upstream concurrency control. Acquire blocks until a slot is free OR
@@ -156,6 +162,107 @@ type Engine interface {
 	TryAcquire(ctx context.Context) bool
 	Release()
 }
+
+// ChatStream is a live streaming completion. Recv returns successive SSE data
+// payloads — the bytes that belong after "data: " — already in OpenAI wire
+// shape, and io.EOF once the upstream stream ends normally. Close must always
+// be called, and releases the underlying response body.
+//
+// This replaces a ChatStream(w, r, …) method that took an http.ResponseWriter.
+// Handing adapters the writer meant SSE framing, error payloads, flushing and
+// audit logging were reimplemented per engine type, and the translation could
+// not be exercised without standing up an httptest recorder and parsing the
+// framing back off. With a reader the handler owns the wire format once and a
+// test can drive an adapter's translator straight from a bytes.Reader.
+type ChatStream interface {
+	Recv() ([]byte, error)
+	Close() error
+}
+
+// ollamaStream translates Ollama's newline-delimited JSON into OpenAI chunks.
+type ollamaStream struct {
+	body         io.ReadCloser
+	scanner      *bufio.Scanner
+	completionID string
+	isFirst      bool
+	done         bool
+}
+
+func (s *ollamaStream) Recv() ([]byte, error) {
+	if s.done {
+		return nil, io.EOF
+	}
+	for s.scanner.Scan() {
+		line := strings.TrimSpace(s.scanner.Text())
+		if line == "" {
+			continue
+		}
+		var chunk map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &chunk); err != nil {
+			// One unparseable line does not justify tearing down the stream:
+			// Ollama emits a self-contained JSON object per line, so the next
+			// one is still usable.
+			continue
+		}
+		out, err := json.Marshal(formatStreamChunk(chunk, s.completionID, s.isFirst))
+		if err != nil {
+			return nil, err
+		}
+		s.isFirst = false
+		// Report this chunk, then stop on the next call — the final Ollama
+		// object carries both done:true and the usage counts, so returning
+		// EOF here instead would discard them.
+		if fin, _ := chunk["done"].(bool); fin {
+			s.done = true
+		}
+		return out, nil
+	}
+	if err := s.scanner.Err(); err != nil {
+		return nil, err
+	}
+	return nil, io.EOF
+}
+
+func (s *ollamaStream) Close() error { return s.body.Close() }
+
+// passthroughStream forwards an upstream that already speaks OpenAI SSE. It
+// unwraps the "data: " framing so the handler can re-apply it uniformly for
+// both engine types. Non-data lines (SSE comments, "event:", "id:") are
+// dropped: this gateway emits nothing but data frames, and upstream keepalive
+// comments have no meaning once our own writes drive the flush cadence.
+type passthroughStream struct {
+	body    io.ReadCloser
+	scanner *bufio.Scanner
+	done    bool
+}
+
+func (s *passthroughStream) Recv() ([]byte, error) {
+	if s.done {
+		return nil, io.EOF
+	}
+	for s.scanner.Scan() {
+		payload, ok := strings.CutPrefix(strings.TrimSpace(s.scanner.Text()), "data:")
+		if !ok {
+			continue
+		}
+		if payload = strings.TrimSpace(payload); payload == "" {
+			continue
+		}
+		if payload == "[DONE]" {
+			// Swallow the upstream terminator; the handler emits its own, so
+			// a stream that ends without one still terminates correctly.
+			s.done = true
+			return nil, io.EOF
+		}
+		return []byte(payload), nil
+	}
+	if err := s.scanner.Err(); err != nil {
+		return nil, err
+	}
+	return nil, io.EOF
+}
+
+func (s *passthroughStream) Close() error { return s.body.Close() }
 
 // concurrencyLimiter caps simultaneous in-flight upstream requests per engine.
 // One Ollama instance cannot serve many parallel streams without thrashing;
@@ -233,30 +340,6 @@ func newEngine(cf EngineConfig) (Engine, error) {
 	}
 }
 
-// GetEngineByName returns the EngineConfig for an engine by its database ID, or nil.
-func GetEngineByName(engines []EngineConfig, id int) *EngineConfig {
-	for _, e := range engines {
-		if e.ID == id {
-			return &e
-		}
-	}
-	return nil
-}
-
-// GetFirstOllamaAdapter returns an adapter for the first Ollama engine, or nil if none configured.
-func GetFirstOllamaAdapter() (Engine, error) {
-	engines, err := getEngines()
-	if err != nil || len(engines) == 0 {
-		return nil, err
-	}
-	for _, e := range engines {
-		if e.Type == EngineOllama {
-			return newEngine(e)
-		}
-	}
-	return nil, fmt.Errorf("no Ollama engine configured")
-}
-
 // modelName extracts the model identifier from a model map, handling both
 // Ollama ("name") and OpenAI-compat ("id") response formats.
 func modelName(m map[string]interface{}) string {
@@ -267,34 +350,29 @@ func modelName(m map[string]interface{}) string {
 	return n
 }
 
-// probeEngine probes an engine adapter for status and model names.
-func probeEngine(e Engine) (bool, []string) {
-	status, err := e.Status()
-	if err != nil || !status {
-		return false, nil
-	}
-	models, err := e.ListModels()
-	if err != nil {
-		return true, nil
-	}
-	var names []string
-	for _, m := range models {
-		if n := modelName(m); n != "" {
-			names = append(names, n)
-		}
-	}
-	return true, names
-}
-
 // ── Probe cache ───────────────────────────────────────────────────────────────
 
 const probeCacheTTL = 10 * time.Second
 
-type probeEntry struct {
+// probeData is everything one probe of an engine yields. raw keeps the
+// unmodified ListModels payload so /v1/models can report per-model metadata
+// (created, size, owner) without a second round of upstream calls — the probe
+// already fetched it.
+type probeData struct {
 	status  bool
 	models  []string
 	details []ModelDetail
-	expiry  time.Time
+	raw     []map[string]interface{}
+}
+
+type probeEntry struct {
+	probeData
+	expiry time.Time
+
+	// inflight is non-nil while a refresh is running for this engine and is
+	// closed when that refresh finishes. Callers that find it set wait on it
+	// instead of starting a second upstream probe.
+	inflight chan struct{}
 }
 
 var (
@@ -304,20 +382,62 @@ var (
 
 // probeEngineCached returns probe data for the given engine ID, refreshing
 // from upstream only if the cache is stale.
-func probeEngineCached(id int, e Engine) (bool, []string, []ModelDetail) {
-	probeCacheMu.Lock()
-	if entry, ok := probeCache[id]; ok && time.Now().Before(entry.expiry) {
+//
+// Concurrent callers for the same engine collapse onto a single upstream
+// probe: the first caller owns the refresh and the rest block on its
+// completion channel. Without that, one cold cache entry plus a burst of
+// dashboard loads would open one connection per request to an engine that
+// is, by definition, already slow to answer.
+func probeEngineCached(id int, e Engine) probeData {
+	for {
+		probeCacheMu.Lock()
+		entry, ok := probeCache[id]
+		if ok && entry.inflight != nil {
+			// Someone else is already refreshing — wait, then re-read.
+			wait := entry.inflight
+			probeCacheMu.Unlock()
+			<-wait
+			continue
+		}
+		if ok && time.Now().Before(entry.expiry) {
+			probeCacheMu.Unlock()
+			return entry.probeData
+		}
+		// We own the refresh. Publish the in-flight marker, preserving any
+		// stale values already in the entry.
+		done := make(chan struct{})
+		entry.inflight = done
+		probeCache[id] = entry
 		probeCacheMu.Unlock()
-		return entry.status, entry.models, entry.details
+		return refreshProbe(id, e, done)
 	}
-	probeCacheMu.Unlock()
+}
 
-	status, models, details := probeEngineFull(e)
+// refreshProbe probes upstream, stores the result, and releases callers
+// blocked on done. If the probe panics it clears the entry rather than
+// leaving an in-flight marker behind a closed channel, which would spin
+// waiters forever.
+func refreshProbe(id int, e Engine, done chan struct{}) probeData {
+	stored := false
+	defer func() {
+		if !stored {
+			probeCacheMu.Lock()
+			delete(probeCache, id)
+			probeCacheMu.Unlock()
+		}
+		close(done)
+	}()
+
+	data := probeEngineFull(e)
 
 	probeCacheMu.Lock()
-	probeCache[id] = probeEntry{status, models, details, time.Now().Add(probeCacheTTL)}
+	probeCache[id] = probeEntry{
+		probeData: data,
+		expiry:    time.Now().Add(probeCacheTTL),
+	}
+	stored = true
 	probeCacheMu.Unlock()
-	return status, models, details
+	return data
 }
 
 // invalidateProbeCache clears the probe cache. Call after engine edits so
@@ -326,6 +446,10 @@ func invalidateProbeCache() {
 	probeCacheMu.Lock()
 	probeCache = map[int]probeEntry{}
 	probeCacheMu.Unlock()
+	// The routing index is derived from probe data, so it is stale the moment
+	// the probes are. Dropping it here is what makes a freshly pulled model
+	// routable immediately instead of up to routeIndexTTL later.
+	invalidateRouteIndex()
 }
 
 // warmProbeCache runs probes for all engines in parallel, returning when
@@ -362,14 +486,14 @@ func warmProbeCache(ctx context.Context) {
 }
 
 // probeEngineFull probes an engine adapter for status, model names, and model details.
-func probeEngineFull(e Engine) (bool, []string, []ModelDetail) {
+func probeEngineFull(e Engine) probeData {
 	status, err := e.Status()
 	if err != nil || !status {
-		return false, nil, nil
+		return probeData{}
 	}
 	models, err := e.ListModels()
 	if err != nil {
-		return true, nil, nil
+		return probeData{status: true}
 	}
 	var names []string
 	var details []ModelDetail
@@ -388,31 +512,7 @@ func probeEngineFull(e Engine) (bool, []string, []ModelDetail) {
 		}
 		details = append(details, ModelDetail{Name: n, Size: sizeStr})
 	}
-	return true, names, details
-}
-
-// OllamaEndpointFromConfig returns the host:port endpoint for an Ollama config.
-func OllamaEndpointFromConfig(cfg EngineConfig) string {
-	host := cfg.BaseURL
-	port := cfg.Port
-	if port == 0 {
-		port = 11434
-	}
-	return fmt.Sprintf("%s:%d", strings.TrimRight(host, "/"), port)
-}
-
-// GetOllamaBaseURL returns the base URL and port for the first Ollama engine.
-func GetOllamaBaseURL() (string, int) {
-	engines, err := getEngines()
-	if err != nil || len(engines) == 0 {
-		return "127.0.0.1", 11434
-	}
-	for _, e := range engines {
-		if e.Type == EngineOllama {
-			return e.BaseURL, e.Port
-		}
-	}
-	return "127.0.0.1", 11434
+	return probeData{status: true, models: names, details: details, raw: models}
 }
 
 // ─────────────────── OllamaAdapter ────────────────────────────────────────────
@@ -422,8 +522,8 @@ type OllamaAdapter struct {
 	*concurrencyLimiter
 }
 
-func (a *OllamaAdapter) Type() string  { return EngineOllama }
-func (a *OllamaAdapter) Name() string  { return a.cfg.Name }
+func (a *OllamaAdapter) Type() string { return EngineOllama }
+func (a *OllamaAdapter) Name() string { return a.cfg.Name }
 
 func (a *OllamaAdapter) baseURL() string {
 	u := strings.TrimRight(a.cfg.BaseURL, "/")
@@ -471,9 +571,9 @@ func (a *OllamaAdapter) ListModels() ([]map[string]interface{}, error) {
 	return result, nil
 }
 
-func (a *OllamaAdapter) Chat(req map[string]interface{}) (map[string]interface{}, error) {
+func (a *OllamaAdapter) Chat(ctx context.Context, req map[string]interface{}) (map[string]interface{}, error) {
 	body, _ := json.Marshal(req)
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, upstreamChatTimeout)
 	defer cancel()
 
 	var result map[string]interface{}
@@ -496,69 +596,33 @@ func (a *OllamaAdapter) Chat(req map[string]interface{}) (map[string]interface{}
 	return result, nil
 }
 
-func (a *OllamaAdapter) ChatStream(w http.ResponseWriter, r *http.Request, req map[string]interface{}, userID int, modelName string) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "streaming not supported", 500)
-		return
+// StreamChat opens a streaming completion. The caller owns ctx — including its
+// deadline — because the returned stream outlives this call.
+func (a *OllamaAdapter) StreamChat(ctx context.Context, req map[string]interface{}) (ChatStream, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
 	}
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.Header().Set("Cache-Control", "no-cache")
-
-	body, _ := json.Marshal(req)
-	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
-	defer cancel()
-
-	httpReq, _ := http.NewRequestWithContext(ctx, "POST", a.baseURL()+"/api/chat", bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", a.baseURL()+"/api/chat", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
 	httpReq.Header.Set("Content-Type", "application/json")
 
 	resp, err := sharedClient.Do(httpReq)
 	if err != nil {
-		b, _ := json.Marshal(openaiError("Internal error", "api_error"))
-		fmt.Fprintf(w, "data: %s\n\n", string(b))
-		flusher.Flush()
-		return
+		return nil, err
 	}
-	defer resp.Body.Close()
-
 	if resp.StatusCode != 200 {
-		b, _ := json.Marshal(openaiError("Upstream error", "api_error"))
-		fmt.Fprintf(w, "data: %s\n\n", string(b))
-		flusher.Flush()
-		return
+		resp.Body.Close()
+		return nil, fmt.Errorf("engine returned %d", resp.StatusCode)
 	}
-
-	completionID := newCompletionID()
-	isFirst := true
-
-	scanner := newStreamScanner(resp.Body)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		var chunk map[string]interface{}
-		if err := json.Unmarshal([]byte(line), &chunk); err != nil {
-			continue
-		}
-		openaiChunk := formatStreamChunk(chunk, completionID, isFirst)
-		isFirst = false
-
-		b, _ := json.Marshal(openaiChunk)
-		fmt.Fprintf(w, "data: %s\n\n", string(b))
-		flusher.Flush()
-
-		if done, _ := chunk["done"].(bool); done {
-			break
-		}
-	}
-
-	fmt.Fprintf(w, "data: [DONE]\n\n")
-	flusher.Flush()
-
-	logInteraction(userID, marshalAudit(req["messages"]), "streamed", modelName)
+	return &ollamaStream{
+		body:         resp.Body,
+		scanner:      newStreamScanner(resp.Body),
+		completionID: newCompletionID(),
+		isFirst:      true,
+	}, nil
 }
 
 // ─────────────────── OpenAICompatAdapter ──────────────────────────────────────
@@ -632,9 +696,9 @@ func (a *OpenAICompatAdapter) ListModels() ([]map[string]interface{}, error) {
 	return models, nil
 }
 
-func (a *OpenAICompatAdapter) Chat(req map[string]interface{}) (map[string]interface{}, error) {
+func (a *OpenAICompatAdapter) Chat(ctx context.Context, req map[string]interface{}) (map[string]interface{}, error) {
 	body, _ := json.Marshal(req)
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, upstreamChatTimeout)
 	defer cancel()
 
 	var result map[string]interface{}
@@ -660,22 +724,17 @@ func (a *OpenAICompatAdapter) Chat(req map[string]interface{}) (map[string]inter
 	return result, nil
 }
 
-func (a *OpenAICompatAdapter) ChatStream(w http.ResponseWriter, r *http.Request, req map[string]interface{}, userID int, modelName string) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "streaming not supported", 500)
-		return
+// StreamChat opens a streaming completion. The upstream already speaks OpenAI
+// SSE, so no translation is needed — only unwrapping of the frames.
+func (a *OpenAICompatAdapter) StreamChat(ctx context.Context, req map[string]interface{}) (ChatStream, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
 	}
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.Header().Set("Cache-Control", "no-cache")
-
-	body, _ := json.Marshal(req)
-	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
-	defer cancel()
-
-	httpReq, _ := http.NewRequestWithContext(ctx, "POST", a.upstream("/v1/chat/completions"), bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", a.upstream("/v1/chat/completions"), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	if a.cfg.APIKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+a.cfg.APIKey)
@@ -683,109 +742,52 @@ func (a *OpenAICompatAdapter) ChatStream(w http.ResponseWriter, r *http.Request,
 
 	resp, err := sharedClient.Do(httpReq)
 	if err != nil {
-		b, _ := json.Marshal(openaiError("Internal error", "api_error"))
-		fmt.Fprintf(w, "data: %s\n\n", string(b))
-		flusher.Flush()
-		return
+		return nil, err
 	}
-	defer resp.Body.Close()
-
 	if resp.StatusCode != 200 {
-		b, _ := json.Marshal(openaiError("Upstream error", "api_error"))
-		fmt.Fprintf(w, "data: %s\n\n", string(b))
-		flusher.Flush()
-		return
+		resp.Body.Close()
+		return nil, fmt.Errorf("engine returned %d", resp.StatusCode)
 	}
-
-	scanner := newStreamScanner(resp.Body)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		fmt.Fprintf(w, "%s\n\n", line)
-		flusher.Flush()
-		if line == "data: [DONE]" {
-			break
-		}
-	}
-	flusher.Flush()
-
-	logInteraction(userID, marshalAudit(req["messages"]), "streamed", modelName)
+	return &passthroughStream{body: resp.Body, scanner: newStreamScanner(resp.Body)}, nil
 }
 
 // ── Ollama-only helpers (search, pull, delete) ────────────────────────────────
 
-// OllamaSearchModels searches ollama.com for models
+// ollamaSearchLinkRe matches the model links on an ollama.com search page,
+// e.g. <a href="/library/llama3.2" class="group w-full"> and namespaced
+// entries like <a href="/batiai/qwen3.6-35b" class="group w-full">.
+var ollamaSearchLinkRe = regexp.MustCompile(`href="/(?:library/)?([^"/]+(?:/[^"/]+)?)\"[^>]*class="group w-full"`)
+
+// OllamaSearchModels scrapes ollama.com/search for models matching query.
+// This parses HTML, so it is inherently brittle to upstream redesigns; an
+// empty result set is far more likely than an error when that happens.
 func OllamaSearchModels(query string) ([]ModelDetail, error) {
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(fmt.Sprintf("https://ollama.com/search?q=%s", url.QueryEscape(query)))
+	resp, err := controlClient.Get(fmt.Sprintf("https://ollama.com/search?q=%s", url.QueryEscape(query)))
 	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, _ := io.ReadAll(resp.Body)
-	re := regexp.MustCompile(`href="/(?:library/)?([^"/]+(?:/[^"/]+)?)\"[^>]*class="group w-full"`)
-	matches := re.FindAllStringSubmatch(string(bodyBytes), -1)
-
-	modelMap := make(map[string]bool)
-	var results []ModelDetail
-	for _, m := range matches {
-		if len(m) > 1 && !modelMap[m[1]] {
-			modelMap[m[1]] = true
-			results = append(results, ModelDetail{Name: m[1], Size: "N/A"})
-		}
-	}
-	return results, nil
-}
-
-// OllamaPullModel streams a model pull from Ollama as SSE.
-func OllamaPullModel(baseURL string, port int, model string, w http.ResponseWriter, r *http.Request) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "streaming not supported", 500)
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.Header().Set("Cache-Control", "no-cache")
-
-	endpoint := fmt.Sprintf("%s:%d", strings.TrimRight(baseURL, "/"), port)
-	body, _ := json.Marshal(map[string]interface{}{"name": model, "stream": true})
-
-	ctx, cancel := context.WithTimeout(r.Context(), 600*time.Second)
-	defer cancel()
-
-	httpReq, _ := http.NewRequestWithContext(ctx, "POST", endpoint+"/api/pull", bytes.NewReader(body))
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := sharedClient.Do(httpReq)
-	if err != nil {
-		fmt.Fprintf(w, "data: %s\n\n", jsonErr(err.Error()))
-		flusher.Flush()
-		return
+		return nil, fmt.Errorf("could not reach ollama.com: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		fmt.Fprintf(w, "data: %s\n\n", jsonErr(fmt.Sprintf("Engine returned %d", resp.StatusCode)))
-		flusher.Flush()
-		return
+		return nil, fmt.Errorf("ollama.com search returned %d", resp.StatusCode)
 	}
 
-	scanner := newStreamScanner(resp.Body)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		fmt.Fprintf(w, "data: %s\n\n", line)
-		flusher.Flush()
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading ollama.com response: %w", err)
 	}
-	fmt.Fprintf(w, "data: [DONE]\n\n")
-	flusher.Flush()
+	matches := ollamaSearchLinkRe.FindAllStringSubmatch(string(bodyBytes), -1)
+
+	seen := make(map[string]bool, len(matches))
+	results := make([]ModelDetail, 0, len(matches))
+	for _, m := range matches {
+		if len(m) > 1 && !seen[m[1]] {
+			seen[m[1]] = true
+			// Size is not exposed on the search page.
+			results = append(results, ModelDetail{Name: m[1], Size: "N/A"})
+		}
+	}
+	return results, nil
 }
 
 // OllamaDeleteModel deletes a model from an Ollama instance.

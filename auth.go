@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	gocrypto "golang.org/x/crypto/pbkdf2"
 )
@@ -73,9 +74,17 @@ func validatePassword(password string) (bool, string) {
 	return true, ""
 }
 
+// truncateInput caps text at MaxMsgLen bytes, backing off to the previous rune
+// boundary so the cut never lands mid-sequence. A byte-exact slice would leave
+// a partial UTF-8 rune at the tail, which json.Marshal silently replaces with
+// U+FFFD in the audit log rather than rejecting.
 func truncateInput(text string) string {
 	if len(text) <= cfg.MaxMsgLen {
 		return text
 	}
-	return text[:cfg.MaxMsgLen]
+	cut := cfg.MaxMsgLen
+	for cut > 0 && !utf8.RuneStart(text[cut]) {
+		cut--
+	}
+	return text[:cut]
 }

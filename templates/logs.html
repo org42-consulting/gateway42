@@ -34,6 +34,7 @@
         </div>
     </form>
     <form id="reset-system-form" action="/admin/reset-system" method="post" style="display:none;">
+        <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
         <input type="hidden" name="next" value="admin_logs">
     </form>
 
@@ -289,7 +290,10 @@ function buildPagination(paginationEl, page, pages, onPageChange) {
     resetBtn.addEventListener('click', async () => {
         if (!confirm('This will permanently clear all in-memory system log entries. Continue?')) return;
         try {
-            await fetch('/admin/logs/system/reset', { method: 'POST' });
+            await fetch('/admin/logs/system/reset', {
+                method: 'POST',
+                headers: {'X-CSRF-Token': document.querySelector('meta[name="csrf-token"]').content},
+            });
             currentPage = 1;
             refresh();
         } catch (_) { indicator.textContent = 'Reset failed'; }

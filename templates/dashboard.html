@@ -72,6 +72,7 @@
                 <td>{{.Name}}</td>
                 <td>
                     <form action="/toggle/{{.ID}}" method="post" class="form-inline">
+                        <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
                         <button type="submit" class="badge {{if eq .Status "active"}}badge-active{{else}}badge-disabled{{end}}">
                             {{if eq .Status "active"}}ACTIVE{{else}}DISABLED{{end}}
                         </button>
@@ -79,6 +80,7 @@
                 </td>
                 <td>
                     <form action="/admin/update-rate-limit/{{.ID}}" method="post" class="form-inline">
+                        <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
                         <input type="number" name="rate_limit" value="{{.RateLimit}}" min="1" max="1000" style="width: 60px; padding: 3px;">
                         <button type="submit" class="btn-small btn-ghost">Update</button>
                     </form>
@@ -86,6 +88,7 @@
                 <td>
                     <div class="flex-row" style="gap:6px;">
                         <form action="/admin/reset/{{.ID}}" method="post" class="form-inline">
+                            <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
                             <button type="submit" class="btn-small btn-warning">New API Key</button>
                         </form>
                         <a href="/export/{{.ID}}" class="btn-small btn-primary">Export CSV</a>
@@ -103,6 +106,7 @@
 <div class="card card-mt">
   <h2>Register New Client</h2>
   <form action="/register" method="post" class="space-y-3">
+      <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
       <div>
           <label>Client Name</label>
           <input type="text" name="name" placeholder="e.g. my-agent-app">
@@ -117,6 +121,7 @@
     <p class="section-desc">Permanently deletes all audit logs and clears all rate-limit counters. Users and settings are not affected.</p>
     <form action="/admin/reset-system" method="post"
           onsubmit="return confirm('This will permanently delete all logs and reset all rate-limit counters. This cannot be undone. Continue?');">
+        <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
         <input type="hidden" name="next" value="admin_panel">
         <button type="submit" class="btn btn-danger">Reset System</button>
     </form>

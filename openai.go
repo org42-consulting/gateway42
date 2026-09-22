@@ -1,8 +1,8 @@
 package main
 
 import (
-	"encoding/hex"
 	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"time"
 )
@@ -25,10 +25,10 @@ func openAIToOllama(data map[string]interface{}, messages []map[string]interface
 
 	// Direct parameter mappings
 	paramMap := map[string]string{
-		"temperature":     "temperature",
-		"top_p":           "top_p",
-		"seed":            "seed",
-		"max_tokens":      "num_predict",
+		"temperature":      "temperature",
+		"top_p":            "top_p",
+		"seed":             "seed",
+		"max_tokens":       "num_predict",
 		"presence_penalty": "repeat_last_n",
 	}
 	for openaiKey, ollamaKey := range paramMap {
@@ -84,15 +84,52 @@ func openAIToOllama(data map[string]interface{}, messages []map[string]interface
 	return req
 }
 
+// ─────────────────────────────── Finish reason ────────────────────────────────
+
+// ollamaFinishReason maps a *terminal* Ollama response onto OpenAI's
+// finish_reason. Both response paths call it: the non-streaming envelope and
+// the final streaming chunk, which are the only two places the value is
+// non-null. It is never called mid-stream.
+//
+// TODO: decide what this returns. It currently answers "stop" unconditionally,
+// which is what Gateway42 has always done — see OPENAI_COMPATIBILITY.md.
+//
+// Ollama reports done_reason on its final object: "stop" when the model emitted
+// an end token, "length" when it hit num_predict. Older builds omit the field,
+// and nothing stops a future one from reporting a reason OpenAI has no name for.
+// OpenAI's vocabulary is "stop" | "length" | "content_filter" | "tool_calls".
+//
+// The decision is in the gaps, not the happy path:
+//
+//   - Defaulting an absent or unrecognised reason to "stop" keeps every client
+//     working, but labels a truncated completion as naturally finished — so a
+//     caller that retries on "length" silently never retries.
+//   - Returning nil is honest about not knowing, but null is also what this
+//     gateway sends mid-stream; on a terminal chunk some SDKs read it as "still
+//     going" and a few fault outright.
+//   - Forwarding an unrecognised value verbatim is most faithful to upstream,
+//     but puts a string outside the enum in front of clients that switch on it
+//     exhaustively.
+//
+// Two tests in types_test.go pin the current contract and will need updating if
+// the terminal answer changes: TestChunkFinishReasonIsNullNotAbsent (present
+// and null mid-stream) and TestCompletionUsageAlwaysPresent (asserts "stop" on
+// a completed response).
+//
+// The field is a *string, so the value must be addressable: &finishStop
+// (types.go) covers "stop"; for anything else a local works —
+// r := "length"; return &r.
+func ollamaFinishReason(chunk map[string]interface{}) *string {
+	return &finishStop
+}
+
 // ─────────────────────────────── Non-streaming response ───────────────────────
 
 // ollamaToOpenAI translates a complete Ollama /api/chat response to OpenAI format.
-// This function converts Ollama response format to OpenAI-compatible format
-func ollamaToOpenAI(ollama map[string]interface{}) map[string]interface{} {
+// The input stays a map because it is upstream-shaped; the output is typed
+// because this is where Gateway42 authors the client-facing body.
+func ollamaToOpenAI(ollama map[string]interface{}) *ChatCompletion {
 	msg, _ := ollama["message"].(map[string]interface{})
-	if msg == nil {
-		msg = map[string]interface{}{}
-	}
 	role, _ := msg["role"].(string)
 	if role == "" {
 		role = "assistant"
@@ -103,25 +140,20 @@ func ollamaToOpenAI(ollama map[string]interface{}) map[string]interface{} {
 	completionTokens := toInt(ollama["eval_count"])
 	modelName, _ := ollama["model"].(string)
 
-	return map[string]interface{}{
-		"id":      newCompletionID(),
-		"object":  "chat.completion",
-		"created": time.Now().Unix(),
-		"model":   modelName,
-		"choices": []interface{}{
-			map[string]interface{}{
-				"index": 0,
-				"message": map[string]interface{}{
-					"role":    role,
-					"content": content,
-				},
-				"finish_reason": "stop",
-			},
-		},
-		"usage": map[string]interface{}{
-			"prompt_tokens":     promptTokens,
-			"completion_tokens": completionTokens,
-			"total_tokens":      promptTokens + completionTokens,
+	return &ChatCompletion{
+		ID:      newCompletionID(),
+		Object:  "chat.completion",
+		Created: time.Now().Unix(),
+		Model:   modelName,
+		Choices: []Choice{{
+			Index:        0,
+			Message:      Message{Role: role, Content: content},
+			FinishReason: ollamaFinishReason(ollama),
+		}},
+		Usage: Usage{
+			PromptTokens:     promptTokens,
+			CompletionTokens: completionTokens,
+			TotalTokens:      promptTokens + completionTokens,
 		},
 	}
 }
@@ -129,82 +161,63 @@ func ollamaToOpenAI(ollama map[string]interface{}) map[string]interface{} {
 // ─────────────────────────────── Streaming chunk translation ──────────────────
 
 // formatStreamChunk translates one Ollama streaming line to an OpenAI SSE chunk.
-// This function converts streaming response chunks from Ollama to OpenAI-compatible format
-func formatStreamChunk(chunk map[string]interface{}, completionID string, isFirst bool) map[string]interface{} {
+//
+// isFirst drives the role: OpenAI emits "role" only on the opening delta and
+// clients accumulate from there, so repeating it would have some of them
+// restart the message. The Delta struct's omitempty tags are what make the
+// three shapes — opening, middle, terminating — fall out of one type.
+func formatStreamChunk(chunk map[string]interface{}, completionID string, isFirst bool) *ChatCompletionChunk {
 	done, _ := chunk["done"].(bool)
 	msg, _ := chunk["message"].(map[string]interface{})
-	content := ""
-	if msg != nil {
-		content, _ = msg["content"].(string)
+	content, _ := msg["content"].(string)
+
+	var delta Delta
+	switch {
+	case isFirst:
+		delta = Delta{Role: "assistant", Content: content}
+	case done:
+		// Terminating chunk: finish_reason carries the signal, not the delta.
+		delta = Delta{}
+	default:
+		delta = Delta{Content: content}
 	}
 
-	var delta map[string]interface{}
-	if isFirst {
-		delta = map[string]interface{}{"role": "assistant", "content": content}
-	} else if done {
-		delta = map[string]interface{}{}
-	} else {
-		delta = map[string]interface{}{"content": content}
-	}
-
-	finishReason := interface{}(nil)
+	// Only the terminal chunk carries a reason; mid-stream it stays null.
+	var finishReason *string
 	if done {
-		finishReason = "stop"
+		finishReason = ollamaFinishReason(chunk)
 	}
 
 	modelName, _ := chunk["model"].(string)
 
-	result := map[string]interface{}{
-		"id":      completionID,
-		"object":  "chat.completion.chunk",
-		"created": time.Now().Unix(),
-		"model":   modelName,
-		"choices": []interface{}{
-			map[string]interface{}{
-				"index":         0,
-				"delta":         delta,
-				"finish_reason": finishReason,
-			},
-		},
+	out := &ChatCompletionChunk{
+		ID:      completionID,
+		Object:  "chat.completion.chunk",
+		Created: time.Now().Unix(),
+		Model:   modelName,
+		Choices: []ChunkChoice{{
+			Index:        0,
+			Delta:        delta,
+			FinishReason: finishReason,
+		}},
 	}
 
+	// Ollama reports token counts only on its final object, and OpenAI puts
+	// usage only on the last chunk, so the two line up exactly.
 	if done {
 		promptTokens := toInt(chunk["prompt_eval_count"])
 		completionTokens := toInt(chunk["eval_count"])
-		result["usage"] = map[string]interface{}{
-			"prompt_tokens":     promptTokens,
-			"completion_tokens": completionTokens,
-			"total_tokens":      promptTokens + completionTokens,
+		out.Usage = &Usage{
+			PromptTokens:     promptTokens,
+			CompletionTokens: completionTokens,
+			TotalTokens:      promptTokens + completionTokens,
 		}
 	}
 
-	return result
+	return out
 }
 
 // ─────────────────────────────── Models listing ───────────────────────────────
-
-// ollamaTagsToOpenAIModels translates Ollama GET /api/tags to OpenAI /v1/models format.
-// This function converts Ollama's model listing format to OpenAI-compatible format
-func ollamaTagsToOpenAIModels(tags map[string]interface{}) map[string]interface{} {
-	models, _ := tags["models"].([]interface{})
-	data := make([]interface{}, 0, len(models))
-	for _, m := range models {
-		model, ok := m.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		name, _ := model["name"].(string)
-		ts, _ := model["modified_at"].(string)
-		created := parseOllamaTS(ts)
-		data = append(data, map[string]interface{}{
-			"id":       name,
-			"object":   "model",
-			"created":  created,
-			"owned_by": "ollama",
-		})
-	}
-	return map[string]interface{}{"object": "list", "data": data}
-}
 
 // parseOllamaTS converts Ollama timestamp string to Unix timestamp
 func parseOllamaTS(ts string) int64 {
@@ -224,14 +237,8 @@ func parseOllamaTS(ts string) int64 {
 // ─────────────────────────────── Error helpers ────────────────────────────────
 
 // openaiError creates an OpenAI-compatible error response
-func openaiError(message, errorType string) map[string]interface{} {
-	return map[string]interface{}{
-		"error": map[string]interface{}{
-			"message": message,
-			"type":    errorType,
-			"code":    nil,
-		},
-	}
+func openaiError(message, errorType string) *ErrorResponse {
+	return &ErrorResponse{Error: APIError{Message: message, Type: errorType}}
 }
 
 // ─────────────────────────────── Helpers ──────────────────────────────────────

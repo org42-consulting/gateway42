@@ -1,5 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Reference copy only. ./install.sh generates the authoritative LaunchAgent at
+  ~/Library/LaunchAgents/com.gateway42.service.plist and is what you should
+  normally use; it substitutes the real $HOME into the paths below.
+
+  This file is here for manual installs and for diffing against what is
+  actually loaded. Replace /Users/org42 with your own home directory before
+  copying it into ~/Library/LaunchAgents — launchd does not expand ~ or $HOME.
+-->
 <plist version="1.0">
 <dict>
     <key>Label</key>
@@ -7,7 +16,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/org42/git/gateway42/service-run.sh</string>
+        <string>/usr/local/bin/gateway42</string>
     </array>
 
     <key>RunAtLoad</key>
@@ -17,18 +26,20 @@
     <false/>
 
     <key>WorkingDirectory</key>
-    <string>/Users/org42/git/gateway42</string>
+    <string>/Users/org42/.gateway42</string>
 
     <key>StandardOutPath</key>
-    <string>/Users/org42/git/gateway42/logs/gateway42.log</string>
+    <string>/Users/org42/Library/Logs/gateway42/gateway42.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/org42/git/gateway42/logs/gateway42.log</string>
+    <string>/Users/org42/Library/Logs/gateway42/gateway42.err.log</string>
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>GW42_DB_PATH</key>
+        <string>/Users/org42/.gateway42/db/gateway.db</string>
     </dict>
 </dict>
 </plist>
