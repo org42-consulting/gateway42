@@ -184,14 +184,3 @@ func selectEngine(model string) (Engine, routeErr) {
 	}
 	return nil, routeModelNotFound
 }
-
-// engineTypeByID reports an engine's configured type, for /v1/models owner
-// reporting. Returns "" when the ID is unknown.
-func engineTypeByID(id int) string {
-	for _, e := range cachedEngines() {
-		if e.ID == id {
-			return e.Type
-		}
-	}
-	return ""
-}

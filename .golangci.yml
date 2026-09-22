@@ -17,12 +17,22 @@ linters:
 
   settings:
     errcheck:
-      # These are deliberate: a failed Flush or a failed write to an already
-      # disconnected client has no recovery path, and rolling back an
-      # already-committed transaction is the standard defer idiom.
       exclude-functions:
+        # A failed write or flush to an already-disconnected client has no
+        # recovery path: the response is gone either way, and the only place an
+        # error could be reported to is the connection that just died. This
+        # covers the whole response-writing family, including the SSE error
+        # frame recoveryMiddleware emits mid-stream.
         - (net/http.Flusher).Flush
-        - (database/sql.Tx).Rollback
+        - (net/http.ResponseWriter).Write
+        - (*encoding/csv.Writer).Write
+        - fmt.Fprint
+        - fmt.Fprintf
+        # Rolling back an already-committed transaction is the standard defer
+        # idiom and returns sql.ErrTxDone by design. Note the pointer receiver:
+        # the calls are on *sql.Tx, and the interface-style spelling
+        # `(database/sql.Tx).Rollback` silently matches nothing at all.
+        - (*database/sql.Tx).Rollback
     staticcheck:
       checks:
         - all

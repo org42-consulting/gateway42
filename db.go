@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -15,6 +16,46 @@ import (
 
 	_ "modernc.org/sqlite"
 )
+
+// tableHasColumn reports whether a table already has the named column, which is
+// how the migrations decide whether an ALTER is needed. The scan error is
+// returned rather than dropped: swallowing it reads as "column absent" and
+// triggers an ALTER that then fails with a message describing the symptom
+// rather than the cause.
+//
+// table is interpolated because PRAGMA does not accept bound parameters for it.
+// Every call site passes a string literal; do not hand it anything derived from
+// a request.
+func tableHasColumn(tx *sql.Tx, table, column string) (bool, error) {
+	rows, err := tx.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, typ string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			return false, fmt.Errorf("PRAGMA table_info(%s): %w", table, err)
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+// txCount runs a single-value COUNT query inside a migration transaction.
+// It exists so the error cannot be dropped: a caller that ignores it gets 0,
+// which is a legitimate count and therefore indistinguishable from failure.
+func txCount(tx *sql.Tx, query string) (int, error) {
+	var n int
+	if err := tx.QueryRow(query).Scan(&n); err != nil {
+		return 0, fmt.Errorf("%s: %w", query, err)
+	}
+	return n, nil
+}
 
 // sha256Hex returns the hex-encoded SHA-256 hash of s.
 func sha256Hex(s string) string {
@@ -157,21 +198,10 @@ func createSchema() error {
 	}
 
 	// Migration: rename users.email → users.name
-	urows, err := tx.Query("PRAGMA table_info(users)")
+	hasName, err := tableHasColumn(tx, "users", "name")
 	if err != nil {
 		return err
 	}
-	hasName := false
-	for urows.Next() {
-		var cid, notNull, pk int
-		var name, typ string
-		var dflt sql.NullString
-		urows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk)
-		if name == "name" {
-			hasName = true
-		}
-	}
-	urows.Close()
 	if !hasName {
 		if _, err := tx.Exec("ALTER TABLE users RENAME COLUMN email TO name"); err != nil {
 			return err
@@ -179,21 +209,10 @@ func createSchema() error {
 	}
 
 	// Migration: add model column to logs
-	lrows, err := tx.Query("PRAGMA table_info(logs)")
+	hasModel, err := tableHasColumn(tx, "logs", "model")
 	if err != nil {
 		return err
 	}
-	hasModel := false
-	for lrows.Next() {
-		var cid, notNull, pk int
-		var name, typ string
-		var dflt sql.NullString
-		lrows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk)
-		if name == "model" {
-			hasModel = true
-		}
-	}
-	lrows.Close()
 	if !hasModel {
 		if _, err := tx.Exec("ALTER TABLE logs ADD COLUMN model TEXT"); err != nil {
 			return err
@@ -270,10 +289,20 @@ func createSchema() error {
 	}
 	if ftsOK {
 		// One-shot backfill: populate FTS tables from existing rows if empty.
-		var ftsLogsCount, baseLogsCount int
-		tx.QueryRow("SELECT COUNT(*) FROM logs_fts").Scan(&ftsLogsCount)
-		tx.QueryRow("SELECT COUNT(*) FROM logs").Scan(&baseLogsCount)
-		if ftsLogsCount == 0 && baseLogsCount > 0 {
+		//
+		// A failed count is indistinguishable from a count of zero, and zero is
+		// precisely what triggers a backfill, so an unchecked scan here would
+		// re-run the INSERT on every startup against a table that may already be
+		// populated. FTS is optional, so a count that cannot be read degrades to
+		// the LIKE fallback rather than failing the whole migration.
+		ftsLogsCount, errFTSLogs := txCount(tx, "SELECT COUNT(*) FROM logs_fts")
+		baseLogsCount, errBaseLogs := txCount(tx, "SELECT COUNT(*) FROM logs")
+		switch {
+		case errFTSLogs != nil || errBaseLogs != nil:
+			slog.Warn("logs_fts count failed, falling back to LIKE search",
+				"err", errors.Join(errFTSLogs, errBaseLogs))
+			ftsOK = false
+		case ftsLogsCount == 0 && baseLogsCount > 0:
 			if _, err := tx.Exec(`
 				INSERT INTO logs_fts(rowid, prompt, response, user_name)
 				SELECT l.id, COALESCE(l.prompt,''), COALESCE(l.response,''),
@@ -285,10 +314,14 @@ func createSchema() error {
 				slog.Info("logs_fts backfilled", "rows", baseLogsCount)
 			}
 		}
-		var ftsRLCount, baseRLCount int
-		tx.QueryRow("SELECT COUNT(*) FROM request_logs_fts").Scan(&ftsRLCount)
-		tx.QueryRow("SELECT COUNT(*) FROM request_logs").Scan(&baseRLCount)
-		if ftsRLCount == 0 && baseRLCount > 0 {
+		ftsRLCount, errFTSRL := txCount(tx, "SELECT COUNT(*) FROM request_logs_fts")
+		baseRLCount, errBaseRL := txCount(tx, "SELECT COUNT(*) FROM request_logs")
+		switch {
+		case errFTSRL != nil || errBaseRL != nil:
+			slog.Warn("request_logs_fts count failed, falling back to LIKE search",
+				"err", errors.Join(errFTSRL, errBaseRL))
+			ftsOK = false
+		case ftsRLCount == 0 && baseRLCount > 0:
 			if _, err := tx.Exec(`
 				INSERT INTO request_logs_fts(rowid, path, client_ip, user_name)
 				SELECT id, path, client_ip, user_name FROM request_logs`); err != nil {
@@ -301,9 +334,14 @@ func createSchema() error {
 	}
 	fts5Enabled = ftsOK
 
-	// Seed admin user if none exists
-	var exists int
-	tx.QueryRow("SELECT COUNT(*) FROM admin_user").Scan(&exists)
+	// Seed admin user if none exists. Unlike the FTS counts this one aborts the
+	// migration: a failed count reads as zero, and zero means "seed an admin",
+	// so swallowing the error risks an INSERT against a table that already has
+	// one — silently, on a database whose state we could not read.
+	exists, err := txCount(tx, "SELECT COUNT(*) FROM admin_user")
+	if err != nil {
+		return err
+	}
 	if exists == 0 {
 		pw := cfg.AdminPassword
 		if pw == "" {
@@ -465,7 +503,9 @@ func getAllUsers() ([]User, error) {
 	var users []User
 	for rows.Next() {
 		var u User
-		rows.Scan(&u.ID, &u.Name, &u.APIKey, &u.Status, &u.RateLimit, &u.CreatedAt)
+		if err := rows.Scan(&u.ID, &u.Name, &u.APIKey, &u.Status, &u.RateLimit, &u.CreatedAt); err != nil {
+			return nil, err
+		}
 		users = append(users, u)
 	}
 	return users, rows.Err()
@@ -553,79 +593,13 @@ func getUserLogs(userID int) ([]UserLogRow, error) {
 	for rows.Next() {
 		var r UserLogRow
 		var model sql.NullString
-		rows.Scan(&r.ID, &model, &r.Prompt, &r.Response, &r.TS)
+		if err := rows.Scan(&r.ID, &model, &r.Prompt, &r.Response, &r.TS); err != nil {
+			return nil, err
+		}
 		r.Model = model.String
 		out = append(out, r)
 	}
 	return out, nil
-}
-
-func getLogsCount(search string) (int, error) {
-	var count int
-	var err error
-	switch {
-	case search != "" && fts5Enabled:
-		err = dbRead.QueryRow(
-			`SELECT COUNT(*) FROM logs_fts WHERE logs_fts MATCH ?`,
-			ftsPhrase(search),
-		).Scan(&count)
-	case search != "":
-		p := "%" + search + "%"
-		err = dbRead.QueryRow(
-			`SELECT COUNT(*) FROM logs l JOIN users u ON u.id=l.user_id
-			WHERE l.prompt LIKE ? OR l.response LIKE ? OR u.name LIKE ?`,
-			p, p, p,
-		).Scan(&count)
-	default:
-		err = dbRead.QueryRow(`SELECT COUNT(*) FROM logs`).Scan(&count)
-	}
-	return count, err
-}
-
-func getLogsPage(search string, limit, offset int) ([]LogRow, error) {
-	var (
-		sqlRows *sql.Rows
-		err     error
-	)
-	switch {
-	case search != "" && fts5Enabled:
-		sqlRows, err = dbRead.Query(
-			`SELECT l.id, COALESCE(u.name,''), COALESCE(l.model,''), l.prompt, l.response, l.ts
-			FROM logs_fts f
-			JOIN logs l ON l.id = f.rowid
-			LEFT JOIN users u ON u.id = l.user_id
-			WHERE logs_fts MATCH ?
-			ORDER BY l.ts DESC LIMIT ? OFFSET ?`,
-			ftsPhrase(search), limit, offset,
-		)
-	case search != "":
-		p := "%" + search + "%"
-		sqlRows, err = dbRead.Query(
-			`SELECT l.id, u.name, COALESCE(l.model,''), l.prompt, l.response, l.ts
-			FROM logs l JOIN users u ON u.id=l.user_id
-			WHERE l.prompt LIKE ? OR l.response LIKE ? OR u.name LIKE ?
-			ORDER BY l.ts DESC LIMIT ? OFFSET ?`,
-			p, p, p, limit, offset,
-		)
-	default:
-		sqlRows, err = dbRead.Query(
-			`SELECT l.id, u.name, COALESCE(l.model,''), l.prompt, l.response, l.ts
-			FROM logs l JOIN users u ON u.id=l.user_id
-			ORDER BY l.ts DESC LIMIT ? OFFSET ?`,
-			limit, offset,
-		)
-	}
-	if err != nil {
-		return nil, err
-	}
-	defer sqlRows.Close()
-	var out []LogRow
-	for sqlRows.Next() {
-		var r LogRow
-		sqlRows.Scan(&r.ID, &r.Name, &r.Model, &r.Prompt, &r.Response, &r.TS)
-		out = append(out, r)
-	}
-	return out, sqlRows.Err()
 }
 
 // ── Request log queries ───────────────────────────────────────────────────────
@@ -694,7 +668,9 @@ func getRequestLogsPage(search string, limit, offset int) ([]RequestLogRow, erro
 	var out []RequestLogRow
 	for sqlRows.Next() {
 		var r RequestLogRow
-		sqlRows.Scan(&r.ID, &r.TS, &r.Method, &r.Path, &r.ClientIP, &r.UserName, &r.StatusCode)
+		if err := sqlRows.Scan(&r.ID, &r.TS, &r.Method, &r.Path, &r.ClientIP, &r.UserName, &r.StatusCode); err != nil {
+			return nil, err
+		}
 		out = append(out, r)
 	}
 	return out, sqlRows.Err()
@@ -724,14 +700,6 @@ func updateAdminPassword(adminID int, hash string) error {
 }
 
 // ── Settings ──────────────────────────────────────────────────────────────────
-
-func getSetting(key, def string) string {
-	var val string
-	if err := dbRead.QueryRow("SELECT value FROM settings WHERE key=?", key).Scan(&val); err != nil {
-		return def
-	}
-	return val
-}
 
 func setSetting(key, value string) error {
 	_, err := db.Exec(

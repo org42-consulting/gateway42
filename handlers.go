@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/gorilla/sessions"
 )
 
 // ─────────────────────────────── Index / login ────────────────────────────────
@@ -34,7 +35,13 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 func handleLogout(w http.ResponseWriter, r *http.Request) {
 	sess := getSession(r)
 	sess.Values["admin"] = false
-	sess.Save(r, w)
+	if !saveSession(w, r, sess) {
+		// The browser still holds a cookie asserting admin. Redirecting to the
+		// login page would tell the operator they are logged out when they are
+		// not, which is the one outcome worth a 500 to avoid.
+		http.Error(w, "could not end session", http.StatusInternalServerError)
+		return
+	}
 	slog.Info("Admin logged out")
 	http.Redirect(w, r, "/", http.StatusFound)
 }
@@ -57,7 +64,12 @@ func handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	sess := getSession(r)
 	sess.Values["admin"] = true
 	sess.Options.MaxAge = cfg.SessionTTL
-	sess.Save(r, w)
+	if !saveSession(w, r, sess) {
+		// Redirecting to the panel would bounce straight back to the login page,
+		// since the cookie granting access was never issued. Say so instead.
+		http.Error(w, "could not start session", http.StatusInternalServerError)
+		return
+	}
 	slog.Info("Admin logged in")
 	http.Redirect(w, r, "/admin/panel", http.StatusFound)
 }
@@ -271,7 +283,9 @@ func handleOllamaDeleteModel(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
-	r.ParseForm()
+	if !parseAdminForm(w, r, "/admin/settings-page") {
+		return
+	}
 	model := strings.TrimSpace(r.FormValue("model"))
 	if model == "" {
 		addFlash(w, r, "error", "Model name is required")
@@ -327,7 +341,9 @@ func handleEngineSettings(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
-	r.ParseForm()
+	if !parseAdminForm(w, r, "/admin/settings-page") {
+		return
+	}
 
 	engineType := r.FormValue("engine_type")
 	engineName := strings.TrimSpace(r.FormValue("engine_name"))
@@ -453,7 +469,9 @@ func handleRemoveEngine(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
-	r.ParseForm()
+	if !parseAdminForm(w, r, "/admin/settings-page") {
+		return
+	}
 
 	editIDStr := r.FormValue("engine_id")
 	if editIDStr == "" {
@@ -541,7 +559,9 @@ func handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
-	r.ParseForm()
+	if !parseAdminForm(w, r, "/admin/settings-page") {
+		return
+	}
 	current := r.FormValue("current")
 	newPw := r.FormValue("new")
 	confirm := r.FormValue("confirm")
@@ -574,7 +594,15 @@ func handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	sess.Values["admin"] = false
 	b, _ := json.Marshal([]FlashMsg{{"success", "Password updated. Please log in again."}})
 	sess.Values["flashes"] = string(b)
-	sess.Save(r, w)
+	// The password row is already updated and cannot be rolled back. A 500 here
+	// would tell the admin the change failed when it succeeded, sending them
+	// back to a password that no longer works — the worse of the two outcomes.
+	//
+	// The store is a CookieStore, so a failed save does leave this browser
+	// holding admin=true until the cookie expires. That is the same principal
+	// who just authenticated to change their own password, so the cost is a
+	// skipped re-login, not an escalation.
+	_ = saveSession(w, r, sess)
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
@@ -585,7 +613,9 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
-	r.ParseForm()
+	if !parseAdminForm(w, r, "/admin/panel") {
+		return
+	}
 	name := truncateInput(r.FormValue("name"))
 
 	if !validateName(name) {
@@ -665,7 +695,9 @@ func handleUpdateRateLimit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	uid := uidFromVars(r)
-	r.ParseForm()
+	if !parseAdminForm(w, r, "/admin/panel") {
+		return
+	}
 	rl, err := strconv.Atoi(r.FormValue("rate_limit"))
 	if err != nil || rl < 1 {
 		rl = 1
@@ -859,7 +891,9 @@ func handleExport(w http.ResponseWriter, r *http.Request) {
 	// Mark as exported in session
 	sess := getSession(r)
 	sess.Values[fmt.Sprintf("exported_%d", uid)] = true
-	sess.Save(r, w)
+	// The CSV is already written and flushed to the client. A lost flag only
+	// means the UI will offer the export again.
+	_ = saveSession(w, r, sess)
 	slog.Info("CSV export", "uid", uid)
 }
 
@@ -886,13 +920,23 @@ func handleExportAllLogs(w http.ResponseWriter, r *http.Request) {
 	cw.Write([]string{"id", "timestamp", "method", "path", "client_ip", "client_name", "status_code"})
 	for sqlRows.Next() {
 		var row RequestLogRow
-		sqlRows.Scan(&row.ID, &row.TS, &row.Method, &row.Path, &row.ClientIP, &row.UserName, &row.StatusCode)
+		if err := sqlRows.Scan(&row.ID, &row.TS, &row.Method, &row.Path, &row.ClientIP, &row.UserName, &row.StatusCode); err != nil {
+			// The 200 and the header row are already on the wire, so there is no
+			// error status left to send. Stop at the first bad row: a truncated
+			// prefix is recoverable by the operator, a silently skipped row in
+			// the middle of an audit export is not.
+			slog.Error("request_logs export scan", "err", err)
+			break
+		}
 		cw.Write([]string{
 			strconv.Itoa(row.ID), row.TS, row.Method, row.Path,
 			row.ClientIP, row.UserName, strconv.Itoa(row.StatusCode),
 		})
 	}
 	cw.Flush()
+	if err := sqlRows.Err(); err != nil {
+		slog.Error("request_logs export iteration", "err", err)
+	}
 	slog.Info("CSV export request logs")
 }
 
@@ -930,7 +974,8 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	delete(sess.Values, fmt.Sprintf("exported_%d", uid))
-	sess.Save(r, w)
+	// The user row is already gone; the stale exported_ flag is cosmetic.
+	_ = saveSession(w, r, sess)
 	slog.Info("User deleted", "uid", uid)
 	http.Redirect(w, r, "/admin/panel", http.StatusFound)
 }
@@ -949,7 +994,10 @@ func handleResetSystem(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Info("System reset: all logs and rate-limit entries cleared")
 	addFlash(w, r, "success", "System reset: all logs and rate-limit entries have been cleared.")
-	r.ParseForm()
+	// The reset already happened. This parse only feeds the redirect-target
+	// read below, which is guarded by an allow-list, so a malformed body
+	// falls through to the default target — the safe answer either way.
+	_ = r.ParseForm()
 	// Allow-list, not a free-form path: "next" is attacker-controllable, and
 	// echoing it into a redirect unchecked is an open-redirect.
 	dest := "/admin/panel"
@@ -973,6 +1021,40 @@ func handleUsers(w http.ResponseWriter, r *http.Request) {
 }
 
 // ─────────────────────────────── Helpers ──────────────────────────────────────
+
+// parseAdminForm parses a browser form post, reporting failure the way every
+// other validation failure in these handlers does: a flash plus a redirect back
+// to the page that submitted it. Returns false when the caller should stop.
+//
+// The alternative — ignoring the error — is worse than it looks: a malformed
+// body does not stop the handler, it reaches it as silently-empty form values.
+// handleUpdateRateLimit, for one, would then read "" as the limit, fail the
+// Atoi, and clamp the user to 1 request per window without saying why.
+func parseAdminForm(w http.ResponseWriter, r *http.Request, back string) bool {
+	if err := r.ParseForm(); err != nil {
+		slog.Warn("malformed form submission", "path", r.URL.Path, "err", err)
+		addFlash(w, r, "error", "Could not read the submitted form. Please try again.")
+		http.Redirect(w, r, back, http.StatusFound)
+		return false
+	}
+	return true
+}
+
+// saveSession persists a session and reports whether it stuck.
+//
+// The store writes through Set-Cookie, so a failure means the browser keeps the
+// cookie it already had. Callers that are about to *announce* a state change —
+// logged in, logged out — must not redirect on false: the redirect would assert
+// a session the client never received. Callers whose change has already landed
+// elsewhere (a password row, a deleted user) should carry on; the log line is
+// the whole remedy available to them.
+func saveSession(w http.ResponseWriter, r *http.Request, sess *sessions.Session) bool {
+	if err := sess.Save(r, w); err != nil {
+		slog.Error("session save failed", "path", r.URL.Path, "err", err)
+		return false
+	}
+	return true
+}
 
 func uidFromVars(r *http.Request) int {
 	vars := mux.Vars(r)

@@ -348,12 +348,18 @@ func addFlash(w http.ResponseWriter, r *http.Request, category, message string) 
 	sess := getSession(r)
 	var flashes []FlashMsg
 	if raw, ok := sess.Values["flashes"].(string); ok && raw != "" {
-		json.Unmarshal([]byte(raw), &flashes)
+		if err := json.Unmarshal([]byte(raw), &flashes); err != nil {
+			// A half-decoded slice would get the new message appended to it and
+			// re-encoded, making the corruption permanent. Drop the queue and
+			// keep the message the caller actually cares about.
+			slog.Warn("discarding unreadable flash queue", "err", err)
+			flashes = nil
+		}
 	}
 	flashes = append(flashes, FlashMsg{category, message})
 	b, _ := json.Marshal(flashes)
 	sess.Values["flashes"] = string(b)
-	sess.Save(r, w)
+	_ = saveSession(w, r, sess)
 }
 
 func consumeFlashes(w http.ResponseWriter, r *http.Request, sess *sessions.Session) []FlashMsg {
@@ -362,9 +368,14 @@ func consumeFlashes(w http.ResponseWriter, r *http.Request, sess *sessions.Sessi
 		return nil
 	}
 	var flashes []FlashMsg
-	json.Unmarshal([]byte(raw), &flashes)
+	if err := json.Unmarshal([]byte(raw), &flashes); err != nil {
+		slog.Warn("discarding unreadable flash queue", "err", err)
+		flashes = nil
+	}
+	// Clear the queue even when the decode failed, so a corrupt value cannot
+	// re-log a warning on every subsequent page render.
 	sess.Values["flashes"] = ""
-	sess.Save(r, w)
+	_ = saveSession(w, r, sess)
 	return flashes
 }
 

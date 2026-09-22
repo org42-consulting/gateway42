@@ -68,7 +68,12 @@ func csrfMiddleware(next http.Handler) http.Handler {
 			// ParseForm consumes the body. Every protected route here reads
 			// form values anyway, and net/http caches the parsed result in
 			// r.PostForm, so the handler's own ParseForm is a no-op.
-			r.ParseForm()
+			//
+			// The error is deliberately dropped: a body we cannot parse yields
+			// an empty token, and the constant-time compare below already
+			// rejects that with a 403. Handling it here would only duplicate
+			// that answer with a less specific status.
+			_ = r.ParseForm()
 			got = r.PostFormValue(csrfFormField)
 		}
 
