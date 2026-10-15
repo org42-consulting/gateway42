@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"strconv"
 	"strings"
 	"time"
@@ -76,13 +77,200 @@ func openAIToOllama(data map[string]interface{}, messages []map[string]interface
 
 	req := map[string]interface{}{
 		"model":    model,
-		"messages": messages,
+		"messages": ollamaMessages(messages),
 		"stream":   stream,
 	}
 	if len(options) > 0 {
 		req["options"] = options
 	}
+
+	// Ollama takes OpenAI's tool schema as-is. It has no tool_choice, so the
+	// one value that can be honoured is "none": withhold the tools entirely.
+	if tools, ok := data["tools"].([]interface{}); ok && len(tools) > 0 {
+		if choice, _ := data["tool_choice"].(string); choice != "none" {
+			req["tools"] = tools
+		}
+	}
+	if format := ollamaFormat(data["response_format"]); format != nil {
+		req["format"] = format
+	}
 	return req
+}
+
+// ollamaFormat maps OpenAI's response_format onto Ollama's format field:
+// "json" for JSON mode, or the schema object itself for structured output.
+// Anything else — {"type":"text"}, or a shape not recognised — returns nil,
+// which leaves format unset and the reply unconstrained.
+func ollamaFormat(rf interface{}) interface{} {
+	m, ok := rf.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	switch m["type"] {
+	case "json_object":
+		return "json"
+	case "json_schema":
+		js, _ := m["json_schema"].(map[string]interface{})
+		if schema, ok := js["schema"].(map[string]interface{}); ok {
+			return schema
+		}
+		// A json_schema request without a usable schema still asked for
+		// JSON; plain JSON mode is the closest Ollama can get.
+		return "json"
+	}
+	return nil
+}
+
+// ollamaMessages converts an OpenAI message history into Ollama's shape. The
+// differences that matter are all in tool use and multimodal content:
+//
+//   - Assistant tool_calls carry arguments as a JSON *string* in OpenAI and as
+//     an object in Ollama.
+//   - A tool result is linked to its call by tool_call_id in OpenAI; Ollama
+//     has no call IDs and wants the function's name as tool_name instead,
+//     which is recovered from the assistant turn that issued the call.
+//   - Content may be an array of parts. Ollama wants one content string plus
+//     a separate images list of bare base64. Only inline data: URLs can be
+//     passed on; a remote image URL would need fetching, which the gateway
+//     does not do, so it is dropped.
+func ollamaMessages(messages []map[string]interface{}) []map[string]interface{} {
+	nameByCallID := map[string]string{}
+	out := make([]map[string]interface{}, 0, len(messages))
+
+	for _, m := range messages {
+		om := map[string]interface{}{"role": m["role"]}
+
+		text, images := flattenContent(m["content"])
+		om["content"] = text
+		if len(images) > 0 {
+			om["images"] = images
+		}
+
+		if calls, ok := m["tool_calls"].([]interface{}); ok && len(calls) > 0 {
+			ollamaCalls := make([]map[string]interface{}, 0, len(calls))
+			for _, c := range calls {
+				call, _ := c.(map[string]interface{})
+				fn, _ := call["function"].(map[string]interface{})
+				name, _ := fn["name"].(string)
+				if id, _ := call["id"].(string); id != "" {
+					nameByCallID[id] = name
+				}
+				ollamaCalls = append(ollamaCalls, map[string]interface{}{
+					"function": map[string]interface{}{
+						"name":      name,
+						"arguments": decodeArguments(fn["arguments"]),
+					},
+				})
+			}
+			om["tool_calls"] = ollamaCalls
+		}
+
+		if m["role"] == "tool" {
+			name, _ := m["name"].(string)
+			if name == "" {
+				id, _ := m["tool_call_id"].(string)
+				name = nameByCallID[id]
+			}
+			if name != "" {
+				om["tool_name"] = name
+			}
+		}
+		out = append(out, om)
+	}
+	return out
+}
+
+// flattenContent splits OpenAI message content into Ollama's text and images.
+func flattenContent(content interface{}) (string, []string) {
+	switch c := content.(type) {
+	case string:
+		return c, nil
+	case []interface{}:
+		var text strings.Builder
+		var images []string
+		for _, p := range c {
+			part, _ := p.(map[string]interface{})
+			switch part["type"] {
+			case "text":
+				s, _ := part["text"].(string)
+				if text.Len() > 0 && s != "" {
+					text.WriteString("\n")
+				}
+				text.WriteString(s)
+			case "image_url":
+				iu, _ := part["image_url"].(map[string]interface{})
+				u, _ := iu["url"].(string)
+				if _, b64, ok := strings.Cut(u, ";base64,"); ok && strings.HasPrefix(u, "data:") {
+					images = append(images, b64)
+				}
+			}
+		}
+		return text.String(), images
+	}
+	return "", nil
+}
+
+// decodeArguments turns OpenAI's string-encoded arguments into the object
+// Ollama expects. Arguments that are already an object pass through; a
+// string that is not valid JSON is passed as-is so the engine reports it
+// rather than the gateway silently replacing it.
+func decodeArguments(args interface{}) interface{} {
+	s, ok := args.(string)
+	if !ok {
+		return args
+	}
+	var obj interface{}
+	if err := json.Unmarshal([]byte(s), &obj); err != nil {
+		return s
+	}
+	return obj
+}
+
+// openAIToolCalls converts the tool calls on an Ollama message into OpenAI's
+// shape, or returns nil when there are none.
+//
+// Ollama does not assign call IDs (some builds do; those are kept), but an
+// OpenAI client must echo one back as tool_call_id on the result, so one is
+// minted per call.
+func openAIToolCalls(msg map[string]interface{}) []ToolCall {
+	raw, _ := msg["tool_calls"].([]interface{})
+	if len(raw) == 0 {
+		return nil
+	}
+	calls := make([]ToolCall, 0, len(raw))
+	for _, c := range raw {
+		call, _ := c.(map[string]interface{})
+		fn, _ := call["function"].(map[string]interface{})
+		name, _ := fn["name"].(string)
+
+		args, isString := fn["arguments"].(string)
+		if !isString {
+			args = "{}"
+			if fn["arguments"] != nil {
+				if b, err := json.Marshal(fn["arguments"]); err == nil {
+					args = string(b)
+				}
+			}
+		}
+
+		id, _ := call["id"].(string)
+		if id == "" {
+			id = newToolCallID()
+		}
+		calls = append(calls, ToolCall{
+			ID:       id,
+			Type:     "function",
+			Function: FunctionCall{Name: name, Arguments: args},
+		})
+	}
+	return calls
+}
+
+// newToolCallID mints an OpenAI-style call ID.
+func newToolCallID() string {
+	b := make([]byte, 12)
+	_, _ = rand.Read(b)
+	return "call_" + hex.EncodeToString(b)
 }
 
 // ─────────────────────────────── Finish reason ────────────────────────────────
@@ -134,6 +322,14 @@ func ollamaToOpenAI(ollama map[string]interface{}) *ChatCompletion {
 	completionTokens := toInt(ollama["eval_count"])
 	modelName, _ := ollama["model"].(string)
 
+	// A reply that calls tools finished *because* it called them, which is
+	// what tool_calls means; Ollama reports that case as an ordinary "stop".
+	toolCalls := openAIToolCalls(msg)
+	finishReason := ollamaFinishReason(ollama)
+	if len(toolCalls) > 0 {
+		finishReason = &finishToolCalls
+	}
+
 	return &ChatCompletion{
 		ID:      newCompletionID(),
 		Object:  "chat.completion",
@@ -141,8 +337,8 @@ func ollamaToOpenAI(ollama map[string]interface{}) *ChatCompletion {
 		Model:   modelName,
 		Choices: []Choice{{
 			Index:        0,
-			Message:      Message{Role: role, Content: content},
-			FinishReason: ollamaFinishReason(ollama),
+			Message:      Message{Role: role, Content: content, ToolCalls: toolCalls},
+			FinishReason: finishReason,
 		}},
 		Usage: Usage{
 			PromptTokens:     promptTokens,
@@ -174,6 +370,14 @@ func formatStreamChunk(chunk map[string]interface{}, completionID string, isFirs
 		delta = Delta{}
 	default:
 		delta = Delta{Content: content}
+	}
+
+	// Ollama emits each tool call whole, in one line, so each becomes one
+	// complete StreamToolCall. Index is numbered within this chunk only: a
+	// stream's calls are numbered across chunks, which only the stream itself
+	// can do — ollamaStream renumbers them.
+	for i, tc := range openAIToolCalls(msg) {
+		delta.ToolCalls = append(delta.ToolCalls, StreamToolCall{Index: i, ToolCall: tc})
 	}
 
 	// Only the terminal chunk carries a reason; mid-stream it stays null.

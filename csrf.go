@@ -87,6 +87,24 @@ func csrfMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// csrfQueryValid checks a token carried in the query string, for the one kind
+// of state-changing admin request that cannot be a POST: a model pull, which
+// streams its progress over EventSource, and EventSource only issues GETs.
+//
+// csrfMiddleware deliberately exempts GETs, and SameSite=Lax still sends the
+// session cookie on a top-level cross-site navigation — so without this a link
+// on any page the admin opens could start a multi-gigabyte download.
+//
+// A token in a URL is weaker than one in a body (it can land in history and
+// proxy logs), but it is the same per-session token the forms already embed in
+// the page, and the pull response is an event stream with no links to leak it
+// through a Referer.
+func csrfQueryValid(r *http.Request) bool {
+	want, _ := getSession(r).Values[csrfSessionKey].(string)
+	got := r.URL.Query().Get(csrfFormField)
+	return want != "" && subtle.ConstantTimeCompare([]byte(want), []byte(got)) == 1
+}
+
 // csrfProtected reports whether a request must carry a token: state-changing
 // methods on everything except the bearer-authenticated API surface.
 func csrfProtected(r *http.Request) bool {

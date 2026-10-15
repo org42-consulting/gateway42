@@ -368,6 +368,8 @@ print(response.choices[0].message.content)</pre>
             <tr><td><code>stop</code></td><td><code>stop</code></td><td>String or list of strings.</td></tr>
             <tr><td><code>presence_penalty</code></td><td><code>repeat_last_n</code></td><td></td></tr>
             <tr><td><code>frequency_penalty</code></td><td><code>repeat_penalty</code></td><td>Mapped as <code>1.0 + value</code>.</td></tr>
+            <tr><td><code>tools</code></td><td><code>tools</code></td><td>Forwarded as-is. <code>tool_choice: "none"</code> withholds them. Tool calls come back in OpenAI format with <code>finish_reason: "tool_calls"</code>.</td></tr>
+            <tr><td><code>response_format</code></td><td><code>format</code></td><td><code>json_object</code> → <code>"json"</code>; <code>json_schema</code> → the schema.</td></tr>
         </tbody>
     </table>
 
@@ -437,6 +439,7 @@ print(response.choices[0].message.content)</pre>
             <tr><td><code>TLS_CERT</code></td><td>—</td><td>Path to TLS certificate file. When set with <code>TLS_KEY</code>, enables HTTPS.</td></tr>
             <tr><td><code>TLS_KEY</code></td><td>—</td><td>Path to TLS private key file. When set with <code>TLS_CERT</code>, enables HTTPS.</td></tr>
             <tr><td><code>GW42_UPSTREAM_CONCURRENCY</code></td><td><code>8</code></td><td>Maximum simultaneous in-flight requests per engine. Requests beyond this are rejected with <code>503</code> and a <code>Retry-After</code> header rather than queued.</td></tr>
+            <tr><td><code>GW42_METRICS_TOKEN</code></td><td>—</td><td>Bearer token a Prometheus scraper can use to read <code>/metrics</code>. Unset means only an admin session can.</td></tr>
             <tr><td><code>GW42_LOG_RETENTION_DAYS</code></td><td><code>30</code></td><td>Age after which log rows are deleted. A sweep runs at startup and hourly thereafter. <code>0</code> disables pruning and keeps everything.</td></tr>
         </tbody>
     </table>

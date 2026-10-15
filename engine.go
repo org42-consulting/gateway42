@@ -186,6 +186,12 @@ type ollamaStream struct {
 	completionID string
 	isFirst      bool
 	done         bool
+
+	// toolCalls counts the tool calls already sent. OpenAI clients assemble
+	// calls by their index across the whole stream, and the terminal chunk's
+	// finish_reason must say "tool_calls" if any were made — while Ollama
+	// sends the calls on an earlier line and ends with an ordinary "stop".
+	toolCalls int
 }
 
 func (s *ollamaStream) Recv() ([]byte, error) {
@@ -204,7 +210,16 @@ func (s *ollamaStream) Recv() ([]byte, error) {
 			// one is still usable.
 			continue
 		}
-		out, err := json.Marshal(formatStreamChunk(chunk, s.completionID, s.isFirst))
+		c := formatStreamChunk(chunk, s.completionID, s.isFirst)
+		choice := &c.Choices[0]
+		for i := range choice.Delta.ToolCalls {
+			choice.Delta.ToolCalls[i].Index = s.toolCalls
+			s.toolCalls++
+		}
+		if choice.FinishReason != nil && s.toolCalls > 0 {
+			choice.FinishReason = &finishToolCalls
+		}
+		out, err := json.Marshal(c)
 		if err != nil {
 			return nil, err
 		}

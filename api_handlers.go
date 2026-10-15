@@ -317,6 +317,14 @@ func streamCompletion(w http.ResponseWriter, r *http.Request, adapter Engine,
 	logInteraction(userID, marshalAudit(messages), "streamed", model)
 }
 
+// sanitizeMessages bounds each message's text and keeps the fields a chat
+// message can legitimately carry.
+//
+// It used to rebuild every message as {role, content-as-string}. That
+// silently broke tool use for every engine type: an assistant turn lost its
+// tool_calls and a tool result lost its tool_call_id, so the second request of
+// any tool loop was rejected upstream. Array content (text and image parts)
+// was flattened to "" for the same reason.
 func sanitizeMessages(messages []interface{}) []map[string]interface{} {
 	out := make([]map[string]interface{}, 0, len(messages))
 	for _, m := range messages {
@@ -325,11 +333,53 @@ func sanitizeMessages(messages []interface{}) []map[string]interface{} {
 			continue
 		}
 		role, _ := msg["role"].(string)
-		content, _ := msg["content"].(string)
-		out = append(out, map[string]interface{}{
+		clean := map[string]interface{}{
 			"role":    role,
-			"content": truncateInput(content),
-		})
+			"content": sanitizeContent(msg["content"]),
+		}
+		for _, key := range []string{"name", "tool_call_id", "tool_calls"} {
+			if v, ok := msg[key]; ok && v != nil {
+				clean[key] = v
+			}
+		}
+		// An assistant turn that only calls tools has null content in the
+		// OpenAI schema; keep it null there. Anywhere else, absent content
+		// becomes "" — what this function always sent — since strict
+		// upstreams reject a user message whose content is null.
+		if clean["content"] == nil && clean["tool_calls"] == nil {
+			clean["content"] = ""
+		}
+		out = append(out, clean)
 	}
 	return out
+}
+
+// sanitizeContent truncates the text in a message's content, which is either a
+// string or an array of typed parts. Parts are copied, never edited in place,
+// so the caller's decoded request is not modified behind its back. Non-text
+// parts pass through: their size is already bounded by the request body limit.
+func sanitizeContent(content interface{}) interface{} {
+	switch c := content.(type) {
+	case string:
+		return truncateInput(c)
+	case []interface{}:
+		parts := make([]interface{}, 0, len(c))
+		for _, p := range c {
+			part, ok := p.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if text, isText := part["text"].(string); isText && part["type"] == "text" {
+				cp := make(map[string]interface{}, len(part))
+				for k, v := range part {
+					cp[k] = v
+				}
+				cp["text"] = truncateInput(text)
+				part = cp
+			}
+			parts = append(parts, part)
+		}
+		return parts
+	}
+	return nil
 }
