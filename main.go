@@ -9,12 +9,14 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -315,6 +317,53 @@ func (m *multiSlogHandler) WithGroup(name string) slog.Handler {
 	return &multiSlogHandler{m.a.WithGroup(name), m.b.WithGroup(name)}
 }
 
+// parseLogLevel maps LOG_LEVEL onto a slog level. WARNING is accepted
+// alongside WARN because the documented values follow Python's logging names.
+// ok is false for anything unrecognised, which falls back to INFO.
+func parseLogLevel(s string) (level slog.Level, ok bool) {
+	switch strings.ToUpper(strings.TrimSpace(s)) {
+	case "DEBUG":
+		return slog.LevelDebug, true
+	case "INFO", "":
+		return slog.LevelInfo, true
+	case "WARN", "WARNING":
+		return slog.LevelWarn, true
+	case "ERROR":
+		return slog.LevelError, true
+	}
+	return slog.LevelInfo, false
+}
+
+// openLogOutput returns the writer the text log goes to: stderr, plus the file
+// at path when one is configured.
+//
+// The file is skipped when stderr already *is* that file. install.sh points
+// both launchd's StandardErrorPath and LOG_FILE at the same log, and writing
+// to it twice would double every line. The returned close func is always safe
+// to call. A file that cannot be opened is reported, not fatal: losing the
+// file copy is better than refusing to start.
+func openLogOutput(path string) (out io.Writer, closeFn func(), err error) {
+	noop := func() {}
+	if path == "" {
+		return os.Stderr, noop, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return os.Stderr, noop, err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return os.Stderr, noop, err
+	}
+	closeFn = func() { _ = f.Close() }
+
+	fileInfo, fErr := f.Stat()
+	errInfo, sErr := os.Stderr.Stat()
+	if fErr == nil && sErr == nil && os.SameFile(fileInfo, errInfo) {
+		return os.Stderr, closeFn, nil
+	}
+	return io.MultiWriter(os.Stderr, f), closeFn, nil
+}
+
 // DB, user/admin queries, rate limiter, and auth helpers live in db.go and auth.go.
 
 // ─────────────────────────────── Session / flash ───────────────────────────────
@@ -392,16 +441,10 @@ func getEngineURLs(engines []EngineConfig) map[string]string {
 
 // engineEndpoint returns the full endpoint for an engine config.
 func engineEndpoint(cfg EngineConfig) string {
-	host := cfg.BaseURL
 	if cfg.Type == EngineOllama {
-		u := strings.TrimRight(host, "/")
-		port := cfg.Port
-		if port == 0 {
-			port = 11434
-		}
-		return fmt.Sprintf("%s:%d", u, port)
+		return ollamaEndpoint(cfg)
 	}
-	// OpenAI-compatible: include port if non-standard
+	host := cfg.BaseURL
 	if !strings.HasPrefix(host, "http://") && !strings.HasPrefix(host, "https://") {
 		host = "http://" + host
 	}
@@ -831,19 +874,33 @@ func main() {
 
 	// Logging
 	syslogBuf = newSyslogBuffer()
-	logLevel := slog.LevelInfo
-	if strings.ToUpper(cfg.LogLevel) == "DEBUG" {
-		logLevel = slog.LevelDebug
-	}
+	logLevel, levelOK := parseLogLevel(cfg.LogLevel)
 
-	textH := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})
+	logOut, closeLog, logFileErr := openLogOutput(cfg.LogFile)
+	defer closeLog()
+
+	textH := slog.NewTextHandler(logOut, &slog.HandlerOptions{Level: logLevel})
 	bufH := &bufSlogHandler{buf: syslogBuf, level: logLevel}
 	slog.SetDefault(slog.New(&multiSlogHandler{a: textH, b: bufH}))
 
-	// Session store (random key, sessions invalidated on restart)
-	key := make([]byte, 32)
-	rand.Read(key)
-	sessionStore = sessions.NewCookieStore(key)
+	// Reported only now, once there is a logger to report through.
+	if !levelOK {
+		slog.Warn("unrecognised LOG_LEVEL, using INFO", "value", cfg.LogLevel)
+	}
+	if logFileErr != nil {
+		slog.Warn("could not open LOG_FILE, logging to stderr only",
+			"path", cfg.LogFile, "err", logFileErr)
+	}
+
+	// Session store (random keys, sessions invalidated on restart). The second
+	// key turns on AES encryption: with the hash key alone the cookie is only
+	// signed, so its contents — CSRF token, flash messages — are readable by
+	// anything that can see the cookie.
+	hashKey := make([]byte, 32)
+	blockKey := make([]byte, 32)
+	rand.Read(hashKey)
+	rand.Read(blockKey)
+	sessionStore = sessions.NewCookieStore(hashKey, blockKey)
 	sessionStore.Options = &sessions.Options{
 		MaxAge:   cfg.SessionTTL,
 		HttpOnly: true,

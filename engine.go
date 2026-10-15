@@ -525,16 +525,26 @@ type OllamaAdapter struct {
 func (a *OllamaAdapter) Type() string { return EngineOllama }
 func (a *OllamaAdapter) Name() string { return a.cfg.Name }
 
-func (a *OllamaAdapter) baseURL() string {
-	u := strings.TrimRight(a.cfg.BaseURL, "/")
-	strip := strings.TrimPrefix(strings.TrimPrefix(u, "http://"), "https://")
-	_, _, err := net.SplitHostPort(strip)
-	if err == nil {
+func (a *OllamaAdapter) baseURL() string { return ollamaEndpoint(a.cfg) }
+
+// ollamaEndpoint is the one place an Ollama engine's scheme://host:port is
+// assembled. Every Ollama call — the adapter, the dashboard's endpoint column,
+// model deletion — must go through it: building "base:port" by hand elsewhere
+// is how a BaseURL that already carried a port became "host:11434:11434".
+func ollamaEndpoint(cf EngineConfig) string {
+	u := strings.TrimRight(strings.TrimSpace(cf.BaseURL), "/")
+	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+		// Without a scheme net/http rejects the URL outright, so a BaseURL
+		// typed as a bare "127.0.0.1" would fail every probe.
+		u = "http://" + u
+	}
+	hostPort := strings.TrimPrefix(strings.TrimPrefix(u, "http://"), "https://")
+	if _, _, err := net.SplitHostPort(hostPort); err == nil {
 		// URL already contains a port — use as-is.
 		return u
 	}
 
-	port := a.cfg.Port
+	port := cf.Port
 	if port == 0 {
 		port = 11434
 	}
@@ -542,23 +552,33 @@ func (a *OllamaAdapter) baseURL() string {
 }
 
 func (a *OllamaAdapter) Status() (bool, error) {
-	resp, err := controlClient.Get(a.baseURL() + "/api/version")
-	if err != nil {
-		return false, err
-	}
-	defer resp.Body.Close()
-	return resp.StatusCode == 200, nil
+	var up bool
+	err := observeUpstream(EngineOllama, "status", func() error {
+		resp, err := controlClient.Get(a.baseURL() + "/api/version")
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		up = resp.StatusCode == 200
+		return nil
+	})
+	return up, err
 }
 
 func (a *OllamaAdapter) ListModels() ([]map[string]interface{}, error) {
-	resp, err := controlClient.Get(a.baseURL() + "/api/tags")
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
 	var tags map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&tags); err != nil {
+	err := observeUpstream(EngineOllama, "list_models", func() error {
+		resp, err := controlClient.Get(a.baseURL() + "/api/tags")
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			return fmt.Errorf("ollama returned %d", resp.StatusCode)
+		}
+		return json.NewDecoder(resp.Body).Decode(&tags)
+	})
+	if err != nil {
 		return nil, err
 	}
 	models, _ := tags["models"].([]interface{})
@@ -609,24 +629,45 @@ func (a *OllamaAdapter) StreamChat(ctx context.Context, req map[string]interface
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 
+	stream, err := openUpstreamStream(EngineOllama, httpReq)
+	if err != nil {
+		return nil, err
+	}
+	return &ollamaStream{
+		body:         stream,
+		scanner:      newStreamScanner(stream),
+		completionID: newCompletionID(),
+		isFirst:      true,
+	}, nil
+}
+
+// openUpstreamStream sends a streaming request and, once upstream has accepted
+// it, returns the live response body. On success the caller owns the body and
+// must Close it.
+//
+// It is timed as op="stream", and the timing deliberately stops here, at the
+// response headers. The full stream lasts as long as the generation does, so
+// timing that would measure output length rather than engine latency; the
+// whole-request duration is already in gw42_http_request_duration_seconds.
+func openUpstreamStream(engineType string, httpReq *http.Request) (io.ReadCloser, error) {
+	start := time.Now()
 	resp, err := sharedClient.Do(httpReq)
 	if err != nil {
+		recordUpstream(engineType, "stream", start, err)
 		return nil, err
 	}
 	if resp.StatusCode != 200 {
 		// Not deferred because the success path hands this body to the stream
-		// below and must not close it. The close error is dropped on purpose:
-		// we are already returning the failure the caller needs to see, and
-		// replacing it with a close error would hide the status code.
+		// and must not close it. The close error is dropped on purpose: we are
+		// already returning the failure the caller needs to see, and replacing
+		// it with a close error would hide the status code.
 		_ = resp.Body.Close()
-		return nil, fmt.Errorf("engine returned %d", resp.StatusCode)
+		err := fmt.Errorf("engine returned %d", resp.StatusCode)
+		recordUpstream(engineType, "stream", start, err)
+		return nil, err
 	}
-	return &ollamaStream{
-		body:         resp.Body,
-		scanner:      newStreamScanner(resp.Body),
-		completionID: newCompletionID(),
-		isFirst:      true,
-	}, nil
+	recordUpstream(engineType, "stream", start, nil)
+	return resp.Body, nil
 }
 
 // ─────────────────── OpenAICompatAdapter ──────────────────────────────────────
@@ -671,23 +712,33 @@ func (a *OpenAICompatAdapter) doReq(method, path string, body io.Reader) (*http.
 }
 
 func (a *OpenAICompatAdapter) Status() (bool, error) {
-	resp, err := a.doReq("GET", "/v1/models", nil)
-	if err != nil {
-		return false, err
-	}
-	defer resp.Body.Close()
-	return resp.StatusCode == 200, nil
+	var up bool
+	err := observeUpstream(EngineOpenAICompat, "status", func() error {
+		resp, err := a.doReq("GET", "/v1/models", nil)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		up = resp.StatusCode == 200
+		return nil
+	})
+	return up, err
 }
 
 func (a *OpenAICompatAdapter) ListModels() ([]map[string]interface{}, error) {
-	resp, err := a.doReq("GET", "/v1/models", nil)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
 	var result map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	err := observeUpstream(EngineOpenAICompat, "list_models", func() error {
+		resp, err := a.doReq("GET", "/v1/models", nil)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			return fmt.Errorf("engine returned %d", resp.StatusCode)
+		}
+		return json.NewDecoder(resp.Body).Decode(&result)
+	})
+	if err != nil {
 		return nil, err
 	}
 	data, _ := result["data"].([]interface{})
@@ -744,19 +795,11 @@ func (a *OpenAICompatAdapter) StreamChat(ctx context.Context, req map[string]int
 		httpReq.Header.Set("Authorization", "Bearer "+a.cfg.APIKey)
 	}
 
-	resp, err := sharedClient.Do(httpReq)
+	stream, err := openUpstreamStream(EngineOpenAICompat, httpReq)
 	if err != nil {
 		return nil, err
 	}
-	if resp.StatusCode != 200 {
-		// Not deferred because the success path hands this body to the stream
-		// below and must not close it. The close error is dropped on purpose:
-		// we are already returning the failure the caller needs to see, and
-		// replacing it with a close error would hide the status code.
-		_ = resp.Body.Close()
-		return nil, fmt.Errorf("engine returned %d", resp.StatusCode)
-	}
-	return &passthroughStream{body: resp.Body, scanner: newStreamScanner(resp.Body)}, nil
+	return &passthroughStream{body: stream, scanner: newStreamScanner(stream)}, nil
 }
 
 // ── Ollama-only helpers (search, pull, delete) ────────────────────────────────
@@ -798,9 +841,9 @@ func OllamaSearchModels(query string) ([]ModelDetail, error) {
 	return results, nil
 }
 
-// OllamaDeleteModel deletes a model from an Ollama instance.
-func OllamaDeleteModel(baseURL string, port int, model string) error {
-	endpoint := fmt.Sprintf("%s:%d", strings.TrimRight(baseURL, "/"), port)
+// OllamaDeleteModel deletes a model from an Ollama instance. endpoint is the
+// full scheme://host:port, as returned by ollamaEndpoint.
+func OllamaDeleteModel(endpoint, model string) error {
 	body, _ := json.Marshal(map[string]string{"name": model})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

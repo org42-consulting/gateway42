@@ -616,7 +616,7 @@ func getUserLogs(userID int) ([]UserLogRow, error) {
 		r.Model = model.String
 		out = append(out, r)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 // ── Request log queries ───────────────────────────────────────────────────────

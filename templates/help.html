@@ -185,7 +185,7 @@
     <p>For each engine you can:</p>
     <ul>
         <li><strong>Add</strong> — name it, select the type, and provide the URL/host, port (Ollama), and API key (OpenAI-compatible).</li>
-        <li><strong>Edit</strong> — update an existing engine's connection details or API key.</li>
+        <li><strong>Edit</strong> — update an existing engine's connection details or API key. Leave the API key blank to keep the current one; it is never shown back.</li>
         <li><strong>Remove</strong> — delete an engine you no longer need.</li>
         <li><strong>Test</strong> — probe connectivity and see which models the engine reports.</li>
     </ul>
@@ -221,7 +221,7 @@
         including both standard models (e.g. <code>llama3.2</code>) and namespaced models (e.g. <code>batiai/qwen3.6-35b</code>).
     </p>
     <p>
-        Each search result includes a <strong>Pull</strong> button. Clicking it downloads the model to your Ollama instance.
+        Each search result includes a <strong>Pull</strong> button. Clicking it downloads the model to your Ollama instance — with several Ollama engines, choose which one in the selector next to <em>Search</em>. The model is routable as soon as the pull finishes.
         A live progress bar tracks the download layer by layer, showing bytes transferred and overall percentage.
     </p>
 
@@ -279,7 +279,7 @@
 
     <h3>Export CSV</h3>
     <p>
-        Downloads <strong>all</strong> HTTP request log entries (not just the current 200) as a CSV file with columns:
+        Downloads <strong>all</strong> HTTP request log entries (not just the current page) as a CSV file with columns:
         <code>id</code>, <code>timestamp</code>, <code>method</code>, <code>path</code>,
         <code>client_ip</code>, <code>client_name</code>, <code>status_code</code>.
     </p>
@@ -432,8 +432,8 @@ print(response.choices[0].message.content)</pre>
             <tr><td><code>DEFAULT_RATE_LIMIT</code></td><td><code>10</code></td><td>Default requests-per-minute for newly registered users.</td></tr>
             <tr><td><code>SESSION_TIMEOUT</code></td><td><code>3600</code></td><td>Admin session lifetime in seconds.</td></tr>
             <tr><td><code>MAX_MESSAGE_LENGTH</code></td><td><code>262144</code></td><td>Maximum characters stored per prompt or response in the AI interaction log (~256 KB).</td></tr>
-            <tr><td><code>LOG_LEVEL</code></td><td><code>INFO</code></td><td>Log verbosity: <code>DEBUG</code>, <code>INFO</code>, <code>WARNING</code>, <code>ERROR</code>.</td></tr>
-            <tr><td><code>LOG_FILE</code></td><td><code>./logs/gateway.log</code></td><td>Path to the application log file (directory is created automatically).</td></tr>
+            <tr><td><code>LOG_LEVEL</code></td><td><code>INFO</code></td><td>Log verbosity: <code>DEBUG</code>, <code>INFO</code>, <code>WARN</code> (or <code>WARNING</code>), <code>ERROR</code>.</td></tr>
+            <tr><td><code>LOG_FILE</code></td><td><code>./logs/gateway.log</code></td><td>Application log file, written in addition to stderr (directory is created automatically). Empty logs to stderr only.</td></tr>
             <tr><td><code>TLS_CERT</code></td><td>—</td><td>Path to TLS certificate file. When set with <code>TLS_KEY</code>, enables HTTPS.</td></tr>
             <tr><td><code>TLS_KEY</code></td><td>—</td><td>Path to TLS private key file. When set with <code>TLS_CERT</code>, enables HTTPS.</td></tr>
             <tr><td><code>GW42_UPSTREAM_CONCURRENCY</code></td><td><code>8</code></td><td>Maximum simultaneous in-flight requests per engine. Requests beyond this are rejected with <code>503</code> and a <code>Retry-After</code> header rather than queued.</td></tr>

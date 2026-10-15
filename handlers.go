@@ -194,29 +194,36 @@ func handleEngineTest(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
 }
 
-// ollamaPullStream streams a model pull from Ollama as SSE. Auth is checked by callers.
-func ollamaPullStream(w http.ResponseWriter, r *http.Request, model string) {
+// ollamaPullStream streams a model pull from Ollama as SSE. Auth is checked by
+// callers. engineID selects the target engine; 0 means "the only/first one".
+func ollamaPullStream(w http.ResponseWriter, r *http.Request, model string, engineID int) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming not supported", 500)
 		return
 	}
 
-	var adapter Engine
-	if ollamas := cachedAdaptersByType(EngineOllama); len(ollamas) > 0 {
-		adapter = ollamas[0]
-	}
-	if adapter == nil {
-		fmt.Fprintf(w, "data: %s\n\n", jsonErr("No Ollama engine configured"))
-		flusher.Flush()
-		return
-	}
-
+	// Headers first: every exit below writes an SSE frame, and a frame written
+	// before these are set goes out as text/plain, which EventSource rejects
+	// without ever showing the error it carried.
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.Header().Set("Cache-Control", "no-cache")
 
-	endpoint := adapter.baseURL()
+	target := findOllamaEngine(engineID)
+	if target == nil {
+		fmt.Fprintf(w, "data: %s\n\n", jsonErr("No matching Ollama engine configured"))
+		flusher.Flush()
+		return
+	}
+
+	// Whatever the pull achieved — including a partial one that was cut off —
+	// the engine's model list may have changed. Dropping the probe cache also
+	// drops the routing index, so a freshly pulled model is routable at once
+	// rather than after probeCacheTTL/routeIndexTTL.
+	defer invalidateProbeCache()
+
+	endpoint := ollamaEndpoint(*target)
 	body, _ := json.Marshal(map[string]interface{}{"name": model, "stream": true})
 
 	ctx, cancel := context.WithTimeout(r.Context(), 600*time.Second)
@@ -253,6 +260,12 @@ func ollamaPullStream(w http.ResponseWriter, r *http.Request, model string) {
 		fmt.Fprintf(w, "data: %s\n\n", line)
 		flusher.Flush()
 	}
+	if err := scanner.Err(); err != nil {
+		// Without this a dropped connection mid-download ends in a bare [DONE],
+		// which the page cannot tell apart from a clean finish.
+		slog.Warn("ollama pull stream", "model", model, "engine", target.Name, "err", err)
+		fmt.Fprintf(w, "data: %s\n\n", jsonErr("Pull interrupted: "+err.Error()))
+	}
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
 }
@@ -270,7 +283,27 @@ func handleOllamaPullStream(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"error":"Model name required"}`))
 		return
 	}
-	ollamaPullStream(w, r, model)
+	engineID, _ := strconv.Atoi(r.URL.Query().Get("engine_id"))
+	ollamaPullStream(w, r, model, engineID)
+}
+
+// findOllamaEngine resolves the Ollama engine an admin action targets.
+//
+// wantID is the engine the admin picked. Zero means none was given, and only
+// then is "first Ollama engine" an acceptable stand-in — with several Ollama
+// hosts, guessing would pull onto or delete from the wrong machine. A non-zero
+// ID that matches nothing returns nil rather than falling back for the same
+// reason.
+func findOllamaEngine(wantID int) *EngineConfig {
+	for _, e := range cachedEngines() {
+		if e.Type != EngineOllama {
+			continue
+		}
+		if wantID == 0 || e.ID == wantID {
+			return &e
+		}
+	}
+	return nil
 }
 
 func jsonErr(msg string) string {
@@ -293,34 +326,15 @@ func handleOllamaDeleteModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Target the engine the admin clicked on. Falling back to "first Ollama
-	// engine" is only correct when there is exactly one; with several, a
-	// missing engine_id would delete the model off the wrong host.
 	wantID, _ := strconv.Atoi(r.FormValue("engine_id"))
-	var target *EngineConfig
-	for _, e := range cachedEngines() {
-		if e.Type != EngineOllama {
-			continue
-		}
-		if e.ID == wantID {
-			target = &e
-			break
-		}
-		if target == nil && wantID == 0 {
-			target = &e
-		}
-	}
+	target := findOllamaEngine(wantID)
 	if target == nil {
 		addFlash(w, r, "error", "No Ollama engine available to delete from")
 		http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
 		return
 	}
 
-	port := target.Port
-	if port == 0 {
-		port = 11434
-	}
-	if err := OllamaDeleteModel(target.BaseURL, port, model); err != nil {
+	if err := OllamaDeleteModel(ollamaEndpoint(*target), model); err != nil {
 		slog.Error("delete model", "model", model, "engine", target.Name, "err", err)
 		addFlash(w, r, "error", fmt.Sprintf("Could not delete '%s': %v", model, err))
 		http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
@@ -403,15 +417,7 @@ func handleEngineSettings(w http.ResponseWriter, r *http.Request) {
 		found := false
 		for i := range engines {
 			if engines[i].ID == editID {
-				engines[i].Type = engineType
-				engines[i].BaseURL = baseURL
-				engines[i].APIKey = apiKey
-				if engineName != "" {
-					engines[i].Name = engineName
-				}
-				if engineType == EngineOllama {
-					engines[i].Port = portInt
-				}
+				applyEngineEdit(&engines[i], engineType, engineName, baseURL, portInt, apiKey)
 				found = true
 				break
 			}
@@ -440,10 +446,13 @@ func handleEngineSettings(w http.ResponseWriter, r *http.Request) {
 			Name:    engineName,
 			Type:    engineType,
 			BaseURL: baseURL,
-			APIKey:  apiKey,
 		}
+		// The API key input is only hidden for Ollama, not removed, so it is
+		// still submitted — and browsers autofill password fields into it.
 		if engineType == EngineOllama {
 			ec.Port = portInt
+		} else {
+			ec.APIKey = apiKey
 		}
 		engines = append(engines, ec)
 	}
@@ -462,6 +471,34 @@ func handleEngineSettings(w http.ResponseWriter, r *http.Request) {
 	slog.Info("Engine "+action, "id", editID, "type", engineType, "url", baseURL)
 	addFlash(w, r, "success", "Engine "+action)
 	http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
+}
+
+// applyEngineEdit merges a submitted edit form into an existing engine.
+//
+// Blank fields mean "keep", not "clear", for the two values the form cannot
+// show back: the name is optional on edit, and the API key is never rendered
+// into the page (it is a credential), so the admin always submits it empty
+// unless they are replacing it. Overwriting with "" would silently strip an
+// OpenAI-compatible engine's key on every unrelated edit.
+//
+// Fields that belong only to the other engine type are cleared on a type
+// change, so a stale port or key cannot resurface if the type is switched back.
+func applyEngineEdit(e *EngineConfig, engineType, name, baseURL string, port int, apiKey string) {
+	e.Type = engineType
+	e.BaseURL = baseURL
+	if name != "" {
+		e.Name = name
+	}
+	if apiKey != "" {
+		e.APIKey = apiKey
+	}
+	switch engineType {
+	case EngineOllama:
+		e.Port = port
+		e.APIKey = ""
+	case EngineOpenAICompat:
+		e.Port = 0
+	}
 }
 
 func handleRemoveEngine(w http.ResponseWriter, r *http.Request) {
@@ -549,7 +586,8 @@ func handleOllamaPullSearchStream(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"error":"Model name required"}`))
 		return
 	}
-	ollamaPullStream(w, r, model)
+	engineID, _ := strconv.Atoi(r.URL.Query().Get("engine_id"))
+	ollamaPullStream(w, r, model, engineID)
 }
 
 // ─────────────────────────────── Password change ──────────────────────────────
@@ -632,14 +670,26 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	slog.Info("User registered", "name", name)
+	writeAPIKeyPage(w, "Registration Successful", name, apiKey)
+}
+
+// writeAPIKeyPage shows a freshly issued API key, once, in the body of the
+// response that created it.
+//
+// The key must not travel any other way. A flash would put it in the session
+// cookie, which is signed but readable, and which the browser keeps re-sending
+// until the flash is next rendered; the database only ever holds its hash. No
+// caching, for the same reason: this page is the key's only plaintext copy.
+func writeAPIKeyPage(w http.ResponseWriter, heading, name, apiKey string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
 	fmt.Fprintf(w,
-		`<h2 style='font-family:sans-serif'>Registration Successful</h2>`+
+		`<h2 style='font-family:sans-serif'>%s</h2>`+
 			`<p>API key for <strong>%s</strong>:</p>`+
 			`<pre style='background:#111;color:#0f0;padding:12px'>%s</pre>`+
 			`<p>Save this key — it will not be shown again.</p>`+
 			`<p><a href='/admin/panel'>Back to admin panel</a></p>`,
-		html.EscapeString(name), html.EscapeString(apiKey),
+		html.EscapeString(heading), html.EscapeString(name), html.EscapeString(apiKey),
 	)
 }
 
@@ -685,8 +735,7 @@ func handleAdminResetKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slog.Info("API key reset", "uid", uid)
-	addFlash(w, r, "success", fmt.Sprintf("New API key for %s: %s", user.Name, newKey))
-	http.Redirect(w, r, "/admin/panel", http.StatusFound)
+	writeAPIKeyPage(w, "API Key Reset", user.Name, newKey)
 }
 
 func handleUpdateRateLimit(w http.ResponseWriter, r *http.Request) {

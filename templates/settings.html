@@ -17,7 +17,7 @@
         </div>
         <div>
             <label>Engine Name</label>
-            <input type="text" name="engine_name" placeholder="e.g., Local Ollama">
+            <input type="text" name="engine_name" id="engine-name" placeholder="e.g., Local Ollama">
         </div>
         <div>
             <label>Base URL</label>
@@ -29,11 +29,12 @@
         </div>
         <div id="api-key-field">
             <label>API Key (optional)</label>
-            <input type="password" name="api_key" placeholder="e.g., sk-...">
+            <input type="password" name="api_key" id="api-key-input" placeholder="e.g., sk-..." autocomplete="new-password">
         </div>
         <input type="hidden" name="engine_id" id="engine-id" value="">
         <div class="flex-row" style="padding-top:4px;">
             <button class="btn btn-primary" type="submit" id="save-btn">Add Engine</button>
+            <button class="btn btn-ghost" type="button" id="cancel-edit-btn" style="display:none;">Cancel Edit</button>
             <a href="/admin/engine-test" class="btn btn-ghost">Test Connectivity</a>
         </div>
     </form>
@@ -89,7 +90,13 @@
                                 <span class="text-hint">No models</span>
                             {{end}}
                         </td>
-                        <td>
+                        <td style="white-space:nowrap;">
+                            <!-- The API key is deliberately not exposed here: it is a
+                                 credential, and the edit handler keeps the stored key
+                                 when the field is submitted blank. -->
+                            <button type="button" class="btn btn-ghost btn-small engine-edit"
+                                    data-id="{{.ID}}" data-name="{{.Name}}" data-type="{{.Type}}"
+                                    data-url="{{.BaseURL}}" data-port="{{.Port}}">Edit</button>
                             <form action="/admin/engine-remove" method="post" class="form-inline"
                                   onsubmit="return confirm('Remove this engine? This cannot be undone.');">
                                 <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
@@ -114,6 +121,11 @@
     </p>
     <div class="flex-row" style="margin-top:6px;">
         <input type="text" id="search-model-name" placeholder="e.g., llama3.2" style="max-width:320px;">
+        <!-- Which Ollama host a Pull lands on. Hidden by the script when there is
+             only one, since the choice is then implied. -->
+        <select id="pull-engine" class="select-sm" title="Pull to engine">
+            {{range .Engines}}{{if eq .Type "ollama"}}<option value="{{.ID}}">Pull to: {{.Name}}</option>{{end}}{{end}}
+        </select>
         <button class="btn btn-primary" id="search-btn" type="button" onclick="startSearch()">Search</button>
     </div>
     <div id="search-status" class="pull-status" style="display:none;">
@@ -206,6 +218,46 @@
 
     sel.addEventListener('change', update);
     update();
+
+    // ── Edit mode: the same form, pre-filled, with engine_id set ─────────────
+    const idInput   = document.getElementById('engine-id');
+    const nameInput = document.getElementById('engine-name');
+    const portInput = document.getElementById('port-input');
+    const keyInput  = document.getElementById('api-key-input');
+    const saveBtn   = document.getElementById('save-btn');
+    const cancelBtn = document.getElementById('cancel-edit-btn');
+    const card      = document.getElementById('engine-settings');
+
+    function exitEdit() {
+        card.querySelector('form').reset();
+        idInput.value = '';
+        saveBtn.textContent = 'Add Engine';
+        cancelBtn.style.display = 'none';
+        keyInput.placeholder = 'e.g., sk-...';
+        update();
+    }
+
+    document.querySelectorAll('.engine-edit').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const d = btn.dataset;
+            idInput.value   = d.id;
+            nameInput.value = d.name;
+            sel.value       = d.type;
+            baseUrlInput.value = d.url;
+            portInput.value = (d.port && d.port !== '0') ? d.port : '11434';
+            keyInput.value  = '';
+            // The stored key is never sent to the page; blank means "keep it".
+            keyInput.placeholder = 'Leave blank to keep the current key';
+            saveBtn.textContent = 'Save Changes';
+            cancelBtn.style.display = '';
+            update();
+            card.scrollIntoView({behavior: 'smooth', block: 'start'});
+        });
+    });
+    cancelBtn.addEventListener('click', exitEdit);
+
+    const pullEngine = document.getElementById('pull-engine');
+    if (pullEngine.options.length <= 1) pullEngine.style.display = 'none';
 })();
 
 function startSearch() {
@@ -335,7 +387,10 @@ function startPullSearchResult(modelName, btn) {
         }
     }
 
-    const es = new EventSource('/admin/ollama-pull-search-stream?model=' + encodeURIComponent(modelName));
+    const params = new URLSearchParams({ model: modelName });
+    const pullEngine = document.getElementById('pull-engine');
+    if (pullEngine.value) params.set('engine_id', pullEngine.value);
+    const es = new EventSource('/admin/ollama-pull-search-stream?' + params);
 
     es.onmessage = (e) => {
         if (e.data === '[DONE]') { es.close(); return; }

@@ -133,11 +133,18 @@ func metricsMiddleware(next http.Handler) http.Handler {
 func observeUpstream(engineType, op string, fn func() error) error {
 	start := time.Now()
 	err := fn()
+	recordUpstream(engineType, op, start, err)
+	return err
+}
+
+// recordUpstream is observeUpstream's recording half, for a call that cannot
+// be wrapped in a closure — one that hands a live response body back to its
+// caller, which bodyclose cannot follow through a captured variable.
+func recordUpstream(engineType, op string, start time.Time, err error) {
 	metricUpstreamDuration.WithLabelValues(engineType, op).Observe(time.Since(start).Seconds())
 	if err != nil {
 		metricUpstreamErrors.WithLabelValues(engineType, op).Inc()
 	}
-	return err
 }
 
 // handleMetrics serves /metrics, gated by an admin session.
