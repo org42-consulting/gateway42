@@ -124,6 +124,57 @@ func TestCompletionUsageAlwaysPresent(t *testing.T) {
 	}
 }
 
+// Ollama's done_reason has to survive translation on both response paths. The
+// case that matters is "length": it is how a client learns its completion was
+// cut off by max_tokens, and reporting "stop" there makes a truncated reply
+// look finished. Everything Gateway42 cannot map falls back to "stop".
+func TestFinishReasonFollowsOllamaDoneReason(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		doneReason interface{} // nil means the field is absent
+		want       string
+	}{
+		{"natural end", "stop", "stop"},
+		{"hit num_predict", "length", "length"},
+		{"absent on older builds", nil, "stop"},
+		{"reason OpenAI has no name for", "unload", "stop"},
+		{"wrong type", 42, "stop"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			final := map[string]interface{}{
+				"model": "m", "done": true,
+				"message": map[string]interface{}{"role": "assistant", "content": "hi"},
+			}
+			if tc.doneReason != nil {
+				final["done_reason"] = tc.doneReason
+			}
+
+			c := ollamaToOpenAI(final)
+			if fr := c.Choices[0].FinishReason; fr == nil || *fr != tc.want {
+				t.Errorf("non-streaming finish_reason = %v, want %q", fr, tc.want)
+			}
+
+			chunk := formatStreamChunk(final, "id", false)
+			if fr := chunk.Choices[0].FinishReason; fr == nil || *fr != tc.want {
+				t.Errorf("final stream chunk finish_reason = %v, want %q", fr, tc.want)
+			}
+		})
+	}
+}
+
+// The shared pointees must never be written through: one caller mutating
+// *FinishReason would change the answer for every later response.
+func TestFinishReasonValuesAreNotAliasedToEachOther(t *testing.T) {
+	stop := ollamaFinishReason(map[string]interface{}{"done_reason": "stop"})
+	length := ollamaFinishReason(map[string]interface{}{"done_reason": "length"})
+	if stop == length {
+		t.Fatal("stop and length share one pointer")
+	}
+	if *stop != "stop" || *length != "length" {
+		t.Errorf("got %q / %q, want \"stop\" / \"length\"", *stop, *length)
+	}
+}
+
 func TestOllamaToOpenAIDefaultsRoleWhenUpstreamOmitsIt(t *testing.T) {
 	// Some Ollama builds omit message.role. An empty role makes clients drop
 	// the message, so it defaults to assistant.

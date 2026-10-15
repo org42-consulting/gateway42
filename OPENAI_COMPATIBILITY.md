@@ -64,8 +64,10 @@ Only these two paths exist under `/v1/`. Anything else returns `404`.
 }
 ```
 
-`finish_reason` is always `"stop"` on the Ollama path — Gateway42 does not currently distinguish a
-length-truncated response from a naturally completed one.
+On the Ollama path `finish_reason` follows Ollama's `done_reason`: `"length"` when the reply was cut
+off by `max_tokens` (Ollama's `num_predict`), so a client can tell a truncated completion from a
+finished one, and `"stop"` otherwise. An absent `done_reason` (older Ollama builds) or a value
+OpenAI has no name for is reported as `"stop"`, never `null` or a non-standard string.
 
 ### 2. Model Listing
 

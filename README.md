@@ -306,7 +306,8 @@ What that guarantees:
 - **The first chunk declares `"role": "assistant"`**; later chunks omit it, so a client that
   accumulates deltas does not restart the message.
 - **`finish_reason` is present and `null`** on every chunk until the last one. It is a key that
-  exists rather than a key that is missing — some SDKs fault on absence.
+  exists rather than a key that is missing — some SDKs fault on absence. On the last chunk it is
+  `"length"` if the reply was cut off by `max_tokens`, otherwise `"stop"`.
 - **`usage` appears only on the final chunk.** A client that sums usage across chunks gets the right
   total instead of over-counting.
 - **The stream always ends `data: [DONE]`**, even if the upstream closes without sending its own
@@ -709,7 +710,7 @@ The race detector works without a C toolchain because the SQLite driver is pure 
 
 | File | Covers |
 | ---- | ------ |
-| `types_test.go` | The wire contract of authored responses — that `finish_reason` is present-and-null rather than absent, that `usage` fields serialise when zero, that `usage` appears only on the final chunk. |
+| `types_test.go` | The wire contract of authored responses — that `finish_reason` is present-and-null rather than absent, that `usage` fields serialise when zero, that `usage` appears only on the final chunk, and that `finish_reason` reports `"length"` for a truncated Ollama reply. |
 | `stream_test.go` | Stream translation: Ollama NDJSON → OpenAI chunks, SSE passthrough unwrapping, terminal-chunk handling. |
 | `recovery_test.go` | Panic recovery: the JSON envelope on `/v1/`, plain text on the admin UI, an SSE error frame when the response is already committed mid-stream, and that a committed body is never appended to. |
 | `metrics_test.go` | That a recovered panic is counted, with the status the client actually saw; that a mid-stream panic counts as `200` and raises `gw42_panics_total`; that the in-flight gauge unwinds; that one `statusRecorder` is shared; and that a panicked request still produces an audit row. |

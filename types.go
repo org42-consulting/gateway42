@@ -82,9 +82,13 @@ type ChatCompletionChunk struct {
 	Usage   *Usage        `json:"usage,omitempty"`
 }
 
-// finishStop is the address-of-able "stop" that FinishReason points at. One
-// shared value is safe because nothing ever writes through these pointers.
-var finishStop = "stop"
+// finishStop and finishLength are the address-of-able values FinishReason
+// points at. Sharing them is safe because nothing ever writes through these
+// pointers.
+var (
+	finishStop   = "stop"
+	finishLength = "length"
+)
 
 // ── Models ────────────────────────────────────────────────────────────────────
 

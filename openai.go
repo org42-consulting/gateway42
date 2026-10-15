@@ -92,35 +92,28 @@ func openAIToOllama(data map[string]interface{}, messages []map[string]interface
 // the final streaming chunk, which are the only two places the value is
 // non-null. It is never called mid-stream.
 //
-// TODO: decide what this returns. It currently answers "stop" unconditionally,
-// which is what Gateway42 has always done — see OPENAI_COMPATIBILITY.md.
-//
 // Ollama reports done_reason on its final object: "stop" when the model emitted
-// an end token, "length" when it hit num_predict. Older builds omit the field,
-// and nothing stops a future one from reporting a reason OpenAI has no name for.
+// an end token, "length" when it hit num_predict (which max_tokens maps to).
 // OpenAI's vocabulary is "stop" | "length" | "content_filter" | "tool_calls".
 //
-// The decision is in the gaps, not the happy path:
+// "length" is the value that matters: it is how a client learns its completion
+// was truncated, and callers continue or retry on it. Labelling a truncated
+// reply "stop" makes a half answer look finished.
 //
-//   - Defaulting an absent or unrecognised reason to "stop" keeps every client
-//     working, but labels a truncated completion as naturally finished — so a
-//     caller that retries on "length" silently never retries.
-//   - Returning nil is honest about not knowing, but null is also what this
-//     gateway sends mid-stream; on a terminal chunk some SDKs read it as "still
-//     going" and a few fault outright.
-//   - Forwarding an unrecognised value verbatim is most faithful to upstream,
-//     but puts a string outside the enum in front of clients that switch on it
-//     exhaustively.
+// Everything else — an absent field (older Ollama builds), or a reason OpenAI
+// has no name for — maps to "stop". The alternatives were rejected:
 //
-// Two tests in types_test.go pin the current contract and will need updating if
-// the terminal answer changes: TestChunkFinishReasonIsNullNotAbsent (present
-// and null mid-stream) and TestCompletionUsageAlwaysPresent (asserts "stop" on
-// a completed response).
+//   - nil is what this gateway sends mid-stream; on a terminal chunk some SDKs
+//     read it as "still going" and a few fault outright.
+//   - Forwarding an unrecognised value verbatim puts a string outside the enum
+//     in front of clients that switch on it exhaustively.
 //
-// The field is a *string, so the value must be addressable: &finishStop
-// (types.go) covers "stop"; for anything else a local works —
-// r := "length"; return &r.
+// "stop" is what Gateway42 answered unconditionally before, so the fallback
+// is never worse than the old behaviour.
 func ollamaFinishReason(chunk map[string]interface{}) *string {
+	if reason, _ := chunk["done_reason"].(string); reason == finishLength {
+		return &finishLength
+	}
 	return &finishStop
 }
 
