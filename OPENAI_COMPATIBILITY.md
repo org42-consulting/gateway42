@@ -138,10 +138,18 @@ For Ollama engines, parameters are instead mapped into Ollama's `options` object
 | `stop` | `stop` | A bare string is wrapped into a list |
 | `frequency_penalty` | `repeat_penalty` | `1.0 + value` |
 | `presence_penalty` | `repeat_last_n` | Approximate: Ollama has no presence penalty, and `repeat_last_n` is a lookback window in tokens, not a penalty weight. Treat this mapping as lossy. |
+| `tools` | `tools` | Same schema. `tool_choice: "none"` withholds them; other values are ignored |
+| `response_format` | `format` | `json_object` → `"json"`; `json_schema` → the schema object |
 
-On the Ollama path anything not in the table above is dropped rather than rejected — including
-`tools` and `response_format`, so a tool-calling request sent to an Ollama engine silently degrades
-to a plain completion.
+Tool calls from an Ollama engine are returned in OpenAI shape — string `arguments`, a minted `id`
+per call, a streaming `index`, and `finish_reason: "tool_calls"` — and the message history of a tool
+loop is translated back (a tool result's `tool_call_id` becomes Ollama's `tool_name`). Array content
+is split into text and `images`; only inline `data:` image URLs survive, as the gateway does not
+fetch remote ones.
+
+On both paths, messages keep `tool_calls`, `tool_call_id` and `name`, and array content is
+preserved with each text part truncated to `MAX_MESSAGE_LENGTH`. Anything not in the table above is
+dropped rather than rejected on the Ollama path.
 
 ## Authentication
 

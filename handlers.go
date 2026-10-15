@@ -270,17 +270,23 @@ func ollamaPullStream(w http.ResponseWriter, r *http.Request, model string, engi
 	flusher.Flush()
 }
 
+// handleOllamaPullStream starts a model pull and streams its progress. It is a
+// GET only because EventSource cannot send anything else, which is why it
+// checks the CSRF token itself: the middleware exempts GETs.
 func handleOllamaPullStream(w http.ResponseWriter, r *http.Request) {
 	if !isAdminSession(r) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(401)
-		w.Write([]byte(`{"error":"Unauthorized"}`))
+		jsonResponse(w, http.StatusUnauthorized, map[string]string{"error": "Unauthorized"})
+		return
+	}
+	if !csrfQueryValid(r) {
+		slog.Warn("csrf: rejected pull", "ip", clientIP(r))
+		jsonResponse(w, http.StatusForbidden,
+			map[string]string{"error": "CSRF token missing or invalid — reload the page and retry."})
 		return
 	}
 	model := strings.TrimSpace(r.URL.Query().Get("model"))
 	if model == "" {
-		w.WriteHeader(400)
-		w.Write([]byte(`{"error":"Model name required"}`))
+		jsonResponse(w, http.StatusBadRequest, map[string]string{"error": "Model name required"})
 		return
 	}
 	engineID, _ := strconv.Atoi(r.URL.Query().Get("engine_id"))
@@ -571,23 +577,6 @@ func handleOllamaSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jsonResponse(w, 200, map[string][]ModelDetail{"results": results})
-}
-
-func handleOllamaPullSearchStream(w http.ResponseWriter, r *http.Request) {
-	if !isAdminSession(r) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(401)
-		w.Write([]byte(`{"error":"Unauthorized"}`))
-		return
-	}
-	model := strings.TrimSpace(r.URL.Query().Get("model"))
-	if model == "" {
-		w.WriteHeader(400)
-		w.Write([]byte(`{"error":"Model name required"}`))
-		return
-	}
-	engineID, _ := strconv.Atoi(r.URL.Query().Get("engine_id"))
-	ollamaPullStream(w, r, model, engineID)
 }
 
 // ─────────────────────────────── Password change ──────────────────────────────

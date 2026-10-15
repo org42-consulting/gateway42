@@ -60,6 +60,11 @@ type Config struct {
 	// MaxMsgLen each), so an unbounded table grows with traffic and holds
 	// user content indefinitely. 0 disables pruning.
 	LogRetentionDays int
+
+	// MetricsToken, when set, lets a scraper read /metrics with
+	// "Authorization: Bearer <token>". Without it /metrics needs an admin
+	// session cookie, which Prometheus cannot present.
+	MetricsToken string
 }
 
 var cfg Config
@@ -97,6 +102,7 @@ func loadConfig() Config {
 		TLSKey:              getEnv("TLS_KEY", ""),
 		UpstreamConcurrency: getEnvInt("GW42_UPSTREAM_CONCURRENCY", 8),
 		LogRetentionDays:    getEnvInt("GW42_LOG_RETENTION_DAYS", 30),
+		MetricsToken:        getEnv("GW42_METRICS_TOKEN", ""),
 	}
 	return c
 }
@@ -729,7 +735,6 @@ func setupRouter() *mux.Router {
 	r.HandleFunc("/admin/settings-page", handleAdminSettingsPage).Methods("GET")
 	r.HandleFunc("/admin/engine-test", handleEngineTest).Methods("GET")
 	r.HandleFunc("/admin/ollama-pull-stream", handleOllamaPullStream).Methods("GET")
-	r.HandleFunc("/admin/ollama-pull-search-stream", handleOllamaPullSearchStream).Methods("GET")
 	r.HandleFunc("/admin/ollama-delete-model", handleOllamaDeleteModel).Methods("POST")
 	r.HandleFunc("/admin/engine-settings", handleEngineSettings).Methods("POST")
 	r.HandleFunc("/admin/engine-remove", handleRemoveEngine).Methods("POST")

@@ -18,17 +18,42 @@ package main
 
 // Message is one turn in a completed (non-streaming) response.
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role      string     `json:"role"`
+	Content   string     `json:"content"`
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
 }
 
 // Delta is the incremental payload in a streaming chunk. Every field is
-// optional: the first chunk carries the role, middle chunks carry content, and
-// the terminating chunk carries neither — which is why this cannot reuse
-// Message, whose fields are always emitted.
+// optional: the first chunk carries the role, middle chunks carry content or
+// tool calls, and the terminating chunk carries none — which is why this
+// cannot reuse Message, whose role and content are always emitted.
 type Delta struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
+	Role      string           `json:"role,omitempty"`
+	Content   string           `json:"content,omitempty"`
+	ToolCalls []StreamToolCall `json:"tool_calls,omitempty"`
+}
+
+// ToolCall is a function call the model asked the client to make.
+type ToolCall struct {
+	ID       string       `json:"id"`
+	Type     string       `json:"type"` // always "function"
+	Function FunctionCall `json:"function"`
+}
+
+// StreamToolCall is a ToolCall inside a streaming delta. OpenAI clients
+// assemble calls across chunks by index, so it is required on the wire —
+// including index 0, which is why it is not omitempty.
+type StreamToolCall struct {
+	Index int `json:"index"`
+	ToolCall
+}
+
+// FunctionCall names the function and its arguments. Arguments is a string
+// of JSON, not an object: that is the OpenAI schema, and SDKs json.loads it.
+// Ollama sends an object, so the translation re-encodes it.
+type FunctionCall struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
 }
 
 // Usage reports token accounting. Values are always emitted, including zero:
@@ -86,8 +111,9 @@ type ChatCompletionChunk struct {
 // points at. Sharing them is safe because nothing ever writes through these
 // pointers.
 var (
-	finishStop   = "stop"
-	finishLength = "length"
+	finishStop      = "stop"
+	finishLength    = "length"
+	finishToolCalls = "tool_calls"
 )
 
 // ── Models ────────────────────────────────────────────────────────────────────

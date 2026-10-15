@@ -387,10 +387,15 @@ function startPullSearchResult(modelName, btn) {
         }
     }
 
-    const params = new URLSearchParams({ model: modelName });
+    // The pull is a GET (EventSource cannot POST), so the CSRF token rides in
+    // the query string and the handler checks it there.
+    const params = new URLSearchParams({
+        model: modelName,
+        _csrf: document.querySelector('meta[name="csrf-token"]').content,
+    });
     const pullEngine = document.getElementById('pull-engine');
     if (pullEngine.value) params.set('engine_id', pullEngine.value);
-    const es = new EventSource('/admin/ollama-pull-search-stream?' + params);
+    const es = new EventSource('/admin/ollama-pull-stream?' + params);
 
     es.onmessage = (e) => {
         if (e.data === '[DONE]') { es.close(); return; }

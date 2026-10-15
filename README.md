@@ -221,7 +221,7 @@ Requests with a missing, invalid, or deactivated key are rejected with `401 Unau
 | `/v1/chat/completions` | POST | Chat completion. Accepts OpenAI-format bodies. Set `"stream": true` for SSE streaming. |
 | `/v1/models` | GET | Returns the combined catalogue of every reachable engine, in OpenAI format. Duplicates are collapsed; an engine that is down is skipped rather than failing the listing. |
 | `/health` | GET | Returns `{"status": "ok"}`. No auth required. Use for uptime monitoring. |
-| `/metrics` | GET | Prometheus exposition. Requires an **admin session cookie**, not a Bearer token — see [Observability](#prometheus-metrics). |
+| `/metrics` | GET | Prometheus exposition. Requires an admin session cookie, or `Authorization: Bearer <GW42_METRICS_TOKEN>` when that variable is set — see [Observability](#prometheus-metrics). |
 
 `OPTIONS` on any `/v1/` path is answered as a CORS preflight. Any other path under `/v1/` returns
 `404` — the surface is deliberately just these two endpoints.
@@ -271,11 +271,17 @@ print(response.choices[0].message.content)
 | `stop` | `stop` | String or list of strings; a bare string is wrapped into a list |
 | `presence_penalty` | `repeat_last_n` | **Lossy.** Ollama has no presence penalty; `repeat_last_n` is a lookback window measured in tokens, not a penalty weight. The value is passed through as-is, so treat the mapping as approximate rather than equivalent. |
 | `frequency_penalty` | `repeat_penalty` | Mapped as `1.0 + value` |
+| `tools` | `tools` | Same schema, forwarded as-is. `tool_choice: "none"` withholds them; other `tool_choice` values are ignored (Ollama has no equivalent). |
+| `response_format` | `format` | `json_object` → `"json"`; `json_schema` → the schema object. |
 
-Anything not in that table is **dropped rather than rejected** — including `tools` and
-`response_format`. A tool-calling request sent to an Ollama engine therefore degrades silently to a
-plain completion rather than returning an error. If you need tool calling, route to an
-OpenAI-compatible engine.
+Tool calls come back in OpenAI shape: arguments as a JSON string, an `id` per call (Ollama does not
+assign one, so Gateway42 does), an `index` per call when streaming, and `finish_reason: "tool_calls"`.
+On the way in, the message history is converted to Ollama's shape — a tool result's `tool_call_id`
+becomes the `tool_name` of the call it answers, and array content is split into text and `images`.
+Only inline `data:` image URLs can be passed on; a remote image URL is dropped, since the gateway
+does not fetch it. Whether a model actually calls tools depends on the model.
+
+Anything else not in that table is **dropped rather than rejected**.
 
 **When routing to an OpenAI-compatible engine**, the body is forwarded through an allow-list that
 covers the standard fields plus the tool-calling and structured-output ones: `temperature`, `top_p`,
@@ -460,10 +466,18 @@ Path labels are bucketed to keep cardinality bounded: `/v1/chat/completions`, `/
 `/admin/*` and numeric-tail routes like `/toggle/42` collapse to `/toggle/*`. Without this, one
 series per user ID would accumulate forever.
 
-> **Limitation:** `/metrics` is gated by an **admin session cookie**, not a Bearer token. A
-> Prometheus scraper cannot authenticate to it as configured. Until that changes, scrape it through
-> something that can present the cookie, or restrict access at the network layer and treat the
-> endpoint as unauthenticated.
+`/metrics` accepts an admin session cookie or, for a scraper, the token in `GW42_METRICS_TOKEN`
+sent as a Bearer token. It is a separate credential from user API keys, so it can be rotated
+without touching any client. With the variable unset, only the admin session works.
+
+```yaml
+scrape_configs:
+  - job_name: gateway42
+    authorization:
+      credentials: <GW42_METRICS_TOKEN>
+    static_configs:
+      - targets: ["gateway-host:7000"]
+```
 
 `gw42_logs_dropped_total` is the one to alert on: a non-zero value means audit entries were
 discarded under load, so the logs are no longer a complete record.
@@ -663,6 +677,7 @@ All configuration is via environment variables. No variables are strictly requir
 | `TLS_CERT` | _(empty)_ | Path to TLS certificate file. When set with `TLS_KEY`, enables HTTPS. |
 | `TLS_KEY` | _(empty)_ | Path to TLS private key file. When set with `TLS_CERT`, enables HTTPS. |
 | `GW42_UPSTREAM_CONCURRENCY` | `8` | Maximum simultaneous in-flight requests per engine. Requests beyond this are rejected with `503` and a `Retry-After` header rather than queued. |
+| `GW42_METRICS_TOKEN` | _(empty)_ | Bearer token a Prometheus scraper can use for `/metrics`. Unset means only an admin session can read it. |
 | `GW42_LOG_RETENTION_DAYS` | `30` | Age after which interaction and request-log rows are deleted. A sweep runs at startup and hourly thereafter. Set to `0` to keep everything — note that interaction logs hold full prompts and responses, so an unbounded table grows with traffic and retains user content indefinitely. |
 
 Gateway42 reads these from the process environment only — it does not parse a `.env` file. Export them
@@ -718,6 +733,9 @@ The race detector works without a C toolchain because the SQLite driver is pure 
 | `engine_config_test.go` | Ollama URL assembly (no doubled port, default scheme and port), engine-edit merging (a blank key keeps the stored one), and Ollama engine selection for pull/delete. |
 | `engine_delete_test.go` | Model deletion reports upstream refusals, with the reason bounded so it fits a session-cookie flash. |
 | `logging_test.go` | `LOG_LEVEL` parsing and `LOG_FILE` output, including not double-writing when stderr is already that file. |
+| `tools_test.go` | The tool-use loop in both directions: message fields kept through sanitising, OpenAI → Ollama history translation (argument objects, `tool_name` from `tool_call_id`, image parts), `response_format` → `format`, and Ollama tool calls returned in OpenAI shape with cross-chunk indexes and `finish_reason: "tool_calls"`. |
+| `pull_csrf_test.go` | A model pull — a GET, so outside the CSRF middleware — is refused without the session's token. |
+| `metrics_auth_test.go` | `/metrics` access by admin session and by `GW42_METRICS_TOKEN`, and that an unset token is not an open door. |
 
 The template test matters more than it sounds: `html/template` resolves field names at render time,
 so a mistyped `{{.FieldName}}` is invisible until someone loads the page.
@@ -738,19 +756,19 @@ Single `package main`, one file per concern:
 
 | File | Lines | Responsibility |
 | ---- | ----- | -------------- |
-| `main.go` | 999 | Config, routing table, middleware chain, panic recovery, server lifecycle, graceful shutdown. |
-| `handlers.go` | 1150 | Admin web UI handlers only. |
-| `api_handlers.go` | 335 | The `/v1/*` OpenAI-compatible surface. Separate from the admin UI so a change to one cannot alter the other's contract. |
-| `engine.go` | 902 | The `Engine` interface and its two adapters, plus the probe cache and stream implementations. |
+| `main.go` | 1004 | Config, routing table, middleware chain, panic recovery, server lifecycle, graceful shutdown. |
+| `handlers.go` | 1139 | Admin web UI handlers only. |
+| `api_handlers.go` | 385 | The `/v1/*` OpenAI-compatible surface. Separate from the admin UI so a change to one cannot alter the other's contract. |
+| `engine.go` | 917 | The `Engine` interface and its two adapters, plus the probe cache and stream implementations. |
 | `routing.go` | 186 | Model-name → engine resolution and the cached routing index. |
-| `openai.go` | 269 | Request and response translation between OpenAI and Ollama shapes. |
-| `types.go` | 126 | Typed structs for responses Gateway42. authors. |
+| `openai.go` | 466 | Request and response translation between OpenAI and Ollama shapes. |
+| `types.go` | 156 | Typed structs for responses Gateway42. authors. |
 | `db.go` | 821 | Schema, migrations, both connection pools, queries, FTS5 setup, retention pruning. |
 | `logwriter.go` | 289 | Asynchronous batched log writers. |
 | `auth.go` | 90 | Password hashing and API-key generation. |
-| `csrf.go` | 98 | CSRF token issue and verification. |
+| `csrf.go` | 116 | CSRF token issue and verification. |
 | `ratelimit.go` | 89 | Per-user token buckets. |
-| `metrics.go` | 160 | Prometheus collectors and the path bucketer. |
+| `metrics.go` | 181 | Prometheus collectors and the path bucketer. |
 
 Templates and static images are compiled into the binary with `embed.FS`, so deployment is a single
 file with no asset directory to ship alongside it.

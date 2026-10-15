@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/subtle"
 	"net/http"
 	"strconv"
 	"strings"
@@ -147,14 +148,34 @@ func recordUpstream(engineType, op string, start time.Time, err error) {
 	}
 }
 
-// handleMetrics serves /metrics, gated by an admin session.
+// handleMetrics serves /metrics to an admin session or, when
+// GW42_METRICS_TOKEN is set, to a scraper presenting it as a Bearer token.
 func handleMetrics() http.Handler {
 	h := promhttp.Handler()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !isAdminSession(r) {
+		if !metricsTokenValid(r) && !isAdminSession(r) {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="gw42-metrics"`)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 		h.ServeHTTP(w, r)
 	})
+}
+
+// metricsTokenValid reports whether r carries the configured scrape token.
+//
+// This is a separate credential from user API keys on purpose: a user key
+// identifies a client of the /v1 API and is rate-limited per user, while this
+// grants read access to operational data across all users and should be
+// revocable without touching any of them. An unset token disables the path
+// entirely rather than matching an empty header.
+func metricsTokenValid(r *http.Request) bool {
+	if cfg.MetricsToken == "" {
+		return false
+	}
+	got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !ok {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(cfg.MetricsToken)) == 1
 }
