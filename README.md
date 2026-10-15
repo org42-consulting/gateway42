@@ -447,7 +447,7 @@ All series use the `gw42_` prefix:
 | `gw42_http_requests_total` | counter | `path`, `method`, `status` | Request volume and error rate |
 | `gw42_http_request_duration_seconds` | histogram | `path`, `method` | End-to-end latency, 1 ms–60 s buckets |
 | `gw42_inflight_requests` | gauge | `path` | Requests in progress right now |
-| `gw42_upstream_duration_seconds` | histogram | `engine`, `op` | Engine latency, 5 ms–120 s buckets. `op` is `chat`, `stream`, `list_models`, or `status` |
+| `gw42_upstream_duration_seconds` | histogram | `engine`, `op` | Engine latency, 5 ms–120 s buckets. `op` is `chat`, `stream`, `list_models`, or `status`. For `stream` it is the time until the engine accepted the stream (response headers), not the whole generation |
 | `gw42_upstream_errors_total` | counter | `engine`, `op` | Engine failures, separated from client errors |
 | `gw42_upstream_busy_total` | counter | `engine` | Requests shed by the concurrency cap |
 | `gw42_rate_limited_total` | counter | — | Requests rejected by the rate limiter |
@@ -479,7 +479,7 @@ when nothing had been written, or the already-committed status when it had.
 
 ### Application logs
 
-Structured `slog` output goes to `LOG_FILE` and to an in-memory ring buffer that the admin **System
+Structured `slog` output goes to stderr, to `LOG_FILE`, and to an in-memory ring buffer that the admin **System
 Logs** page renders, so recent application logs are readable without shell access. They can be
 exported from that page.
 
@@ -490,10 +490,10 @@ exported from that page.
 | ------- | ----------------- |
 | Admin password | PBKDF2-SHA256, 260,000 iterations, per-password random salt, stored in the Werkzeug `pbkdf2:sha256:…$salt$hash` format. Verified with a constant-time compare. |
 | API keys | Generated from 20 bytes of `crypto/rand`, URL-safe base64 (~27 chars). Stored as a **SHA-256 hash** — the plaintext key exists only in the response that creates it. Existing plaintext keys are rehashed automatically on startup. |
-| Key display | Shown exactly once, at creation or reset. There is no way to recover a key afterwards; issue a new one, which invalidates the old immediately. |
+| Key display | Shown exactly once, at creation or reset, in the body of that response — never in a flash or cookie. There is no way to recover a key afterwards; issue a new one, which invalidates the old immediately. |
 | New users | Created **DISABLED**. A key cannot be used until an admin activates the account, so a key leaked in transit is not live by default. |
-| Admin forms | CSRF token required on every state-changing POST; session cookie is `SameSite=Lax`. |
-| Engine credentials | Upstream API keys are stored in the database and never rendered back into the settings form. |
+| Admin forms | CSRF token required on every state-changing POST; session cookie is `SameSite=Lax` and AES-encrypted as well as signed, so its contents (CSRF token, flash messages) are not readable client-side. |
+| Engine credentials | Upstream API keys are stored in the database and never rendered back into the settings form. Editing an engine with the key field left blank keeps the stored key. |
 | Transport | HTTPS when `TLS_CERT` and `TLS_KEY` are both set. |
 | Input bounds | Request bodies capped at 8 × `MAX_MESSAGE_LENGTH`; each logged prompt and response truncated to `MAX_MESSAGE_LENGTH`, on a rune boundary so truncation cannot split a multi-byte character. |
 | Log retention | Prompts and responses are deleted after `GW42_LOG_RETENTION_DAYS`, so stored user content has a bounded lifetime. |
@@ -594,10 +594,10 @@ New users are registered with a unique API key and start in **DISABLED** status.
 The Settings page is where you configure your inference backends. For each engine you can:
 
 - **Add** a new Ollama or OpenAI-compatible engine — name it, provide the URL and (for Ollama) the port
-- **Edit** an existing engine's connection details or API key
+- **Edit** an existing engine's connection details or API key — leave the key blank to keep the current one
 - **Remove** an engine you no longer need
 - **Test** connectivity and see which models the engine reports
-- **Manage Ollama models** — search ollama.com, download with live progress, and delete models to free disk space
+- **Manage Ollama models** — search ollama.com, download with live progress, and delete models to free disk space. With several Ollama engines, a selector next to *Search* picks which one a pull lands on; a pulled model is routable as soon as the pull ends
 
 <img width="1554" height="806" alt="Image" src="https://github.com/user-attachments/assets/d99401c0-f270-4da4-837f-9a7568643520" />
 
@@ -657,8 +657,8 @@ All configuration is via environment variables. No variables are strictly requir
 | `DEFAULT_RATE_LIMIT` | `10` | Default requests-per-minute for newly registered users. |
 | `SESSION_TIMEOUT` | `3600` | Admin session lifetime in seconds. |
 | `MAX_MESSAGE_LENGTH` | `262144` | Maximum characters stored per prompt or response in the AI interaction log (~256 KB). |
-| `LOG_LEVEL` | `INFO` | Log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
-| `LOG_FILE` | `./logs/gateway.log` | Path to the application log file. |
+| `LOG_LEVEL` | `INFO` | Log verbosity: `DEBUG`, `INFO`, `WARN` (or `WARNING`), `ERROR`. An unrecognised value falls back to `INFO` with a warning. |
+| `LOG_FILE` | `./logs/gateway.log` | Application log file, written in addition to stderr; the directory is created if needed. Set it empty to log to stderr only. When stderr is already redirected to this same file (as `install.sh` does under launchd) it is written once, not twice. |
 | `TLS_CERT` | _(empty)_ | Path to TLS certificate file. When set with `TLS_KEY`, enables HTTPS. |
 | `TLS_KEY` | _(empty)_ | Path to TLS private key file. When set with `TLS_CERT`, enables HTTPS. |
 | `GW42_UPSTREAM_CONCURRENCY` | `8` | Maximum simultaneous in-flight requests per engine. Requests beyond this are rejected with `503` and a `Retry-After` header rather than queued. |
@@ -713,7 +713,10 @@ The race detector works without a C toolchain because the SQLite driver is pure 
 | `stream_test.go` | Stream translation: Ollama NDJSON → OpenAI chunks, SSE passthrough unwrapping, terminal-chunk handling. |
 | `recovery_test.go` | Panic recovery: the JSON envelope on `/v1/`, plain text on the admin UI, an SSE error frame when the response is already committed mid-stream, and that a committed body is never appended to. |
 | `metrics_test.go` | That a recovered panic is counted, with the status the client actually saw; that a mid-stream panic counts as `200` and raises `gw42_panics_total`; that the in-flight gauge unwinds; that one `statusRecorder` is shared; and that a panicked request still produces an audit row. |
-| `tmpl_render_check_test.go` | Every template renders against its real data shape, so a typo in an admin page is caught at test time rather than in the browser. |
+| `tmpl_render_check_test.go` | Every template renders against its real data shape, so a typo in an admin page is caught at test time rather than in the browser. Also checks that an engine's API key never reaches the settings page. |
+| `engine_config_test.go` | Ollama URL assembly (no doubled port, default scheme and port), engine-edit merging (a blank key keeps the stored one), and Ollama engine selection for pull/delete. |
+| `engine_delete_test.go` | Model deletion reports upstream refusals, with the reason bounded so it fits a session-cookie flash. |
+| `logging_test.go` | `LOG_LEVEL` parsing and `LOG_FILE` output, including not double-writing when stderr is already that file. |
 
 The template test matters more than it sounds: `html/template` resolves field names at render time,
 so a mistyped `{{.FieldName}}` is invisible until someone loads the page.
@@ -734,19 +737,19 @@ Single `package main`, one file per concern:
 
 | File | Lines | Responsibility |
 | ---- | ----- | -------------- |
-| `main.go` | 923 | Config, routing table, middleware chain, panic recovery, server lifecycle, graceful shutdown. |
-| `handlers.go` | 1013 | Admin web UI handlers only. |
+| `main.go` | 999 | Config, routing table, middleware chain, panic recovery, server lifecycle, graceful shutdown. |
+| `handlers.go` | 1150 | Admin web UI handlers only. |
 | `api_handlers.go` | 335 | The `/v1/*` OpenAI-compatible surface. Separate from the admin UI so a change to one cannot alter the other's contract. |
-| `engine.go` | 810 | The `Engine` interface and its two adapters, plus the probe cache and stream implementations. |
-| `routing.go` | 197 | Model-name → engine resolution and the cached routing index. |
-| `openai.go` | 261 | Request and response translation between OpenAI and Ollama shapes. |
+| `engine.go` | 902 | The `Engine` interface and its two adapters, plus the probe cache and stream implementations. |
+| `routing.go` | 186 | Model-name → engine resolution and the cached routing index. |
+| `openai.go` | 269 | Request and response translation between OpenAI and Ollama shapes. |
 | `types.go` | 126 | Typed structs for responses Gateway42. authors. |
-| `db.go` | 836 | Schema, migrations, both connection pools, queries, FTS5 setup, retention pruning. |
-| `logwriter.go` | 277 | Asynchronous batched log writers. |
+| `db.go` | 821 | Schema, migrations, both connection pools, queries, FTS5 setup, retention pruning. |
+| `logwriter.go` | 289 | Asynchronous batched log writers. |
 | `auth.go` | 90 | Password hashing and API-key generation. |
-| `csrf.go` | 93 | CSRF token issue and verification. |
+| `csrf.go` | 98 | CSRF token issue and verification. |
 | `ratelimit.go` | 89 | Per-user token buckets. |
-| `metrics.go` | 153 | Prometheus collectors and the path bucketer. |
+| `metrics.go` | 160 | Prometheus collectors and the path bucketer. |
 
 Templates and static images are compiled into the binary with `embed.FS`, so deployment is a single
 file with no asset directory to ship alongside it.

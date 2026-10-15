@@ -9,7 +9,7 @@
     <!-- Search + refresh control -->
     <form method="get" action="/admin/logs" style="margin-bottom:20px;">
         <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-            <input type="text" name="q" id="search-input" value="{{.Search}}" placeholder="Search prompt, response or client name…" style="max-width:400px;">
+            <input type="text" name="q" id="search-input" value="{{.Search}}" placeholder="Search client name, path or IP…" style="max-width:400px;">
             <button class="btn btn-primary" type="submit">Search</button>
             {{if .Search}}
                 <a href="/admin/logs" class="btn btn-ghost">Clear</a>

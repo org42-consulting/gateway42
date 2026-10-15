@@ -57,6 +57,32 @@ func TestRenderSettingsPage(t *testing.T) {
 		t.Error("delete control rendered for a non-Ollama engine")
 	}
 
+	// Every engine is editable, and the pull target offers only Ollama hosts.
+	if got := strings.Count(out, `class="btn btn-ghost btn-small engine-edit"`); got != 3 {
+		t.Errorf("got %d Edit buttons, want one per engine (3)", got)
+	}
+	for _, want := range []string{
+		`<option value="1">Pull to: local-ollama</option>`,
+		`<option value="3">Pull to: dead-engine</option>`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("pull-target selector missing %q", want)
+		}
+	}
+	if strings.Contains(out, `Pull to: lmstudio`) {
+		t.Error("pull-target selector offers a non-Ollama engine")
+	}
+
+	// The stored upstream credential must never reach the page.
+	data.Engines[1].APIKey = "sk-must-not-render"
+	sb.Reset()
+	if err := tmpl.ExecuteTemplate(&sb, "base.html", data); err != nil {
+		t.Fatalf("render settings: %v", err)
+	}
+	if strings.Contains(sb.String(), "sk-must-not-render") {
+		t.Error("an engine's API key was rendered into the settings page")
+	}
+
 	// Header/cell arity must match in the model-management table, or columns
 	// silently shift (the Remove button used to sit under the "Models" header
 	// with a fourth, unheadered cell after it). Scoped to the first table on

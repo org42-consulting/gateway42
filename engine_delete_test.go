@@ -14,8 +14,9 @@ import (
 // that string reaches the browser through a flash stored in the session cookie.
 
 // newDeleteServer stands up an Ollama-shaped /api/delete endpoint and returns
-// the base URL and port split the way EngineConfig stores them.
-func newDeleteServer(t *testing.T, status int, body string) (string, int) {
+// the endpoint the way the handler builds it: from an EngineConfig whose base
+// URL and port are stored separately, assembled by ollamaEndpoint.
+func newDeleteServer(t *testing.T, status int, body string) string {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/delete" || r.Method != http.MethodDelete {
@@ -34,19 +35,19 @@ func newDeleteServer(t *testing.T, status int, body string) (string, int) {
 	if err != nil {
 		t.Fatalf("port %q: %v", port, err)
 	}
-	return "http://" + host, p
+	return ollamaEndpoint(EngineConfig{Type: EngineOllama, BaseURL: "http://" + host, Port: p})
 }
 
 func TestOllamaDeleteModelSuccess(t *testing.T) {
-	baseURL, port := newDeleteServer(t, http.StatusOK, `{}`)
-	if err := OllamaDeleteModel(baseURL, port, "llama3"); err != nil {
+	endpoint := newDeleteServer(t, http.StatusOK, `{}`)
+	if err := OllamaDeleteModel(endpoint, "llama3"); err != nil {
 		t.Fatalf("expected success, got %v", err)
 	}
 }
 
 func TestOllamaDeleteModelReportsRefusal(t *testing.T) {
-	baseURL, port := newDeleteServer(t, http.StatusNotFound, `{"error":"model 'ghost' not found"}`)
-	err := OllamaDeleteModel(baseURL, port, "ghost")
+	endpoint := newDeleteServer(t, http.StatusNotFound, `{"error":"model 'ghost' not found"}`)
+	err := OllamaDeleteModel(endpoint, "ghost")
 	if err == nil {
 		t.Fatal("a 404 must not report success")
 	}
@@ -60,8 +61,8 @@ func TestOllamaDeleteModelReportsRefusal(t *testing.T) {
 }
 
 func TestOllamaDeleteModelNonJSONBody(t *testing.T) {
-	baseURL, port := newDeleteServer(t, http.StatusBadGateway, "<html>nginx\nbad gateway</html>")
-	err := OllamaDeleteModel(baseURL, port, "llama3")
+	endpoint := newDeleteServer(t, http.StatusBadGateway, "<html>nginx\nbad gateway</html>")
+	err := OllamaDeleteModel(endpoint, "llama3")
 	if err == nil {
 		t.Fatal("a 502 must not report success")
 	}
@@ -77,8 +78,8 @@ func TestOllamaDeleteModelNonJSONBody(t *testing.T) {
 
 func TestOllamaDeleteModelBoundsUpstreamBody(t *testing.T) {
 	huge := strings.Repeat("A", 64*1024)
-	baseURL, port := newDeleteServer(t, http.StatusInternalServerError, huge)
-	err := OllamaDeleteModel(baseURL, port, "llama3")
+	endpoint := newDeleteServer(t, http.StatusInternalServerError, huge)
+	err := OllamaDeleteModel(endpoint, "llama3")
 	if err == nil {
 		t.Fatal("a 500 must not report success")
 	}
