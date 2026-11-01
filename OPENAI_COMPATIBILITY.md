@@ -125,7 +125,8 @@ For OpenAI-compatible engines the request is forwarded through an allow-list tha
 tool-calling and structured-output fields (`tools`, `tool_choice`, `parallel_tool_calls`,
 `response_format`, `logit_bias`, `logprobs`, `top_logprobs`, `n`, `user`, `service_tier`,
 `max_completion_tokens`, `provider_options`) — whether they work depends on the upstream engine, not
-on Gateway42. Anything outside that list is dropped.
+on Gateway42. Anything outside that list is dropped. `stream` is always forwarded as a boolean, `false`
+when the client omitted it, never `null`.
 
 For Ollama engines, parameters are instead mapped into Ollama's `options` object:
 

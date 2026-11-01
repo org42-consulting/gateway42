@@ -18,7 +18,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // ─────────────────────────────── CORS preflight ────────────────────────────────
@@ -186,22 +188,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if adapter.Type() == EngineOllama {
 		engineReq = openAIToOllama(data, messages)
 	} else {
-		engineReq = map[string]interface{}{
-			"model":    data["model"],
-			"messages": messages,
-			"stream":   data["stream"],
-		}
-		// pass through recognized OpenAI params
-		for key := range data {
-			switch key {
-			case "model", "messages", "stream", "temperature", "top_p", "seed", "max_tokens",
-				"max_completion_tokens", "frequency_penalty", "presence_penalty", "stop",
-				"provider_options", "response_format", "service_tier", "logit_bias", "tools",
-				"tool_choice", "logprobs", "top_logprobs", "parallel_tool_calls",
-				"user", "n":
-				engineReq[key] = data[key]
-			}
-		}
+		engineReq = openAICompatRequest(data, messages)
 	}
 
 	if streaming, _ := data["stream"].(bool); streaming {
@@ -241,6 +228,35 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	logInteraction(user.ID, marshalAudit(messages), marshalAudit(payload), model)
 	jsonResponse(w, 200, payload)
+}
+
+// openAICompatRequest builds the body for an OpenAI-compatible engine: the
+// sanitised messages plus the client's parameters that are on the allow-list.
+//
+// model, messages and stream are set here and deliberately absent from the
+// allow-list. messages used to be on it, which overwrote the sanitised slice
+// with the client's raw one, so truncation never reached this engine type.
+// stream is always a bool: the handler reads a missing value as "not
+// streaming", and forwarding the absence as null would leave the upstream to
+// decide — or, on a strict one, reject the request.
+func openAICompatRequest(data map[string]interface{}, messages []map[string]interface{}) map[string]interface{} {
+	streaming, _ := data["stream"].(bool)
+	req := map[string]interface{}{
+		"model":    data["model"],
+		"messages": messages,
+		"stream":   streaming,
+	}
+	for key := range data {
+		switch key {
+		case "temperature", "top_p", "seed", "max_tokens",
+			"max_completion_tokens", "frequency_penalty", "presence_penalty", "stop",
+			"provider_options", "response_format", "service_tier", "logit_bias", "tools",
+			"tool_choice", "logprobs", "top_logprobs", "parallel_tool_calls",
+			"user", "n":
+			req[key] = data[key]
+		}
+	}
+	return req
 }
 
 // streamCompletion relays a streaming completion to the client as SSE.
@@ -286,6 +302,20 @@ func streamCompletion(w http.ResponseWriter, r *http.Request, adapter Engine,
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
+	// Audited on every exit from here on, including a client that hangs up:
+	// the interaction log is a record of what each client was told, and a
+	// partial answer is still something it was told. outcome marks a
+	// completion that did not end normally.
+	audit := streamAudit{limit: cfg.MaxMsgLen}
+	var outcome string
+	defer func() {
+		resp := audit.String()
+		if outcome != "" {
+			resp += "\n[" + outcome + "]"
+		}
+		logInteraction(userID, marshalAudit(messages), resp, model)
+	}()
+
 	for {
 		payload, err := stream.Recv()
 		if err == io.EOF {
@@ -299,6 +329,7 @@ func streamCompletion(w http.ResponseWriter, r *http.Request, adapter Engine,
 			if b, mErr := json.Marshal(openaiError("Stream interrupted", "api_error")); mErr == nil {
 				fmt.Fprintf(w, "data: %s\n\n", b)
 			}
+			outcome = "stream interrupted"
 			break
 		}
 		if _, err := fmt.Fprintf(w, "data: %s\n\n", payload); err != nil {
@@ -306,15 +337,17 @@ func streamCompletion(w http.ResponseWriter, r *http.Request, adapter Engine,
 			// Close and Release rather than writing into a dead connection
 			// for the rest of the completion.
 			slog.Info("client disconnected mid-stream", "model", model, "user", userID)
+			outcome = "client disconnected"
 			return
 		}
+		// Recorded after the write succeeds, so the audit holds what reached
+		// the client rather than what the engine produced.
+		audit.add(payload)
 		flusher.Flush()
 	}
 
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
-
-	logInteraction(userID, marshalAudit(messages), "streamed", model)
 }
 
 // sanitizeMessages bounds each message's text and keeps the fields a chat
@@ -383,3 +416,71 @@ func sanitizeContent(content interface{}) interface{} {
 	}
 	return nil
 }
+
+// streamAudit rebuilds a streamed completion for the interaction log from the
+// OpenAI-shaped chunks the client was sent: the content deltas joined, and
+// each tool call as "[tool_call name] arguments".
+//
+// It is capped at limit bytes because a stream has no length bound of its
+// own, and enqueueInteractionLog would truncate to MaxMsgLen anyway —
+// buffering past that only costs memory.
+type streamAudit struct {
+	limit int
+	buf   strings.Builder
+}
+
+// auditChunk is the subset of a chat.completion.chunk the audit reads.
+type auditChunk struct {
+	Choices []struct {
+		Delta struct {
+			Content   string `json:"content"`
+			ToolCalls []struct {
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
+		} `json:"delta"`
+	} `json:"choices"`
+}
+
+func (a *streamAudit) add(payload []byte) {
+	if a.buf.Len() >= a.limit {
+		return
+	}
+	var c auditChunk
+	if json.Unmarshal(payload, &c) != nil {
+		// Not a chunk (an upstream error object, say). The stream itself
+		// already relayed it; the audit records content only.
+		return
+	}
+	for _, ch := range c.Choices {
+		a.write(ch.Delta.Content)
+		// OpenAI streams a call as a name on its first fragment and argument
+		// fragments after; Ollama sends both at once. Writing the name when
+		// it appears and every fragment as it arrives reassembles both.
+		for _, tc := range ch.Delta.ToolCalls {
+			if tc.Function.Name != "" {
+				a.write("\n[tool_call " + tc.Function.Name + "] ")
+			}
+			a.write(tc.Function.Arguments)
+		}
+	}
+}
+
+// write appends s up to the limit, cutting on a rune boundary.
+func (a *streamAudit) write(s string) {
+	room := a.limit - a.buf.Len()
+	if room <= 0 || s == "" {
+		return
+	}
+	if len(s) > room {
+		for room > 0 && !utf8.RuneStart(s[room]) {
+			room--
+		}
+		s = s[:room]
+	}
+	a.buf.WriteString(s)
+}
+
+func (a *streamAudit) String() string { return strings.TrimPrefix(a.buf.String(), "\n") }

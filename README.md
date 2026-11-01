@@ -288,6 +288,8 @@ covers the standard fields plus the tool-calling and structured-output ones: `te
 `seed`, `max_tokens`, `max_completion_tokens`, `frequency_penalty`, `presence_penalty`, `stop`, `n`,
 `user`, `response_format`, `tools`, `tool_choice`, `parallel_tool_calls`, `logit_bias`, `logprobs`,
 `top_logprobs`, `service_tier`, and `provider_options`. Parameters outside the list are dropped.
+`stream` is always sent as an explicit boolean — `false` when the client omitted it — so the upstream
+answers in the shape the gateway expects to read.
 Whether an allowed parameter actually *works* depends on the upstream engine, not on Gateway42. —
 LM Studio and vLLM support different subsets.
 
@@ -622,7 +624,7 @@ Gateway42. maintains two layers of logs:
 
 **HTTP request log** — every API request to `/v1/` is recorded with: timestamp, client name, IP address, HTTP method, path, and response status code. Color-coded status badges make it easy to spot errors at a glance. This is what the main **Logs** page shows.
 
-**AI interaction log** — the prompt and response for each chat completion, stored per user. Accessible via the per-user **Export CSV** button on the Users page.
+**AI interaction log** — the prompt and response for each chat completion, stored per user. Accessible via the per-user **Export CSV** button on the Users page. For a streamed completion the response is what the client actually received — the content, plus each tool call as `[tool_call name] arguments` — and a stream that did not finish normally ends with `[stream interrupted]` or `[client disconnected]`.
 
 Note that the request log covers `/v1/` only. Admin page views are not recorded there — they appear
 in the application log instead.
@@ -736,6 +738,11 @@ The race detector works without a C toolchain because the SQLite driver is pure 
 | `tools_test.go` | The tool-use loop in both directions: message fields kept through sanitising, OpenAI → Ollama history translation (argument objects, `tool_name` from `tool_call_id`, image parts), `response_format` → `format`, and Ollama tool calls returned in OpenAI shape with cross-chunk indexes and `finish_reason: "tool_calls"`. |
 | `pull_csrf_test.go` | A model pull — a GET, so outside the CSRF middleware — is refused without the session's token. |
 | `metrics_auth_test.go` | `/metrics` access by admin session and by `GW42_METRICS_TOKEN`, and that an unset token is not an open door. |
+| `engine_save_test.go` | Against a real SQLite file: a failed read of the engine list aborts an add or remove instead of saving a list that drops every other engine. |
+| `compat_request_test.go` | The OpenAI-compatible request body: an explicit `stream` boolean, sanitised messages, and the parameter allow-list. |
+| `probe_cache_test.go` | A probe or routing index computed before an invalidation is discarded, so a pull or delete is visible at once. |
+| `stream_audit_test.go` | Streamed completions are audited with the text and tool calls the client received, including streams the client abandoned. |
+| `logout_test.go` | Logout is a POST behind the CSRF check, not a GET any page could trigger. |
 
 The template test matters more than it sounds: `html/template` resolves field names at render time,
 so a mistyped `{{.FieldName}}` is invisible until someone loads the page.
@@ -756,11 +763,11 @@ Single `package main`, one file per concern:
 
 | File | Lines | Responsibility |
 | ---- | ----- | -------------- |
-| `main.go` | 1004 | Config, routing table, middleware chain, panic recovery, server lifecycle, graceful shutdown. |
-| `handlers.go` | 1139 | Admin web UI handlers only. |
-| `api_handlers.go` | 385 | The `/v1/*` OpenAI-compatible surface. Separate from the admin UI so a change to one cannot alter the other's contract. |
-| `engine.go` | 917 | The `Engine` interface and its two adapters, plus the probe cache and stream implementations. |
-| `routing.go` | 186 | Model-name → engine resolution and the cached routing index. |
+| `main.go` | 1005 | Config, routing table, middleware chain, panic recovery, server lifecycle, graceful shutdown. |
+| `handlers.go` | 1153 | Admin web UI handlers only. |
+| `api_handlers.go` | 486 | The `/v1/*` OpenAI-compatible surface. Separate from the admin UI so a change to one cannot alter the other's contract. |
+| `engine.go` | 945 | The `Engine` interface and its two adapters, plus the probe cache and stream implementations. |
+| `routing.go` | 217 | Model-name → engine resolution and the cached routing index. |
 | `openai.go` | 466 | Request and response translation between OpenAI and Ollama shapes. |
 | `types.go` | 156 | Typed structs for responses Gateway42. authors. |
 | `db.go` | 821 | Schema, migrations, both connection pools, queries, FTS5 setup, retention pruning. |
