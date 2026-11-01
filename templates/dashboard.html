@@ -6,16 +6,16 @@
 
 <!-- Engine Status -->
 <div id="engine-status" class="card mb-6">
-    <h2>Engine Status</h2>
+    <h2>Inference Engine Status</h2>
     <div class="table-wrap">
         <div class="scroll-x">
             <table class="data-table">
                 <thead>
                     <tr>
-                        <th style="width:100px;">Type</th>
+                        <th class="col-100">Type</th>
                         <th>Name</th>
-                        <th style="width:180px;">Endpoint</th>
-                        <th style="width:100px;">Status</th>
+                        <th class="col-180">Endpoint</th>
+                        <th class="col-100">Status</th>
                         <th>Models</th>
                     </tr>
                 </thead>
@@ -24,7 +24,7 @@
                     <tr>
                         <td><span class="model-tag">{{.Type}}</span></td>
                         <td>{{.Name}}</td>
-                        <td class="text-hint" style="white-space:normal;">{{index $.EngineURLs (printf "%d" .ID)}}</td>
+                        <td class="text-hint wraps">{{index $.EngineURLs (printf "%d" .ID)}}</td>
                         <td>
                             {{if index $.EngineStatus (printf "%d" .ID)}}
                                 <span class="badge badge-active">ACTIVE</span>
@@ -43,7 +43,7 @@
                     </tr>
                     {{else}}
                     <tr>
-                        <td colspan="5" class="text-hint" style="text-align:center;padding:20px;">No engines configured. Add one in Settings.</td>
+                        <td colspan="5" class="text-hint empty-row">No engines configured. Add one in Settings.</td>
                     </tr>
                     {{end}}
                 </tbody>
@@ -61,7 +61,7 @@
             <thead>
                 <tr>
                     <th>Client Name</th>
-                    <th style="min-width:100px; max-width:200px;">Status</th>
+                    <th class="col-badge">Status</th>
                     <th>Rate / min</th>
                     <th>Actions</th>
                 </tr>
@@ -81,12 +81,12 @@
                 <td>
                     <form action="/admin/update-rate-limit/{{.ID}}" method="post" class="form-inline">
                         <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
-                        <input type="number" name="rate_limit" value="{{.RateLimit}}" min="1" max="1000" style="width: 60px; padding: 3px;">
+                        <input type="number" name="rate_limit" value="{{.RateLimit}}" min="1" max="1000" class="rate-input">
                         <button type="submit" class="btn-small btn-ghost">Update</button>
                     </form>
                 </td>
                 <td>
-                    <div class="flex-row" style="gap:6px;">
+                    <div class="flex-row row-actions">
                         <form action="/admin/reset/{{.ID}}" method="post" class="form-inline">
                             <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
                             <button type="submit" class="btn-small btn-warning">New API Key</button>

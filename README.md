@@ -745,6 +745,7 @@ The race detector works without a C toolchain because the SQLite driver is pure 
 | `probe_cache_test.go` | A probe or routing index computed before an invalidation is discarded, so a pull or delete is visible at once. |
 | `stream_audit_test.go` | Streamed completions are audited with the text and tool calls the client received, including streams the client abandoned. |
 | `logout_test.go` | Logout is a POST behind the CSRF check, not a GET any page could trigger. |
+| `static_css_test.go` | No template contains a `<style>` block or `style` attribute, both layouts link the stylesheet, and the router serves it as `text/css`. |
 | `compat_baseurl_test.go` | OpenAI-compatible base URLs work with or without `/v1` (a proxy prefix is kept), and Test Saved Engines names the upstream status and guides an admin with nothing saved. |
 
 The template test matters more than it sounds: `html/template` resolves field names at render time,
@@ -780,8 +781,19 @@ Single `package main`, one file per concern:
 | `ratelimit.go` | 89 | Per-user token buckets. |
 | `metrics.go` | 181 | Prometheus collectors and the path bucketer. |
 
-Templates and static images are compiled into the binary with `embed.FS`, so deployment is a single
-file with no asset directory to ship alongside it.
+Templates, static images and the stylesheet are compiled into the binary with `embed.FS`, so
+deployment is a single file with no asset directory to ship alongside it.
+
+All page styling lives in one file, `static/gateway42.css`, served at `/static/gateway42.css` and
+linked by both layouts (`base.html` and the standalone `login.html`). Templates carry no `<style>`
+blocks or `style` attributes, and `static_css_test.go` keeps it that way. Two cascade rules to keep in
+mind when editing it:
+
+- **The `<link>` must stay above Tailwind's.** The Play CDN appends its own stylesheet at the end of
+  `<head>`, after ours, so its preflight wins ties with equally specific selectors. Scope a rule
+  (`.help-section code`, not `code`) rather than relying on order.
+- **The login page shares the file.** Its differences are scoped under `body.login-page`, including
+  undoing base rules it never had (the card hover glow, `.btn` line-height).
 
 
 ## Known Design Constraints
