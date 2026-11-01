@@ -37,7 +37,7 @@
                             <span class="model-tag">{{.}}</span>
                             {{end}}
                             {{if not (index $.EngineModels (printf "%d" .ID))}}
-                                {{if $.Engines}}<span class="text-hint">No models</span>{{else}}<span class="text-hint">No engines configured</span>{{end}}
+                                <span class="text-hint">No models</span>
                             {{end}}
                         </td>
                     </tr>

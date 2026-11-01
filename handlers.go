@@ -467,6 +467,7 @@ func handleEngineSettings(w http.ResponseWriter, r *http.Request) {
 			ec.APIKey = apiKey
 		}
 		engines = append(engines, ec)
+		editID = newID
 	}
 
 	if err := saveEngines(engines); err != nil {
@@ -678,8 +679,9 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 // response that created it.
 //
 // The key must not travel any other way. A flash would put it in the session
-// cookie, which is signed but readable, and which the browser keeps re-sending
-// until the flash is next rendered; the database only ever holds its hash. No
+// cookie, which the browser keeps re-sending until the flash is next rendered
+// — encrypted, but still a copy stored outside this response; the database
+// only ever holds its hash. No
 // caching, for the same reason: this page is the key's only plaintext copy.
 func writeAPIKeyPage(w http.ResponseWriter, heading, name, apiKey string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")

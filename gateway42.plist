@@ -22,17 +22,21 @@
     <key>RunAtLoad</key>
     <true/>
 
+    <!-- Restart on a crash, but not after a clean stop (matches install.sh). -->
     <key>KeepAlive</key>
-    <false/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
 
     <key>WorkingDirectory</key>
     <string>/Users/org42/.gateway42</string>
 
     <key>StandardOutPath</key>
-    <string>/Users/org42/Library/Logs/gateway42/gateway42.log</string>
+    <string>/Users/org42/Library/Logs/gateway42/gateway.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/org42/Library/Logs/gateway42/gateway42.err.log</string>
+    <string>/Users/org42/Library/Logs/gateway42/gateway.log</string>
 
     <key>EnvironmentVariables</key>
     <dict>
@@ -40,6 +44,9 @@
         <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>GW42_DB_PATH</key>
         <string>/Users/org42/.gateway42/db/gateway.db</string>
+        <!-- Same file as stderr above; gateway42 detects that and writes once. -->
+        <key>LOG_FILE</key>
+        <string>/Users/org42/Library/Logs/gateway42/gateway.log</string>
     </dict>
 </dict>
 </plist>

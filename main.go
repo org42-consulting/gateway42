@@ -728,7 +728,7 @@ func setupRouter() *mux.Router {
 	r.HandleFunc("/", handleIndex).Methods("GET")
 	r.HandleFunc("/health", handleHealth).Methods("GET")
 	r.HandleFunc("/admin", handleAdminLogin).Methods("POST")
-	r.HandleFunc("/logout", handleLogout).Methods("GET")
+	r.HandleFunc("/logout", handleLogout).Methods("POST")
 
 	// Admin UI
 	r.HandleFunc("/admin/panel", handleAdminPanel).Methods("GET")

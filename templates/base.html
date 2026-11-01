@@ -476,7 +476,10 @@
                 <span class="tagline">An opinionated gateway for any LLM.</span>
             </div>
             <div class="ml-auto">
-                <form action="/logout" method="get">
+                <!-- POST, not a link: logout changes session state, so it goes
+                     through the CSRF check like every other admin action. -->
+                <form action="/logout" method="post">
+                    <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
                     <button class="btn btn-danger">Logout</button>
                 </form>
             </div>
