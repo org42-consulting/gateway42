@@ -175,7 +175,8 @@
                 <td><strong>OpenAI-compatible</strong></td>
                 <td>
                     Any endpoint that speaks the OpenAI API — oMLX, LM Studio, vLLM, or the real OpenAI API.
-                    Provide the base URL and an API key if required. Requests pass through without translation.
+                    Provide the base URL and an API key if required. The base URL works with or without its
+                    <code>/v1</code>. Requests pass through without translation.
                 </td>
             </tr>
         </tbody>
@@ -187,7 +188,7 @@
         <li><strong>Add</strong> — name it, select the type, and provide the URL/host, port (Ollama), and API key (OpenAI-compatible).</li>
         <li><strong>Edit</strong> — update an existing engine's connection details or API key. Leave the API key blank to keep the current one; it is never shown back.</li>
         <li><strong>Remove</strong> — delete an engine you no longer need.</li>
-        <li><strong>Test</strong> — probe connectivity and see which models the engine reports.</li>
+        <li><strong>Test Saved Engines</strong> — probe every engine already added. Typed-in values are not tested; click <em>Add Engine</em> first. A refusal shows the engine's status and reason, e.g. <code>401 Unauthorized: Invalid API key</code>.</li>
     </ul>
 
     <h3>Engine Selection</h3>

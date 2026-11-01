@@ -602,8 +602,7 @@ func (a *OllamaAdapter) Status() (bool, error) {
 			return err
 		}
 		defer resp.Body.Close()
-		up = resp.StatusCode == 200
-		return nil
+		return statusErr(resp, &up)
 	})
 	return up, err
 }
@@ -727,12 +726,21 @@ func (a *OpenAICompatAdapter) baseURL() string {
 	return strings.TrimRight(a.upstream(""), "/")
 }
 
+// upstream joins the engine's base URL with an API path such as
+// "/v1/models".
+//
+// The base may be given with or without its /v1: OpenAI-compatible servers
+// (oMLX, LM Studio, vLLM) and the OpenAI SDKs all document the base URL as
+// "http://host:port/v1", while every path here already starts with /v1. A
+// trailing /v1 is therefore dropped from the base, not the path, so a prefix
+// in front of it (a proxy mount like /openai/v1) survives. Normalising here
+// rather than when the form is saved also repairs engines stored that way.
 func (a *OpenAICompatAdapter) upstream(path string) string {
-	u := a.cfg.BaseURL
+	u := strings.TrimSpace(a.cfg.BaseURL)
 	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
 		u = "http://" + u
 	}
-	u = strings.TrimRight(u, "/")
+	u = strings.TrimSuffix(strings.TrimRight(u, "/"), "/v1")
 	if path == "" || path == "/" {
 		return u
 	}
@@ -762,8 +770,7 @@ func (a *OpenAICompatAdapter) Status() (bool, error) {
 			return err
 		}
 		defer resp.Body.Close()
-		up = resp.StatusCode == 200
-		return nil
+		return statusErr(resp, &up)
 	})
 	return up, err
 }
@@ -911,6 +918,18 @@ func OllamaDeleteModel(endpoint, model string) error {
 	return nil
 }
 
+// statusErr turns a health-probe response into the Status result. A non-200
+// is an error naming the status and the upstream's reason, not a bare
+// "down": the engine was reached and refused, and only the status tells a
+// wrong API key (401) from a wrong base URL (404).
+func statusErr(resp *http.Response, up *bool) error {
+	*up = resp.StatusCode == http.StatusOK
+	if *up {
+		return nil
+	}
+	return fmt.Errorf("engine returned %s%s", resp.Status, upstreamErrDetail(resp.Body))
+}
+
 // upstreamErrDetail reads a bounded excerpt of an error response body and
 // formats it for appending to an error message, or returns "" when the body
 // adds nothing the status has not already said.
@@ -924,14 +943,24 @@ func upstreamErrDetail(body io.Reader) string {
 	if err != nil || len(raw) == 0 {
 		return ""
 	}
-	// Ollama puts the reason in a JSON "error" field. Anything that does not
-	// parse is shown as-is, so an unexpected upstream is still diagnosable.
+	// Ollama puts the reason in a JSON "error" string; OpenAI-compatible
+	// engines nest it as error.message. Anything that matches neither is
+	// shown as-is, so an unexpected upstream is still diagnosable.
 	var payload struct {
-		Error string `json:"error"`
+		Error json.RawMessage `json:"error"`
 	}
 	msg := string(raw)
-	if json.Unmarshal(raw, &payload) == nil && payload.Error != "" {
-		msg = payload.Error
+	if json.Unmarshal(raw, &payload) == nil && len(payload.Error) > 0 {
+		var flat string
+		var nested struct {
+			Message string `json:"message"`
+		}
+		switch {
+		case json.Unmarshal(payload.Error, &flat) == nil && flat != "":
+			msg = flat
+		case json.Unmarshal(payload.Error, &nested) == nil && nested.Message != "":
+			msg = nested.Message
+		}
 	}
 	// Collapse to a single line: this ends up in a one-line flash.
 	msg = strings.Join(strings.Fields(msg), " ")

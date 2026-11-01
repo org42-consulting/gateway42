@@ -35,7 +35,9 @@
         <div class="flex-row" style="padding-top:4px;">
             <button class="btn btn-primary" type="submit" id="save-btn">Add Engine</button>
             <button class="btn btn-ghost" type="button" id="cancel-edit-btn" style="display:none;">Cancel Edit</button>
-            <a href="/admin/engine-test" class="btn btn-ghost">Test Connectivity</a>
+            <!-- A link, not a submit: it tests engines already saved, never the
+                 values typed into this form. -->
+            <a href="/admin/engine-test" class="btn btn-ghost" title="Tests saved engines; click Add Engine first">Test Saved Engines</a>
         </div>
     </form>
 </div>
@@ -213,7 +215,8 @@
         const isOllama = sel.value === 'ollama';
         portField.style.display = isOllama ? '' : 'none';
         apiKeyField.style.display = isOllama ? 'none' : '';
-        baseUrlInput.placeholder = isOllama ? 'e.g., http://127.0.0.1' : 'e.g., http://127.0.0.1:8000';
+        // With or without /v1 both work for OpenAI-compatible engines.
+        baseUrlInput.placeholder = isOllama ? 'e.g., http://127.0.0.1' : 'e.g., http://127.0.0.1:8000/v1';
     }
 
     sel.addEventListener('change', update);

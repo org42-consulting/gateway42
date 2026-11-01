@@ -184,6 +184,8 @@ Point the gateway at a local (or LAN-accessible) Ollama instance. You need the h
 
 Any endpoint that speaks the OpenAI API format — oMLX, LM Studio, vLLM, or the real OpenAI API. Provide the base URL and an API key if the endpoint requires one. Requests pass through directly without translation.
 
+The base URL works with or without its `/v1` — `http://127.0.0.1:8000/v1` (how oMLX, LM Studio and the OpenAI SDKs write it) and `http://127.0.0.1:8000` reach the same endpoints. A path prefix in front of `/v1`, such as a proxy mount at `/openai/v1`, is kept.
+
 ### Engine selection
 
 When a request arrives at `/v1/chat/completions`, Gateway42. routes it to an engine that actually holds the requested model. The routing table is built from the same health probes that feed the dashboard, so adding a model to an engine makes it routable without configuring anything — and without a restart. When two engines report the same model, the one added first wins.
@@ -613,7 +615,7 @@ The Settings page is where you configure your inference backends. For each engin
 - **Add** a new Ollama or OpenAI-compatible engine — name it, provide the URL and (for Ollama) the port
 - **Edit** an existing engine's connection details or API key — leave the key blank to keep the current one
 - **Remove** an engine you no longer need
-- **Test** connectivity and see which models the engine reports
+- **Test Saved Engines** — probes every engine already added. It does not test values typed into the form; add the engine first. A refusal is reported with the engine's status and reason (e.g. `401 Unauthorized: Invalid API key`), so a wrong key and a wrong URL are told apart
 - **Manage Ollama models** — search ollama.com, download with live progress, and delete models to free disk space. With several Ollama engines, a selector next to *Search* picks which one a pull lands on; a pulled model is routable as soon as the pull ends
 
 <img width="1554" height="806" alt="Image" src="https://github.com/user-attachments/assets/d99401c0-f270-4da4-837f-9a7568643520" />
@@ -743,6 +745,7 @@ The race detector works without a C toolchain because the SQLite driver is pure 
 | `probe_cache_test.go` | A probe or routing index computed before an invalidation is discarded, so a pull or delete is visible at once. |
 | `stream_audit_test.go` | Streamed completions are audited with the text and tool calls the client received, including streams the client abandoned. |
 | `logout_test.go` | Logout is a POST behind the CSRF check, not a GET any page could trigger. |
+| `compat_baseurl_test.go` | OpenAI-compatible base URLs work with or without `/v1` (a proxy prefix is kept), and Test Saved Engines names the upstream status and guides an admin with nothing saved. |
 
 The template test matters more than it sounds: `html/template` resolves field names at render time,
 so a mistyped `{{.FieldName}}` is invisible until someone loads the page.
