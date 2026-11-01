@@ -163,7 +163,10 @@ func handleEngineTest(w http.ResponseWriter, r *http.Request) {
 	}
 	engines := cachedEngines()
 	if len(engines) == 0 {
-		addFlash(w, r, "error", "No engines configured")
+		// Only saved engines are tested. The button sits in the add form, so
+		// say that, rather than leave the admin wondering why the engine they
+		// just typed in "is not configured".
+		addFlash(w, r, "error", "No engines saved yet. Test Saved Engines only checks engines already added — click Add Engine first, then test.")
 		http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
 		return
 	}
@@ -176,7 +179,7 @@ func handleEngineTest(w http.ResponseWriter, r *http.Request) {
 		}
 		status, err := adapter.Status()
 		if err != nil {
-			results = append(results, fmt.Sprintf("%s: unreachable (%v)", e.Name, err))
+			results = append(results, fmt.Sprintf("%s: failed (%v)", e.Name, err))
 			continue
 		}
 		if status {

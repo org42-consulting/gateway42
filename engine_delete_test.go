@@ -98,3 +98,14 @@ func TestUpstreamErrDetailEmptyBody(t *testing.T) {
 		t.Errorf("whitespace-only body should add nothing, got %q", got)
 	}
 }
+
+// OpenAI-compatible engines nest the reason one level down, in the error
+// envelope Gateway42 itself emits. Showing that raw JSON in a flash buries the
+// one line the admin needs.
+func TestUpstreamErrDetailOpenAIEnvelope(t *testing.T) {
+	got := upstreamErrDetail(strings.NewReader(
+		`{"error":{"message":"Invalid API key","type":"authentication_error","code":null}}`))
+	if got != ": Invalid API key" {
+		t.Errorf("upstreamErrDetail = %q, want \": Invalid API key\"", got)
+	}
+}
