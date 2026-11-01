@@ -403,6 +403,13 @@ type probeEntry struct {
 var (
 	probeCacheMu sync.Mutex
 	probeCache   = map[int]probeEntry{}
+
+	// probeGen counts invalidations, guarded by probeCacheMu. A refresh
+	// records it when it starts and stores its result only if it has not
+	// moved: a probe that was already in flight when a pull or delete
+	// invalidated the cache read the engine as it was before, and storing
+	// that would undo the invalidation for another probeCacheTTL.
+	probeGen uint64
 )
 
 // probeEngineCached returns probe data for the given engine ID, refreshing
@@ -433,8 +440,9 @@ func probeEngineCached(id int, e Engine) probeData {
 		done := make(chan struct{})
 		entry.inflight = done
 		probeCache[id] = entry
+		gen := probeGen
 		probeCacheMu.Unlock()
-		return refreshProbe(id, e, done)
+		return refreshProbe(id, e, done, gen)
 	}
 }
 
@@ -442,12 +450,19 @@ func probeEngineCached(id int, e Engine) probeData {
 // blocked on done. If the probe panics it clears the entry rather than
 // leaving an in-flight marker behind a closed channel, which would spin
 // waiters forever.
-func refreshProbe(id int, e Engine, done chan struct{}) probeData {
-	stored := false
+//
+// gen is probeGen as it was when the refresh was published. If the cache has
+// been invalidated since, the in-flight marker went with the old map: the
+// result is returned to this caller but not stored, and nothing is deleted,
+// since any entry now under id belongs to a newer refresh.
+func refreshProbe(id int, e Engine, done chan struct{}, gen uint64) probeData {
+	finished := false
 	defer func() {
-		if !stored {
+		if !finished {
 			probeCacheMu.Lock()
-			delete(probeCache, id)
+			if probeGen == gen {
+				delete(probeCache, id)
+			}
 			probeCacheMu.Unlock()
 		}
 		close(done)
@@ -456,11 +471,13 @@ func refreshProbe(id int, e Engine, done chan struct{}) probeData {
 	data := probeEngineFull(e)
 
 	probeCacheMu.Lock()
-	probeCache[id] = probeEntry{
-		probeData: data,
-		expiry:    time.Now().Add(probeCacheTTL),
+	if probeGen == gen {
+		probeCache[id] = probeEntry{
+			probeData: data,
+			expiry:    time.Now().Add(probeCacheTTL),
+		}
 	}
-	stored = true
+	finished = true
 	probeCacheMu.Unlock()
 	return data
 }
@@ -470,6 +487,7 @@ func refreshProbe(id int, e Engine, done chan struct{}) probeData {
 func invalidateProbeCache() {
 	probeCacheMu.Lock()
 	probeCache = map[int]probeEntry{}
+	probeGen++
 	probeCacheMu.Unlock()
 	// The routing index is derived from probe data, so it is stale the moment
 	// the probes are. Dropping it here is what makes a freshly pulled model

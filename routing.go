@@ -40,7 +40,33 @@ type routeIndex struct {
 var (
 	routeIndexPtr   atomic.Pointer[routeIndex]
 	routeRefreshing atomic.Bool
+
+	// routeGen counts invalidations, guarded by routeMu. A build records it
+	// before probing and is stored only if it has not moved, so an index
+	// assembled from probes taken before a pull or delete cannot replace the
+	// nil that invalidation left behind. The check and the store share the
+	// lock; an atomic counter alone would leave a gap between them.
+	routeMu  sync.Mutex
+	routeGen uint64
 )
+
+// routeIndexGeneration returns the current invalidation count, to be passed
+// to storeRouteIndex once the index built after reading it is ready.
+func routeIndexGeneration() uint64 {
+	routeMu.Lock()
+	defer routeMu.Unlock()
+	return routeGen
+}
+
+// storeRouteIndex publishes idx unless the index has been invalidated since
+// gen was read.
+func storeRouteIndex(idx *routeIndex, gen uint64) {
+	routeMu.Lock()
+	defer routeMu.Unlock()
+	if routeGen == gen {
+		routeIndexPtr.Store(idx)
+	}
+}
 
 // buildRouteIndex probes every configured engine and assembles the index.
 // Callers must not hold probeCacheMu.
@@ -96,8 +122,9 @@ func currentRouteIndex() *routeIndex {
 	if idx == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		gen := routeIndexGeneration()
 		idx = buildRouteIndex(ctx)
-		routeIndexPtr.Store(idx)
+		storeRouteIndex(idx, gen)
 		return idx
 	}
 	if time.Since(idx.built) > routeIndexTTL {
@@ -116,13 +143,17 @@ func refreshRouteIndexAsync() {
 		defer routeRefreshing.Store(false)
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		routeIndexPtr.Store(buildRouteIndex(ctx))
+		gen := routeIndexGeneration()
+		storeRouteIndex(buildRouteIndex(ctx), gen)
 	}()
 }
 
 // invalidateRouteIndex drops the index so the next lookup rebuilds it. Called
 // alongside invalidateProbeCache whenever engines or models change.
 func invalidateRouteIndex() {
+	routeMu.Lock()
+	defer routeMu.Unlock()
+	routeGen++
 	routeIndexPtr.Store(nil)
 }
 
