@@ -4,12 +4,12 @@
 <div class="flash flash-{{.Category}}">{{.Message}}</div>
 {{end}}
 
-<div class="card" style="margin-top:24px;">
+<div class="card card-mt">
     <h2>Request Logs</h2>
     <!-- Search + refresh control -->
-    <form method="get" action="/admin/logs" style="margin-bottom:20px;">
-        <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-            <input type="text" name="q" id="search-input" value="{{.Search}}" placeholder="Search client name, path or IP…" style="max-width:400px;">
+    <form method="get" action="/admin/logs" class="logs-search">
+        <div class="toolbar-row">
+            <input type="text" name="q" id="search-input" value="{{.Search}}" placeholder="Search client name, path or IP…" class="search-input">
             <button class="btn btn-primary" type="submit">Search</button>
             {{if .Search}}
                 <a href="/admin/logs" class="btn btn-ghost">Clear</a>
@@ -17,64 +17,58 @@
             <a href="/admin/export-logs" class="btn btn-primary">Export CSV</a>
             <button type="submit" form="reset-system-form" class="btn btn-danger"
                     onclick="return confirm('This will permanently delete all logs and reset all rate-limit counters. This cannot be undone. Continue?')">Reset System</button>
-            <div style="margin-left:auto; display:flex; align-items:center; gap:8px;">
-                <label style="display:inline; margin:0; white-space:nowrap;">Auto-refresh:</label>
-                <select id="refresh-interval"
-                        style="background:rgba(255,255,255,.08); border:1px solid rgba(255,255,255,.15);
-                               border-radius:var(--radius-sm); padding:6px 10px; color:rgba(255,255,255,.9);
-                               font-family:'Mulish',sans-serif; font-size:.8125rem; cursor:pointer; outline:none;">
+            <div class="toolbar-right">
+                <label class="inline">Auto-refresh:</label>
+                <select id="refresh-interval" class="select-sm">
                     <option value="0">Off</option>
                     <option value="5000">5s</option>
                     <option value="10000" selected>10s</option>
                     <option value="30000">30s</option>
                     <option value="60000">60s</option>
                 </select>
-                <span id="refresh-indicator" style="font-size:.75rem; color:rgba(255,255,255,.35); white-space:nowrap;"></span>
+                <span id="refresh-indicator" class="text-hint"></span>
             </div>
         </div>
     </form>
-    <form id="reset-system-form" action="/admin/reset-system" method="post" style="display:none;">
+    <form id="reset-system-form" action="/admin/reset-system" method="post" class="is-hidden">
         <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
         <input type="hidden" name="next" value="admin_logs">
     </form>
 
-    <div id="logs-table" style="padding:0; overflow:hidden; border-radius:var(--radius-sm) !important;">
-        <div style="text-align:center; padding:40px; color:rgba(255,255,255,.35);">Loading…</div>
+    <div id="logs-table" class="table-wrap">
+        <div class="table-empty">Loading…</div>
     </div>
-    <div id="logs-pagination" style="display:flex; align-items:center; gap:6px; margin-top:12px; flex-wrap:wrap;"></div>
-    <p id="logs-count" style="font-size:.75rem; color:rgba(255,255,255,.35); margin-top:6px;"></p>
+    <div id="logs-pagination" class="pagination"></div>
+    <p id="logs-count" class="table-count"></p>
 </div>
 
 
-<div class="card" style="margin-top:24px;">
+<div class="card card-mt">
     <h2>System Logs</h2>
-    <div style="display:flex; gap:10px; align-items:center; margin-bottom:20px; flex-wrap:wrap;">
-        <input type="text" id="syslog-search" placeholder="Search message…" style="max-width:400px;">
+    <div class="toolbar">
+        <input type="text" id="syslog-search" placeholder="Search message…" class="search-input">
         <button class="btn btn-primary" id="syslog-search-btn">Search</button>
-        <button class="btn btn-ghost" id="syslog-clear-btn" style="display:none;">Clear</button>
+        <button class="btn btn-ghost is-hidden" id="syslog-clear-btn">Clear</button>
         <a href="/admin/logs/system/export" id="syslog-export-btn" class="btn btn-primary">Export CSV</a>
         <button class="btn btn-danger" id="syslog-reset-btn">Reset Logs</button>
-        <div style="margin-left:auto; display:flex; align-items:center; gap:8px;">
-            <label style="display:inline; margin:0; white-space:nowrap;">Auto-refresh:</label>
-            <select id="syslog-refresh-interval"
-                    style="background:rgba(255,255,255,.08); border:1px solid rgba(255,255,255,.15);
-                           border-radius:var(--radius-sm); padding:6px 10px; color:rgba(255,255,255,.9);
-                           font-family:'Mulish',sans-serif; font-size:.8125rem; cursor:pointer; outline:none;">
+        <div class="toolbar-right">
+            <label class="inline">Auto-refresh:</label>
+            <select id="syslog-refresh-interval" class="select-sm">
                 <option value="0">Off</option>
                 <option value="5000">5s</option>
                 <option value="10000" selected>10s</option>
                 <option value="30000">30s</option>
                 <option value="60000">60s</option>
             </select>
-            <span id="syslog-refresh-indicator" style="font-size:.75rem; color:rgba(255,255,255,.35); white-space:nowrap;"></span>
+            <span id="syslog-refresh-indicator" class="text-hint"></span>
         </div>
     </div>
 
-    <div id="syslog-table" style="padding:0; overflow:hidden; border-radius:var(--radius-sm) !important;">
-        <div style="text-align:center; padding:40px; color:rgba(255,255,255,.35);">Loading…</div>
+    <div id="syslog-table" class="table-wrap">
+        <div class="table-empty">Loading…</div>
     </div>
-    <div id="syslog-pagination" style="display:flex; align-items:center; gap:6px; margin-top:12px; flex-wrap:wrap;"></div>
-    <p id="syslog-count" style="font-size:.75rem; color:rgba(255,255,255,.35); margin-top:6px;"></p>
+    <div id="syslog-pagination" class="pagination"></div>
+    <p id="syslog-count" class="table-count"></p>
 </div>
 
 {{end}}
@@ -85,20 +79,16 @@
 function buildPagination(paginationEl, page, pages, onPageChange) {
     if (pages <= 1) { paginationEl.innerHTML = ''; return; }
 
-    const s = 'padding:4px 10px;border-radius:var(--radius-sm);cursor:pointer;font-size:.8125rem;' +
-              "font-family:'Mulish',sans-serif;border:1px solid rgba(255,255,255,.15);";
-    const btn = (label, p, active, disabled) => {
-        const style = s + (active   ? 'background:rgba(255,255,255,.18);color:rgba(255,255,255,.95);'
-                                    : 'background:rgba(255,255,255,.06);color:rgba(255,255,255,.55);');
-        return `<button style="${style}" data-page="${p}"${disabled ? ' disabled' : ''}>${label}</button>`;
-    };
+    const btn = (label, p, active, disabled) =>
+        `<button class="page-btn${active ? ' is-current' : ''}" data-page="${p}"${disabled ? ' disabled' : ''}>${label}</button>`;
+    const gap = '<span class="page-gap">…</span>';
 
     const lo = Math.max(1, page - 2), hi = Math.min(pages, page + 2);
     let html = btn('&#8592; Prev', page - 1, false, page <= 1);
     if (lo > 1)        html += btn('1', 1, false, false);
-    if (lo > 2)        html += '<span style="color:rgba(255,255,255,.3);padding:0 4px;">…</span>';
+    if (lo > 2)        html += gap;
     for (let p = lo; p <= hi; p++) html += btn(p, p, p === page, false);
-    if (hi < pages-1)  html += '<span style="color:rgba(255,255,255,.3);padding:0 4px;">…</span>';
+    if (hi < pages-1)  html += gap;
     if (hi < pages)    html += btn(pages, pages, false, false);
     html += btn('Next &#8594;', page + 1, false, page >= pages);
 
@@ -125,33 +115,34 @@ function buildPagination(paginationEl, page, pages, onPageChange) {
                           .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     }
 
-    function statusColor(code) {
-        if (code >= 500) return 'rgba(255,90,90,.85)';
-        if (code >= 400) return 'rgba(255,190,60,.85)';
-        if (code >= 300) return 'rgba(180,180,255,.85)';
-        return 'rgba(100,220,130,.85)';
+    // Class for the status cell's colour; 2xx and anything else is the default.
+    function statusClass(code) {
+        if (code >= 500) return ' is-5xx';
+        if (code >= 400) return ' is-4xx';
+        if (code >= 300) return ' is-3xx';
+        return '';
     }
 
     function buildTable(logs, q) {
-        if (!logs.length) return `<div style="text-align:center;padding:40px;color:rgba(255,255,255,.35);">${
-            q ? `No logs match <strong style="color:rgba(255,255,255,.6);">${esc(q)}</strong>.`
+        if (!logs.length) return `<div class="table-empty">${
+            q ? `No logs match <strong class="empty-term">${esc(q)}</strong>.`
               : 'No requests logged yet.'}</div>`;
         const rows = logs.map(r => {
             const ts = (r.TS || '').slice(0, 19).replace('T', ' ');
             return `<tr>
-                <td style="white-space:nowrap;color:rgba(255,255,255,.45);font-size:.75rem;">${esc(ts)}</td>
-                <td style="color:rgba(255,255,255,.65);">${esc(r.Name || '—')}</td>
-                <td style="color:rgba(255,255,255,.55);">${esc(r.ClientIP || '')}</td>
-                <td style="white-space:nowrap;color:rgba(255,255,255,.55);">${esc(r.Method || '')}</td>
-                <td style="color:rgba(255,255,255,.65);">${esc(r.Path || '')}</td>
-                <td style="white-space:nowrap;color:${statusColor(r.Status)};font-weight:600;">${esc(String(r.Status || ''))}</td>
+                <td class="log-ts">${esc(ts)}</td>
+                <td class="log-client">${esc(r.Name || '—')}</td>
+                <td class="log-ip">${esc(r.ClientIP || '')}</td>
+                <td class="log-method">${esc(r.Method || '')}</td>
+                <td class="log-path">${esc(r.Path || '')}</td>
+                <td class="log-code${statusClass(r.Status)}">${esc(String(r.Status || ''))}</td>
             </tr>`;
         }).join('');
-        return `<div style="overflow-x:auto;"><table class="data-table">
+        return `<div class="scroll-x"><table class="data-table">
             <thead><tr>
-                <th style="width:160px;">Time</th><th style="width:140px;">Client</th>
-                <th style="width:140px;">IP</th><th style="width:80px;">Method</th>
-                <th>Path</th><th style="width:80px;">Status</th>
+                <th class="col-160">Time</th><th class="col-140">Client</th>
+                <th class="col-140">IP</th><th class="col-80">Method</th>
+                <th>Path</th><th class="col-80">Status</th>
             </tr></thead><tbody>${rows}</tbody></table></div>`;
     }
 
@@ -214,26 +205,27 @@ function buildPagination(paginationEl, page, pages, onPageChange) {
                           .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     }
 
-    function levelColor(level) {
-        if (level === 'ERROR' || level === 'ERROR+4') return 'rgba(255,90,90,.85)';
-        if (level === 'WARN'  || level === 'WARN+4')  return 'rgba(255,190,60,.85)';
-        return 'rgba(255,255,255,.65)';
+    // Class for the level cell's colour.
+    function levelClass(level) {
+        if (level === 'ERROR' || level === 'ERROR+4') return ' is-error';
+        if (level === 'WARN'  || level === 'WARN+4')  return ' is-warn';
+        return ' is-info';
     }
 
     function buildTable(logs, q) {
-        if (!logs.length) return `<div style="text-align:center;padding:40px;color:rgba(255,255,255,.35);">${
-            q ? `No entries match <strong style="color:rgba(255,255,255,.6);">${esc(q)}</strong>.`
+        if (!logs.length) return `<div class="table-empty">${
+            q ? `No entries match <strong class="empty-term">${esc(q)}</strong>.`
               : 'No system log entries yet.'}</div>`;
         const rows = logs.map(r => `<tr>
-            <td style="white-space:nowrap;color:rgba(255,255,255,.45);font-size:.75rem;">${esc(r.ts || '')}</td>
-            <td style="white-space:nowrap;color:${levelColor(r.level)};font-weight:600;">${esc(r.level || '')}</td>
-            <td style="color:rgba(255,255,255,.5);white-space:nowrap;">${esc(r.name || '')}</td>
+            <td class="log-ts">${esc(r.ts || '')}</td>
+            <td class="log-code${levelClass(r.level)}">${esc(r.level || '')}</td>
+            <td class="log-logger">${esc(r.name || '')}</td>
             <td>${esc(r.msg || '')}</td>
         </tr>`).join('');
-        return `<div style="overflow-x:auto;"><table class="data-table">
+        return `<div class="scroll-x"><table class="data-table">
             <thead><tr>
-                <th style="width:160px;">Time</th><th style="width:90px;">Level</th>
-                <th style="width:200px;">Logger</th><th>Message</th>
+                <th class="col-160">Time</th><th class="col-90">Level</th>
+                <th class="col-200">Logger</th><th>Message</th>
             </tr></thead><tbody>${rows}</tbody></table></div>`;
     }
 
@@ -272,7 +264,7 @@ function buildPagination(paginationEl, page, pages, onPageChange) {
     function doSearch() {
         currentQ = searchEl.value.trim();
         currentPage = 1;
-        clearBtn.style.display = currentQ ? '' : 'none';
+        clearBtn.classList.toggle('is-hidden', !currentQ);
         updateExportUrl(currentQ);
         refresh();
     }
@@ -282,7 +274,7 @@ function buildPagination(paginationEl, page, pages, onPageChange) {
 
     clearBtn.addEventListener('click', () => {
         searchEl.value = ''; currentQ = ''; currentPage = 1;
-        clearBtn.style.display = 'none';
+        clearBtn.classList.add('is-hidden');
         updateExportUrl('');
         refresh();
     });

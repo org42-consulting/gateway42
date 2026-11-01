@@ -37,6 +37,13 @@ var templateFS embed.FS
 //go:embed images
 var imageFS embed.FS
 
+// staticFS holds the stylesheet every page links. It is served from the
+// binary like the templates, so a page can never be paired with a stale or
+// missing stylesheet from disk.
+//
+//go:embed static
+var staticFS embed.FS
+
 // Template data structs
 
 // ─────────────────────────────── Configuration ─────────────────────────────────
@@ -717,6 +724,13 @@ func setupRouter() *mux.Router {
 	imgSub, _ := fs.Sub(imageFS, "images")
 	r.PathPrefix("/images/").Handler(
 		http.StripPrefix("/images/", http.FileServer(http.FS(imgSub))),
+	)
+
+	// Stylesheet. Public, like the images: the login page needs it before
+	// there is a session.
+	staticSub, _ := fs.Sub(staticFS, "static")
+	r.PathPrefix("/static/").Handler(
+		http.StripPrefix("/static/", http.FileServer(http.FS(staticSub))),
 	)
 
 	// CORS preflight

@@ -1,76 +1,5 @@
 {{define "content"}}
 
-<style>
-    .help-section { margin-bottom: 32px; }
-    .help-section p, .help-section li {
-        font-size: .875rem;
-        color: rgba(255,255,255,.75);
-        line-height: 1.7;
-    }
-    .help-section ul, .help-section ol {
-        padding-left: 20px;
-        margin-top: 8px;
-    }
-    .help-section li { margin-bottom: 4px; }
-    .help-section h3 {
-        font-size: .9375rem;
-        font-weight: 700;
-        color: var(--ai-electric);
-        margin: 20px 0 8px;
-    }
-    .help-table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-    .help-table th {
-        text-align: left;
-        font-size: .75rem;
-        font-weight: 700;
-        color: rgba(255,255,255,.4);
-        text-transform: uppercase;
-        letter-spacing: .05em;
-        padding: 8px 12px;
-        border-bottom: 1px solid rgba(255,255,255,.08);
-    }
-    .help-table td {
-        font-size: .8125rem;
-        color: rgba(255,255,255,.75);
-        padding: 8px 12px;
-        border-bottom: 1px solid rgba(255,255,255,.05);
-        vertical-align: top;
-    }
-    .help-table tr:last-child td { border-bottom: none; }
-    .help-table td:first-child { white-space: nowrap; }
-    code {
-        font-family: 'Courier New', monospace;
-        font-size: .8125rem;
-        background: rgba(0,0,0,.3);
-        border: 1px solid rgba(255,255,255,.1);
-        border-radius: 4px;
-        padding: 1px 6px;
-        color: var(--ai-electric);
-    }
-    pre {
-        background: rgba(0,0,0,.35);
-        border: 1px solid rgba(255,255,255,.08);
-        border-radius: var(--radius-sm);
-        padding: 14px 16px;
-        font-size: .8125rem;
-        color: rgba(255,255,255,.8);
-        overflow-x: auto;
-        margin-top: 8px;
-        line-height: 1.6;
-    }
-    .pill {
-        display: inline-block;
-        font-size: .7rem;
-        font-weight: 700;
-        padding: 2px 8px;
-        border-radius: 100px;
-        vertical-align: middle;
-        margin-left: 4px;
-    }
-    .pill-get  { background: rgba(74,222,128,.15); color: #4ade80; border: 1px solid rgba(74,222,128,.3); }
-    .pill-post { background: rgba(251,191,36,.15);  color: #fbbf24; border: 1px solid rgba(251,191,36,.3); }
-</style>
-
 <!-- Overview -->
 <div class="card help-section">
     <h2>Overview</h2>
@@ -93,7 +22,7 @@
 </div>
 
 <!-- Dashboard -->
-<div class="card help-section" style="margin-top:24px;">
+<div class="card help-section">
     <h2>Dashboard</h2>
     <p>The Dashboard is the main landing page after login. It shows two panels:</p>
 
@@ -152,7 +81,7 @@
 </div>
 
 <!-- Settings -->
-<div class="card help-section" style="margin-top:24px;">
+<div class="card help-section">
     <h2>Settings</h2>
     <p>
         The Settings page is where you configure your inference backends. Two engine types are supported.
@@ -237,7 +166,7 @@
 </div>
 
 <!-- Logs -->
-<div class="card help-section" style="margin-top:24px;">
+<div class="card help-section">
     <h2>Logs</h2>
     <p>
         Gateway42 maintains two layers of logs. The Logs page shows the <strong>HTTP request log</strong> —
@@ -290,7 +219,7 @@
 </div>
 
 <!-- API Usage -->
-<div class="card help-section" style="margin-top:24px;">
+<div class="card help-section">
     <h2>API Usage</h2>
     <p>
         Gateway42 exposes an OpenAI-compatible API. Any client or library that targets the OpenAI API
@@ -400,7 +329,7 @@ print(response.choices[0].message.content)</pre>
 </div>
 
 <!-- Rate Limiting -->
-<div class="card help-section" style="margin-top:24px;">
+<div class="card help-section">
     <h2>Rate Limiting</h2>
     <p>
         Gateway42 enforces a per-user <strong>token bucket</strong>. A user configured for <em>N</em>
@@ -423,7 +352,7 @@ print(response.choices[0].message.content)</pre>
 </div>
 
 <!-- Configuration -->
-<div class="card help-section" style="margin-top:24px;">
+<div class="card help-section">
     <h2>Configuration</h2>
     <p>Gateway42 is configured via environment variables. No variables are strictly required — sensible defaults are applied. Engine connections are managed through the admin UI, not environment variables.</p>
     <table class="help-table">
