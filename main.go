@@ -925,10 +925,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Engine cache (engines + their HTTP adapters). It is fine for this to
-	// return an error: it just means no engines are configured yet.
+	// Engine cache (engines + their HTTP adapters). No engines configured yet
+	// is not an error; one here means the list could not be read, so the
+	// gateway starts with none rather than refusing to start.
 	if err := reloadEngineCache(); err != nil {
-		slog.Info("Engine cache empty on startup", "err", err)
+		slog.Error("could not load engines on startup", "err", err)
 	}
 
 	// Templates

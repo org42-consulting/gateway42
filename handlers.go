@@ -416,7 +416,13 @@ func handleEngineSettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	engines, _ := getEngines()
+	engines, err := getEngines()
+	if err != nil {
+		slog.Error("getEngines", "err", err)
+		addFlash(w, r, "error", "Could not read the current engine list; nothing was changed")
+		http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
+		return
+	}
 
 	if isEdit {
 		// Update existing engine.
@@ -530,7 +536,13 @@ func handleRemoveEngine(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	engines, _ := getEngines()
+	engines, err := getEngines()
+	if err != nil {
+		slog.Error("getEngines", "err", err)
+		addFlash(w, r, "error", "Could not read the current engine list; nothing was changed")
+		http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
+		return
+	}
 	var filtered []EngineConfig
 	for _, e := range engines {
 		if e.ID != editID {

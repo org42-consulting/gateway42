@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -312,9 +314,17 @@ func (c *concurrencyLimiter) Release() {
 // ── Engine CRUD ───────────────────────────────────────────────────────────────
 
 // getEngines returns all configured engines from the DB.
+//
+// No row yet is the first-run state and comes back as an empty list, not an
+// error. Any other error must reach the caller: every engine edit is a
+// read-modify-write of this one value, so treating a failed read as "no
+// engines" and saving the result replaces the whole list.
 func getEngines() ([]EngineConfig, error) {
 	var val string
 	err := dbRead.QueryRow("SELECT value FROM settings WHERE key=?", "engines").Scan(&val)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}
