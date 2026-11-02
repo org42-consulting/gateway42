@@ -39,8 +39,6 @@ func isAllowed(userID, limit int) bool {
 		return false
 	}
 	rlReg.mu.Lock()
-	defer rlReg.mu.Unlock()
-
 	now := time.Now()
 	entry, ok := rlReg.m[userID]
 	if !ok || entry.limit != limit {
@@ -50,6 +48,13 @@ func isAllowed(userID, limit int) bool {
 		rlReg.m[userID] = entry
 	}
 	entry.lastUse = now
+	rlReg.mu.Unlock()
+
+	// Allow runs outside the registry lock on purpose. rate.Limiter has its
+	// own mutex, so holding both meant every API request in the process —
+	// for every user — queued through one global lock twice. The entry is a
+	// pointer, so it stays valid after the unlock even if the sweeper or a
+	// limit change drops it from the map meanwhile.
 	return entry.limiter.Allow()
 }
 

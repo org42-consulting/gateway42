@@ -94,18 +94,24 @@ func handleAdminPanel(w http.ResponseWriter, r *http.Request) {
 	enginesStatus := make(map[string]bool)
 	enginesModels := make(map[string][]string)
 
-	// Warm the probe cache concurrently with a hard 3s budget so a dead
-	// engine cannot wedge the dashboard.
-	warmCtx, warmCancel := context.WithTimeout(r.Context(), 3*time.Second)
-	warmProbeCache(warmCtx)
-	warmCancel()
+	// Render from whatever the probe cache holds; one bounded warm only on a
+	// completely cold cache. The old warm-then-probe loop advertised a "hard
+	// 3s budget" but could take far longer: probeEngineCached blocks on a probe
+	// another request started earlier, and that wait had no deadline. Expired
+	// data still renders here, with the refresh running behind it.
+	snap, stale := cachedProbeSnapshot()
+	if len(snap) == 0 {
+		warmCtx, warmCancel := context.WithTimeout(r.Context(), 3*time.Second)
+		warmProbeCache(warmCtx)
+		warmCancel()
+		snap, stale = cachedProbeSnapshot()
+	}
+	if stale {
+		go warmProbeCache(context.Background())
+	}
 
 	for _, e := range engines {
-		adapter := cachedAdapter(e.ID)
-		if adapter == nil {
-			continue
-		}
-		pd := probeEngineCached(e.ID, adapter)
+		pd := snap[e.ID]
 		enginesStatus[fmt.Sprintf("%d", e.ID)] = pd.status
 		enginesModels[fmt.Sprintf("%d", e.ID)] = pd.models
 	}
@@ -132,16 +138,21 @@ func handleAdminSettingsPage(w http.ResponseWriter, r *http.Request) {
 	engineStatus := make(map[string]bool)
 	engineModelDetails := make(map[string][]ModelDetail)
 
-	warmCtx, warmCancel := context.WithTimeout(r.Context(), 3*time.Second)
-	warmProbeCache(warmCtx)
-	warmCancel()
+	// Same peek-first policy as the dashboard: render cached state, refresh
+	// behind the response, block only on a cold cache.
+	snap, stale := cachedProbeSnapshot()
+	if len(snap) == 0 {
+		warmCtx, warmCancel := context.WithTimeout(r.Context(), 3*time.Second)
+		warmProbeCache(warmCtx)
+		warmCancel()
+		snap, stale = cachedProbeSnapshot()
+	}
+	if stale {
+		go warmProbeCache(context.Background())
+	}
 
 	for _, e := range engines {
-		adapter := cachedAdapter(e.ID)
-		if adapter == nil {
-			continue
-		}
-		pd := probeEngineCached(e.ID, adapter)
+		pd := snap[e.ID]
 		engineStatus[fmt.Sprintf("%d", e.ID)] = pd.status
 		engineModelDetails[fmt.Sprintf("%d", e.ID)] = pd.details
 	}
@@ -222,9 +233,10 @@ func ollamaPullStream(w http.ResponseWriter, r *http.Request, model string, engi
 
 	// Whatever the pull achieved — including a partial one that was cut off —
 	// the engine's model list may have changed. Dropping the probe cache also
-	// drops the routing index, so a freshly pulled model is routable at once
-	// rather than after probeCacheTTL/routeIndexTTL.
-	defer invalidateProbeCache()
+	// marks the routing index stale, and the refill starts immediately, so a
+	// freshly pulled model is routable at once rather than after
+	// probeCacheTTL/routeIndexTTL.
+	defer onEnginesChanged()
 
 	endpoint := ollamaEndpoint(*target)
 	body, _ := json.Marshal(map[string]interface{}{"name": model, "stream": true})
@@ -351,8 +363,9 @@ func handleOllamaDeleteModel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Drop the cached probe so the model list reflects the deletion now
-	// rather than up to probeCacheTTL later.
-	invalidateProbeCache()
+	// rather than up to probeCacheTTL later, and start the refill so no
+	// reader pays for it.
+	onEnginesChanged()
 	slog.Info("Model deleted", "model", model, "engine", target.Name)
 	addFlash(w, r, "success", fmt.Sprintf("Model '%s' deleted from %s.", model, target.Name))
 

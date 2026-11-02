@@ -25,7 +25,10 @@ import (
 
 // routeIndexTTL is deliberately longer than probeCacheTTL: the set of models an
 // engine holds changes only on an explicit pull or delete, both of which call
-// invalidateProbeCache and drop this index with it.
+// invalidateProbeCache and mark this index stale with it. Stale, not gone —
+// the previous index keeps routing while a refresh runs, because a model miss
+// against a stale index is re-checked against a fresh build before it can
+// become a 404 (see selectEngine).
 const routeIndexTTL = 60 * time.Second
 
 type routeIndex struct {
@@ -114,6 +117,16 @@ func buildRouteIndex(ctx context.Context) *routeIndex {
 	return idx
 }
 
+// rebuildRouteIndex builds a fresh index and publishes it, unless the index
+// was invalidated while it was being assembled. gen is read before the build
+// starts, which is what makes storeRouteIndex's staleness check meaningful.
+func rebuildRouteIndex(ctx context.Context) *routeIndex {
+	gen := routeIndexGeneration()
+	idx := buildRouteIndex(ctx)
+	storeRouteIndex(idx, gen)
+	return idx
+}
+
 // currentRouteIndex returns the index, rebuilding synchronously only when there
 // is nothing to serve. A stale index is returned immediately and refreshed in
 // the background, so routing never blocks a request on a slow engine twice.
@@ -122,10 +135,7 @@ func currentRouteIndex() *routeIndex {
 	if idx == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		gen := routeIndexGeneration()
-		idx = buildRouteIndex(ctx)
-		storeRouteIndex(idx, gen)
-		return idx
+		return rebuildRouteIndex(ctx)
 	}
 	if time.Since(idx.built) > routeIndexTTL {
 		refreshRouteIndexAsync()
@@ -143,18 +153,28 @@ func refreshRouteIndexAsync() {
 		defer routeRefreshing.Store(false)
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		gen := routeIndexGeneration()
-		storeRouteIndex(buildRouteIndex(ctx), gen)
+		rebuildRouteIndex(ctx)
 	}()
 }
 
-// invalidateRouteIndex drops the index so the next lookup rebuilds it. Called
-// alongside invalidateProbeCache whenever engines or models change.
+// invalidateRouteIndex marks the index stale so the next lookup revalidates
+// it, and bumps the generation so in-flight builds assembled from pre-change
+// probes are rejected by storeRouteIndex. The previous index stays published:
+// dropping it forced the next routed request through a synchronous rebuild,
+// paying for every engine's probe on the request path. A copy is stored with
+// built zeroed rather than idx.built assigned in place — readers hold the old
+// pointer and must not see a struct mutate underneath them.
+//
+// Called alongside invalidateProbeCache whenever engines or models change.
 func invalidateRouteIndex() {
 	routeMu.Lock()
 	defer routeMu.Unlock()
 	routeGen++
-	routeIndexPtr.Store(nil)
+	if idx := routeIndexPtr.Load(); idx != nil {
+		stale := *idx
+		stale.built = time.Time{}
+		routeIndexPtr.Store(&stale)
+	}
 }
 
 // defaultEngine is the pre-routing behaviour, kept for requests that name no
@@ -201,6 +221,25 @@ func selectEngine(model string) (Engine, routeErr) {
 		for _, id := range ids {
 			if a := cachedAdapter(id); a != nil {
 				return a, routeOK
+			}
+		}
+	}
+
+	// A miss against a stale index is not an answer yet: the model may have
+	// been pulled a moment ago, and invalidation marked rather than erased the
+	// index precisely so this path could re-check instead of rebuild-everything.
+	// A zero built (just invalidated) qualifies, since time.Since on the zero
+	// time is enormous. A miss against a fresh index skips this entirely and
+	// 404s, so the common unknown-model request still costs nothing.
+	if time.Since(idx.built) > routeIndexTTL {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		idx = rebuildRouteIndex(ctx)
+		cancel()
+		if ids := idx.byModel[model]; len(ids) > 0 {
+			for _, id := range ids {
+				if a := cachedAdapter(id); a != nil {
+					return a, routeOK
+				}
 			}
 		}
 	}

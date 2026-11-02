@@ -61,21 +61,31 @@ func handleListModels(w http.ResponseWriter, r *http.Request) {
 	// probe cache means this costs no upstream calls in the common case, and
 	// an engine that is down contributes nothing instead of failing the whole
 	// listing — a partial catalogue is more useful than a 502.
-	warmCtx, warmCancel := context.WithTimeout(r.Context(), 5*time.Second)
-	warmProbeCache(warmCtx)
-	warmCancel()
+	//
+	// Peek first, warm only when empty: the old warm-then-read blocked every
+	// client on the slowest engine for up to the warm budget, and then on any
+	// probe that had started earlier with no deadline of its own. Expired
+	// cache data still answers here; the refresh runs behind the response.
+	snap, stale := cachedProbeSnapshot()
+	if len(snap) == 0 {
+		// Nothing cached at all (cold start): pay one bounded wait so the
+		// first client after a restart gets a catalogue rather than a 502.
+		warmCtx, warmCancel := context.WithTimeout(r.Context(), 5*time.Second)
+		warmProbeCache(warmCtx)
+		warmCancel()
+		snap, stale = cachedProbeSnapshot()
+	}
+	if stale {
+		go warmProbeCache(context.Background())
+	}
 
 	modelList := make([]Model, 0, 16)
 	seen := make(map[string]bool)
 	reachable := 0
 
 	for _, e := range engines {
-		adapter := cachedAdapter(e.ID)
-		if adapter == nil {
-			continue
-		}
-		pd := probeEngineCached(e.ID, adapter)
-		if !pd.status {
+		pd, ok := snap[e.ID]
+		if !ok || !pd.status {
 			continue
 		}
 		reachable++
@@ -182,6 +192,10 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer adapter.Release()
+	// Saturation per engine, where the busy counter only shows that *some*
+	// engine of a type refused. Cardinality is bounded by the engine count.
+	metricEngineInflight.WithLabelValues(adapter.Name()).Inc()
+	defer metricEngineInflight.WithLabelValues(adapter.Name()).Dec()
 
 	// Build the request for the engine — translate only for Ollama adapters.
 	var engineReq map[string]interface{}
@@ -226,7 +240,9 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		payload = ollamaToOpenAI(result)
 	}
 
-	logInteraction(user.ID, marshalAudit(messages), marshalAudit(payload), model)
+	// Raw values, not marshalled strings: the JSON encoding happens on the
+	// writer goroutine, off this request's latency.
+	logInteraction(user.ID, messages, payload, model)
 	jsonResponse(w, 200, payload)
 }
 
@@ -313,11 +329,11 @@ func streamCompletion(w http.ResponseWriter, r *http.Request, adapter Engine,
 		if outcome != "" {
 			resp += "\n[" + outcome + "]"
 		}
-		logInteraction(userID, marshalAudit(messages), resp, model)
+		logInteraction(userID, messages, resp, model)
 	}()
 
 	for {
-		payload, err := stream.Recv()
+		payload, auditText, err := stream.Recv()
 		if err == io.EOF {
 			break
 		}
@@ -341,8 +357,10 @@ func streamCompletion(w http.ResponseWriter, r *http.Request, adapter Engine,
 			return
 		}
 		// Recorded after the write succeeds, so the audit holds what reached
-		// the client rather than what the engine produced.
-		audit.add(payload)
+		// the client rather than what the engine produced. The text was
+		// extracted by the adapter while it parsed the frame — no second
+		// unmarshal here.
+		audit.write(auditText)
 		flusher.Flush()
 	}
 
@@ -417,9 +435,9 @@ func sanitizeContent(content interface{}) interface{} {
 	return nil
 }
 
-// streamAudit rebuilds a streamed completion for the interaction log from the
-// OpenAI-shaped chunks the client was sent: the content deltas joined, and
-// each tool call as "[tool_call name] arguments".
+// streamAudit accumulates a streamed completion for the interaction log from
+// the audit text each chunk carries (see ChatStream.Recv): content deltas
+// joined, and each tool call as "[tool_call name] arguments".
 //
 // It is capped at limit bytes because a stream has no length bound of its
 // own, and enqueueInteractionLog would truncate to MaxMsgLen anyway —
@@ -427,45 +445,6 @@ func sanitizeContent(content interface{}) interface{} {
 type streamAudit struct {
 	limit int
 	buf   strings.Builder
-}
-
-// auditChunk is the subset of a chat.completion.chunk the audit reads.
-type auditChunk struct {
-	Choices []struct {
-		Delta struct {
-			Content   string `json:"content"`
-			ToolCalls []struct {
-				Function struct {
-					Name      string `json:"name"`
-					Arguments string `json:"arguments"`
-				} `json:"function"`
-			} `json:"tool_calls"`
-		} `json:"delta"`
-	} `json:"choices"`
-}
-
-func (a *streamAudit) add(payload []byte) {
-	if a.buf.Len() >= a.limit {
-		return
-	}
-	var c auditChunk
-	if json.Unmarshal(payload, &c) != nil {
-		// Not a chunk (an upstream error object, say). The stream itself
-		// already relayed it; the audit records content only.
-		return
-	}
-	for _, ch := range c.Choices {
-		a.write(ch.Delta.Content)
-		// OpenAI streams a call as a name on its first fragment and argument
-		// fragments after; Ollama sends both at once. Writing the name when
-		// it appears and every fragment as it arrives reassembles both.
-		for _, tc := range ch.Delta.ToolCalls {
-			if tc.Function.Name != "" {
-				a.write("\n[tool_call " + tc.Function.Name + "] ")
-			}
-			a.write(tc.Function.Arguments)
-		}
-	}
 }
 
 // write appends s up to the limit, cutting on a rune boundary.

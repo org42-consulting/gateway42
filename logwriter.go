@@ -27,11 +27,16 @@ const (
 
 // --- interaction logs ---
 
+// prompt and response stay unencoded until the writer flushes them: a
+// completion's payload can be hundreds of KB, and marshalling it on the
+// request goroutine added that cost to the client's latency for a value only
+// the DB ever reads. Strings pass through as-is (the stream path assembles its
+// response text chunk by chunk); everything else is marshalled here.
 type interactionLogEntry struct {
 	userID   int
 	model    string
-	prompt   string
-	response string
+	prompt   interface{}
+	response interface{}
 	ts       string
 }
 
@@ -40,12 +45,12 @@ var (
 	droppedInteraction atomic.Uint64
 )
 
-func enqueueInteractionLog(userID int, prompt, response, model string) {
+func enqueueInteractionLog(userID int, prompt, response interface{}, model string) {
 	e := interactionLogEntry{
 		userID:   userID,
 		model:    model,
-		prompt:   truncateInput(prompt),
-		response: truncateInput(response),
+		prompt:   prompt,
+		response: response,
 		ts:       time.Now().UTC().Format(time.RFC3339),
 	}
 	select {
@@ -54,6 +59,16 @@ func enqueueInteractionLog(userID int, prompt, response, model string) {
 		droppedInteraction.Add(1)
 		metricLogsDropped.WithLabelValues("interaction").Inc()
 	}
+}
+
+// auditField renders one audit value for storage, truncating to MaxMsgLen.
+// A string is already rendered and must not be re-marshalled — that would
+// wrap it in quotes and escape its content a second time.
+func auditField(v interface{}) string {
+	if s, ok := v.(string); ok {
+		return truncateInput(s)
+	}
+	return truncateInput(marshalAudit(v))
 }
 
 func flushInteractionBatch(batch []interactionLogEntry) {
@@ -72,7 +87,7 @@ func flushInteractionBatch(batch []interactionLogEntry) {
 		return
 	}
 	for _, e := range batch {
-		if _, err := stmt.Exec(e.userID, e.model, e.prompt, e.response, e.ts); err != nil {
+		if _, err := stmt.Exec(e.userID, e.model, auditField(e.prompt), auditField(e.response), e.ts); err != nil {
 			slog.Error("interaction log exec", "err", err)
 		}
 	}

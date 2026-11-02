@@ -28,11 +28,13 @@ func newOllamaTestStream(body string) *ollamaStream {
 }
 
 // drain collects every payload a stream yields, plus the terminating error.
+// The audit text each Recv carries alongside is checked separately, in
+// TestRecvCarriesAuditText.
 func drain(t *testing.T, s ChatStream) []map[string]interface{} {
 	t.Helper()
 	var out []map[string]interface{}
 	for {
-		payload, err := s.Recv()
+		payload, _, err := s.Recv()
 		if err == io.EOF {
 			return out
 		}
@@ -168,5 +170,43 @@ func TestPassthroughStreamStopsAtDone(t *testing.T) {
 	chunks := drain(t, s)
 	if len(chunks) != 1 {
 		t.Fatalf("got %d chunks, want 1 — data after [DONE] leaked through", len(chunks))
+	}
+}
+
+// Recv hands the handler the audit text alongside the payload, extracted in
+// the same pass that shaped it. These pin both extraction paths: ollamaStream
+// reads its typed chunk, passthroughStream parses the frame once.
+func TestRecvCarriesAuditText(t *testing.T) {
+	ollama := newOllamaTestStream(`{"model":"llama3","message":{"role":"assistant","content":"Hel"},"done":false}
+{"model":"llama3","message":{"content":"lo"},"done":false}
+{"model":"llama3","message":{"content":""},"done":true}
+`)
+	var text strings.Builder
+	for {
+		_, auditText, err := ollama.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Recv: %v", err)
+		}
+		text.WriteString(auditText)
+	}
+	if text.String() != "Hello" {
+		t.Errorf("ollama audit text = %q, want \"Hello\"", text.String())
+	}
+
+	passthrough := newPassthroughTestStream(`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Tokyo\"}"}}]}}]}
+
+data: [DONE]
+
+`)
+	_, auditText, err := passthrough.Recv()
+	if err != nil {
+		t.Fatalf("Recv: %v", err)
+	}
+	want := "\n[tool_call get_weather] {\"city\":\"Tokyo\"}"
+	if auditText != want {
+		t.Errorf("passthrough audit text = %q, want %q", auditText, want)
 	}
 }
