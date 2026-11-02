@@ -570,7 +570,7 @@ func runLogPrune() {
 var corsHeaders = map[string]string{
 	"Access-Control-Allow-Origin":  "*",
 	"Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-	"Access-Control-Allow-Headers": "Authorization, Content-Type",
+	"Access-Control-Allow-Headers": "Authorization, Content-Type, X-Api-Key, Anthropic-Version, Anthropic-Beta",
 	"Access-Control-Max-Age":       "86400",
 }
 
@@ -664,21 +664,38 @@ func apiAuthMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		auth := r.Header.Get("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") {
-			jsonResponse(w, http.StatusUnauthorized,
-				openaiError("Missing or malformed Bearer token", "authentication_error"))
+		// Errors on the Anthropic routes use Anthropic's envelope: Claude Code
+		// parses error.type to decide whether to re-prompt for credentials.
+		writeErr := apiErrorWriter(writeOpenAIError)
+		if strings.HasPrefix(r.URL.Path, "/v1/messages") {
+			writeErr = writeAnthropicError
+		}
+		key := apiKeyFromRequest(r)
+		if key == "" {
+			writeErr(w, http.StatusUnauthorized, "Missing API key", "authentication_error")
 			return
 		}
-		u, err := getUserByAPIKey(auth[7:])
+		u, err := getUserByAPIKey(key)
 		if err != nil || u == nil || u.Status != "active" {
-			jsonResponse(w, http.StatusUnauthorized,
-				openaiError("Invalid API key", "authentication_error"))
+			writeErr(w, http.StatusUnauthorized, "Invalid API key", "authentication_error")
 			return
 		}
 		ctx := context.WithValue(r.Context(), userCtxKey{}, u)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// apiKeyFromRequest extracts the caller's Gateway42 API key, or "" if none.
+//
+// OpenAI SDKs send "Authorization: Bearer <key>". Anthropic SDKs — and so
+// Claude Code — send "x-api-key: <key>" when configured with
+// ANTHROPIC_API_KEY, and Bearer only with ANTHROPIC_AUTH_TOKEN.
+func apiKeyFromRequest(r *http.Request) string {
+	// TODO(user): decide which headers are accepted, and on which paths.
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+		return auth[7:]
+	}
+	return ""
 }
 
 func requestLoggingMiddleware(next http.Handler) http.Handler {
@@ -791,6 +808,10 @@ func setupRouter() *mux.Router {
 	// OpenAI-compatible API
 	r.HandleFunc("/v1/models", handleListModels).Methods("GET")
 	r.HandleFunc("/v1/chat/completions", handleChatCompletions).Methods("POST")
+
+	// Anthropic Messages API (Claude Code, Anthropic SDKs)
+	r.HandleFunc("/v1/messages", handleMessages).Methods("POST")
+	r.HandleFunc("/v1/messages/count_tokens", handleCountTokens).Methods("POST")
 
 	// Prometheus metrics (admin session required).
 	r.Handle("/metrics", handleMetrics()).Methods("GET")

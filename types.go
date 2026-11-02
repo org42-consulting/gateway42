@@ -120,21 +120,33 @@ var (
 
 // Model is one entry in a /v1/models listing.
 //
-// Size is a Gateway42 extension, not part of the OpenAI schema — omitted when
+// One listing serves both OpenAI and Anthropic clients, so each entry carries
+// both schemas' fields: OpenAI's object/created/owned_by and Anthropic's
+// type/display_name/created_at. Each SDK ignores the other's keys, which is
+// simpler and more robust than choosing a shape by sniffing request headers.
+//
+// Size is a Gateway42 extension, not part of either schema — omitted when
 // zero so engines that do not report it (anything OpenAI-compatible) produce a
 // response a strict client still accepts.
 type Model struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	Created int64  `json:"created"`
-	OwnedBy string `json:"owned_by"`
-	Size    int64  `json:"size,omitempty"`
+	ID          string `json:"id"`
+	Object      string `json:"object"`
+	Created     int64  `json:"created"`
+	OwnedBy     string `json:"owned_by"`
+	Type        string `json:"type"`         // Anthropic: always "model"
+	DisplayName string `json:"display_name"` // Anthropic
+	CreatedAt   string `json:"created_at"`   // Anthropic: RFC 3339
+	Size        int64  `json:"size,omitempty"`
 }
 
-// ModelList is the /v1/models response body.
+// ModelList is the /v1/models response body. HasMore, FirstID and LastID are
+// Anthropic's pagination fields; the gateway returns everything in one page.
 type ModelList struct {
-	Object string  `json:"object"`
-	Data   []Model `json:"data"`
+	Object  string  `json:"object"`
+	Data    []Model `json:"data"`
+	HasMore bool    `json:"has_more"`
+	FirstID *string `json:"first_id"`
+	LastID  *string `json:"last_id"`
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────

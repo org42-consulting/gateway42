@@ -93,11 +93,12 @@ var (
 )
 
 // pathBucket collapses dynamic path segments so cardinality stays bounded.
-// /v1/chat/completions and /v1/models stay distinct; everything else maps
+// The fixed /v1 endpoints stay distinct; everything else maps
 // to its first-segment prefix (e.g. /admin/..., /toggle/..., /export/...).
 func pathBucket(path string) string {
 	switch path {
-	case "/v1/chat/completions", "/v1/models", "/health", "/metrics", "/", "/admin", "/logout":
+	case "/v1/chat/completions", "/v1/models", "/v1/messages", "/v1/messages/count_tokens",
+		"/health", "/metrics", "/", "/admin", "/logout":
 		return path
 	}
 	if strings.HasPrefix(path, "/admin/") {
