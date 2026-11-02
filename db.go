@@ -188,13 +188,27 @@ func createSchema() error {
 			timestamp REAL NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS request_logs(
-			id          INTEGER PRIMARY KEY AUTOINCREMENT,
-			ts          TEXT NOT NULL,
-			method      TEXT NOT NULL,
-			path        TEXT NOT NULL,
-			client_ip   TEXT NOT NULL,
-			user_name   TEXT NOT NULL DEFAULT '',
-			status_code INTEGER NOT NULL
+			id              INTEGER PRIMARY KEY AUTOINCREMENT,
+			ts              TEXT NOT NULL,
+			method          TEXT NOT NULL,
+			path            TEXT NOT NULL,
+			client_ip       TEXT NOT NULL,
+			user_name       TEXT NOT NULL DEFAULT '',
+			status_code     INTEGER NOT NULL,
+			request_id      TEXT NOT NULL DEFAULT '',
+			model_requested TEXT NOT NULL DEFAULT '',
+			model_served    TEXT NOT NULL DEFAULT '',
+			engine_name     TEXT NOT NULL DEFAULT '',
+			engine_type     TEXT NOT NULL DEFAULT '',
+			streamed        INTEGER NOT NULL DEFAULT 0,
+			ttft_ms         INTEGER NOT NULL DEFAULT 0,
+			duration_ms     INTEGER NOT NULL DEFAULT 0,
+			in_tokens       INTEGER NOT NULL DEFAULT 0,
+			out_tokens      INTEGER NOT NULL DEFAULT 0,
+			stop_reason     TEXT NOT NULL DEFAULT '',
+			outcome         TEXT NOT NULL DEFAULT '',
+			upstream_error  TEXT NOT NULL DEFAULT '',
+			user_agent      TEXT NOT NULL DEFAULT ''
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_logs_user_id ON logs(user_id)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_api_key ON users(api_key)`,
@@ -234,6 +248,37 @@ func createSchema() error {
 	if !hasModel {
 		if _, err := tx.Exec("ALTER TABLE logs ADD COLUMN model TEXT"); err != nil {
 			return err
+		}
+	}
+
+	// Migration: add detail columns to request_logs. One ALTER per column:
+	// SQLite has no ADD COLUMN IF NOT EXISTS, and tableHasColumn answers that
+	// per column, so a half-applied older migration completes rather than
+	// failing startup. Defaults keep every pre-detail row readable.
+	for _, col := range []struct{ name, decl string }{
+		{"request_id", "TEXT NOT NULL DEFAULT ''"},
+		{"model_requested", "TEXT NOT NULL DEFAULT ''"},
+		{"model_served", "TEXT NOT NULL DEFAULT ''"},
+		{"engine_name", "TEXT NOT NULL DEFAULT ''"},
+		{"engine_type", "TEXT NOT NULL DEFAULT ''"},
+		{"streamed", "INTEGER NOT NULL DEFAULT 0"},
+		{"ttft_ms", "INTEGER NOT NULL DEFAULT 0"},
+		{"duration_ms", "INTEGER NOT NULL DEFAULT 0"},
+		{"in_tokens", "INTEGER NOT NULL DEFAULT 0"},
+		{"out_tokens", "INTEGER NOT NULL DEFAULT 0"},
+		{"stop_reason", "TEXT NOT NULL DEFAULT ''"},
+		{"outcome", "TEXT NOT NULL DEFAULT ''"},
+		{"upstream_error", "TEXT NOT NULL DEFAULT ''"},
+		{"user_agent", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		has, err := tableHasColumn(tx, "request_logs", col.name)
+		if err != nil {
+			return err
+		}
+		if !has {
+			if _, err := tx.Exec("ALTER TABLE request_logs ADD COLUMN " + col.name + " " + col.decl); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -278,11 +323,34 @@ func createSchema() error {
 	// substring-match semantics (LIKE-equivalent) without the table scan.
 	// If FTS creation fails (older sqlite build without FTS5), we keep
 	// running and fall back to LIKE in the query helpers.
+
+	// Migration: request_logs_fts gained model_served and engine_name. A
+	// contentless FTS table cannot be re-columned in place, and IF NOT
+	// EXISTS would keep the old shape silently, so a stale table (with its
+	// triggers, which belong to the base table and would keep writing the
+	// old column list) is dropped here. The backfill below repopulates it
+	// from request_logs.
+	hasEngineCol, err := tableHasColumn(tx, "request_logs_fts", "engine_name")
+	if err != nil {
+		return err
+	}
+	if !hasEngineCol {
+		for _, s := range []string{
+			`DROP TRIGGER IF EXISTS rlogs_ai`,
+			`DROP TRIGGER IF EXISTS rlogs_ad`,
+			`DROP TABLE IF EXISTS request_logs_fts`,
+		} {
+			if _, err := tx.Exec(s); err != nil {
+				return err
+			}
+		}
+	}
+
 	ftsStmts := []string{
 		`CREATE VIRTUAL TABLE IF NOT EXISTS logs_fts USING fts5(
 			prompt, response, user_name, content='', tokenize='trigram')`,
 		`CREATE VIRTUAL TABLE IF NOT EXISTS request_logs_fts USING fts5(
-			path, client_ip, user_name, content='', tokenize='trigram')`,
+			path, client_ip, user_name, model_served, engine_name, content='', tokenize='trigram')`,
 		`CREATE TRIGGER IF NOT EXISTS logs_ai AFTER INSERT ON logs BEGIN
 			INSERT INTO logs_fts(rowid, prompt, response, user_name)
 			VALUES (new.id, COALESCE(new.prompt,''), COALESCE(new.response,''),
@@ -295,12 +363,12 @@ func createSchema() error {
 				COALESCE((SELECT name FROM users WHERE id=old.user_id), ''));
 		END`,
 		`CREATE TRIGGER IF NOT EXISTS rlogs_ai AFTER INSERT ON request_logs BEGIN
-			INSERT INTO request_logs_fts(rowid, path, client_ip, user_name)
-			VALUES (new.id, new.path, new.client_ip, new.user_name);
+			INSERT INTO request_logs_fts(rowid, path, client_ip, user_name, model_served, engine_name)
+			VALUES (new.id, new.path, new.client_ip, new.user_name, new.model_served, new.engine_name);
 		END`,
 		`CREATE TRIGGER IF NOT EXISTS rlogs_ad AFTER DELETE ON request_logs BEGIN
-			INSERT INTO request_logs_fts(request_logs_fts, rowid, path, client_ip, user_name)
-			VALUES ('delete', old.id, old.path, old.client_ip, old.user_name);
+			INSERT INTO request_logs_fts(request_logs_fts, rowid, path, client_ip, user_name, model_served, engine_name)
+			VALUES ('delete', old.id, old.path, old.client_ip, old.user_name, old.model_served, old.engine_name);
 		END`,
 	}
 	ftsOK := true
@@ -347,8 +415,8 @@ func createSchema() error {
 			ftsOK = false
 		case ftsRLCount == 0 && baseRLCount > 0:
 			if _, err := tx.Exec(`
-				INSERT INTO request_logs_fts(rowid, path, client_ip, user_name)
-				SELECT id, path, client_ip, user_name FROM request_logs`); err != nil {
+				INSERT INTO request_logs_fts(rowid, path, client_ip, user_name, model_served, engine_name)
+				SELECT id, path, client_ip, user_name, model_served, engine_name FROM request_logs`); err != nil {
 				slog.Warn("request_logs_fts backfill failed", "err", err)
 				ftsOK = false
 			} else {
@@ -630,9 +698,11 @@ func getUserLogs(userID int) ([]UserLogRow, error) {
 // ── Request log queries ───────────────────────────────────────────────────────
 
 // insertRequestLog enqueues a request-log row. The actual INSERT is
-// performed by the batched writer in logwriter.go.
-func insertRequestLog(method, path, clientIP, userName string, status int) {
-	enqueueRequestLog(method, path, clientIP, userName, status)
+// performed by the batched writer in logwriter.go. detail carries the
+// per-request facts handlers collected; it may be nil for callers that
+// predate the detail collector.
+func insertRequestLog(method, path, clientIP, userName string, status int, detail *requestDetail) {
+	enqueueRequestLog(method, path, clientIP, userName, status, detail)
 }
 
 func getRequestLogsCount(search string) (int, error) {
@@ -647,14 +717,31 @@ func getRequestLogsCount(search string) (int, error) {
 	case search != "":
 		p := "%" + search + "%"
 		err = dbRead.QueryRow(
-			`SELECT COUNT(*) FROM request_logs WHERE user_name LIKE ? OR path LIKE ? OR client_ip LIKE ?`,
-			p, p, p,
+			`SELECT COUNT(*) FROM request_logs WHERE user_name LIKE ? OR path LIKE ? OR client_ip LIKE ?
+			OR model_served LIKE ? OR engine_name LIKE ?`,
+			p, p, p, p, p,
 		).Scan(&count)
 	default:
 		err = dbRead.QueryRow(`SELECT COUNT(*) FROM request_logs`).Scan(&count)
 	}
 	return count, err
 }
+
+// requestLogCols is the column list shared by every request_logs read. It is
+// one list rather than three repeated literals because the scan order has to
+// match the SELECT order exactly, and 21 columns repeated per query is three
+// chances to drift.
+var requestLogCols = []string{
+	"id", "ts", "method", "path", "client_ip", "user_name", "status_code",
+	"request_id", "model_requested", "model_served", "engine_name", "engine_type",
+	"streamed", "ttft_ms", "duration_ms", "in_tokens", "out_tokens",
+	"stop_reason", "outcome", "upstream_error", "user_agent",
+}
+
+var (
+	requestLogColumns  = strings.Join(requestLogCols, ", ")
+	requestLogColumnsR = "r." + strings.Join(requestLogCols, ", r.")
+)
 
 func getRequestLogsPage(search string, limit, offset int) ([]RequestLogRow, error) {
 	var (
@@ -664,7 +751,7 @@ func getRequestLogsPage(search string, limit, offset int) ([]RequestLogRow, erro
 	switch {
 	case search != "" && fts5Enabled:
 		sqlRows, err = dbRead.Query(
-			`SELECT r.id, r.ts, r.method, r.path, r.client_ip, r.user_name, r.status_code
+			`SELECT `+requestLogColumnsR+`
 			FROM request_logs_fts f
 			JOIN request_logs r ON r.id = f.rowid
 			WHERE request_logs_fts MATCH ?
@@ -674,14 +761,15 @@ func getRequestLogsPage(search string, limit, offset int) ([]RequestLogRow, erro
 	case search != "":
 		p := "%" + search + "%"
 		sqlRows, err = dbRead.Query(
-			`SELECT id, ts, method, path, client_ip, user_name, status_code FROM request_logs
+			`SELECT `+requestLogColumns+` FROM request_logs
 			WHERE user_name LIKE ? OR path LIKE ? OR client_ip LIKE ?
+			OR model_served LIKE ? OR engine_name LIKE ?
 			ORDER BY ts DESC LIMIT ? OFFSET ?`,
-			p, p, p, limit, offset,
+			p, p, p, p, p, limit, offset,
 		)
 	default:
 		sqlRows, err = dbRead.Query(
-			`SELECT id, ts, method, path, client_ip, user_name, status_code FROM request_logs
+			`SELECT `+requestLogColumns+` FROM request_logs
 			ORDER BY ts DESC LIMIT ? OFFSET ?`,
 			limit, offset,
 		)
@@ -693,7 +781,10 @@ func getRequestLogsPage(search string, limit, offset int) ([]RequestLogRow, erro
 	var out []RequestLogRow
 	for sqlRows.Next() {
 		var r RequestLogRow
-		if err := sqlRows.Scan(&r.ID, &r.TS, &r.Method, &r.Path, &r.ClientIP, &r.UserName, &r.StatusCode); err != nil {
+		if err := sqlRows.Scan(&r.ID, &r.TS, &r.Method, &r.Path, &r.ClientIP, &r.UserName, &r.StatusCode,
+			&r.RequestID, &r.ModelRequested, &r.ModelServed, &r.EngineName, &r.EngineType,
+			&r.Streamed, &r.TTFTMs, &r.DurationMs, &r.InTokens, &r.OutTokens,
+			&r.StopReason, &r.Outcome, &r.UpstreamError, &r.UserAgent); err != nil {
 			return nil, err
 		}
 		out = append(out, r)

@@ -1032,7 +1032,7 @@ func handleExportAllLogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sqlRows, err := dbRead.QueryContext(r.Context(),
-		`SELECT id, ts, method, path, client_ip, user_name, status_code FROM request_logs ORDER BY ts DESC`)
+		`SELECT `+requestLogColumns+` FROM request_logs ORDER BY ts DESC`)
 	if err != nil {
 		slog.Error("request_logs export", "err", err)
 		http.Error(w, "Internal server error", 500)
@@ -1045,10 +1045,16 @@ func handleExportAllLogs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 
 	cw := csv.NewWriter(w)
-	cw.Write([]string{"id", "timestamp", "method", "path", "client_ip", "client_name", "status_code"})
+	cw.Write([]string{"id", "timestamp", "method", "path", "client_ip", "client_name", "status_code",
+		"request_id", "model_requested", "model_served", "engine_name", "engine_type",
+		"streamed", "ttft_ms", "duration_ms", "in_tokens", "out_tokens",
+		"stop_reason", "outcome", "upstream_error", "user_agent"})
 	for sqlRows.Next() {
 		var row RequestLogRow
-		if err := sqlRows.Scan(&row.ID, &row.TS, &row.Method, &row.Path, &row.ClientIP, &row.UserName, &row.StatusCode); err != nil {
+		if err := sqlRows.Scan(&row.ID, &row.TS, &row.Method, &row.Path, &row.ClientIP, &row.UserName, &row.StatusCode,
+			&row.RequestID, &row.ModelRequested, &row.ModelServed, &row.EngineName, &row.EngineType,
+			&row.Streamed, &row.TTFTMs, &row.DurationMs, &row.InTokens, &row.OutTokens,
+			&row.StopReason, &row.Outcome, &row.UpstreamError, &row.UserAgent); err != nil {
 			// The 200 and the header row are already on the wire, so there is no
 			// error status left to send. Stop at the first bad row: a truncated
 			// prefix is recoverable by the operator, a silently skipped row in
@@ -1059,6 +1065,10 @@ func handleExportAllLogs(w http.ResponseWriter, r *http.Request) {
 		cw.Write([]string{
 			strconv.Itoa(row.ID), row.TS, row.Method, row.Path,
 			row.ClientIP, row.UserName, strconv.Itoa(row.StatusCode),
+			row.RequestID, row.ModelRequested, row.ModelServed, row.EngineName, row.EngineType,
+			strconv.Itoa(row.Streamed), strconv.Itoa(row.TTFTMs), strconv.Itoa(row.DurationMs),
+			strconv.Itoa(row.InTokens), strconv.Itoa(row.OutTokens),
+			row.StopReason, row.Outcome, row.UpstreamError, row.UserAgent,
 		})
 	}
 	cw.Flush()

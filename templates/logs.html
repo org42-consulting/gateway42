@@ -9,7 +9,7 @@
     <!-- Search + refresh control -->
     <form method="get" action="/admin/logs" class="logs-search">
         <div class="toolbar-row">
-            <input type="text" name="q" id="search-input" value="{{.Search}}" placeholder="Search client name, path or IP…" class="search-input">
+            <input type="text" name="q" id="search-input" value="{{.Search}}" placeholder="Search client, path, IP, model or engine…" class="search-input">
             <button class="btn btn-primary" type="submit">Search</button>
             {{if .Search}}
                 <a href="/admin/logs" class="btn btn-ghost">Clear</a>
@@ -109,6 +109,10 @@ function buildPagination(paginationEl, page, pages, onPageChange) {
 
     let timerId = null;
     let currentPage = 1;
+    // Request IDs whose detail row is open. Auto-refresh rebuilds the table,
+    // and losing an open row mid-read on the next tick is maddening, so the
+    // expanded state outlives the DOM it was set in.
+    const expanded = new Set();
 
     function esc(str) {
         return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;')
@@ -123,27 +127,94 @@ function buildPagination(paginationEl, page, pages, onPageChange) {
         return '';
     }
 
+    function fmtMs(ms) {
+        if (!ms) return '—';
+        return ms >= 1000 ? (ms / 1000).toFixed(1) + 's' : ms + 'ms';
+    }
+
+    function fmtTokens(r) {
+        if (!r.InTokens && !r.OutTokens) return '—';
+        return `${r.InTokens || 0} → ${r.OutTokens || 0}`;
+    }
+
+    // Detail row: the facts that would not fit the table, shown on click.
+    // Everything is escaped the same way as the cells above.
+    function detailRow(r) {
+        const model = r.ModelServed && r.ModelServed !== r.ModelRequested
+            ? `${esc(r.ModelRequested)} → ${esc(r.ModelServed)}`
+            : esc(r.ModelRequested || r.ModelServed || '—');
+        const engine = r.EngineName
+            ? `${esc(r.EngineName)} <span class="detail-dim">(${esc(r.EngineType)})</span>` : '—';
+        const items = [
+            ['Request ID', `<code>${esc(r.RequestID || '—')}</code>`],
+            ['Model', model],
+            ['Engine', engine],
+            ['Streamed', r.Streamed ? 'yes' : 'no'],
+            ['Time to first token', fmtMs(r.TTFTMs)],
+            ['Duration', fmtMs(r.DurationMs)],
+            ['Tokens in → out', fmtTokens(r)],
+            ['Stop reason', esc(r.StopReason || '—')],
+            ['Outcome', r.Outcome ? `<span class="is-4xx">${esc(r.Outcome)}</span>` : '—'],
+            ['Upstream error', r.UpstreamError ? `<span class="is-5xx">${esc(r.UpstreamError)}</span>` : '—'],
+            ['User agent', esc(r.UserAgent || '—')],
+        ];
+        const cells = items.map(([k, v]) =>
+            `<div class="detail-item"><span class="detail-key">${k}</span><span class="detail-val">${v}</span></div>`
+        ).join('');
+        return `<tr class="log-detail-row${expanded.has(r.RequestID) ? '' : ' is-hidden'}"><td colspan="10"><div class="detail-grid">${cells}</div></td></tr>`;
+    }
+
     function buildTable(logs, q) {
         if (!logs.length) return `<div class="table-empty">${
             q ? `No logs match <strong class="empty-term">${esc(q)}</strong>.`
               : 'No requests logged yet.'}</div>`;
         const rows = logs.map(r => {
             const ts = (r.TS || '').slice(0, 19).replace('T', ' ');
-            return `<tr>
+            return `<tr class="log-row" tabindex="0" title="Click for details" data-rid="${esc(r.RequestID || '')}">
                 <td class="log-ts">${esc(ts)}</td>
                 <td class="log-client">${esc(r.Name || '—')}</td>
                 <td class="log-ip">${esc(r.ClientIP || '')}</td>
                 <td class="log-method">${esc(r.Method || '')}</td>
                 <td class="log-path">${esc(r.Path || '')}</td>
+                <td class="log-model">${esc(r.ModelServed || r.ModelRequested || '—')}</td>
+                <td class="log-engine">${esc(r.EngineName || '—')}</td>
                 <td class="log-code${statusClass(r.Status)}">${esc(String(r.Status || ''))}</td>
-            </tr>`;
+                <td class="log-ms">${fmtMs(r.DurationMs)}</td>
+                <td class="log-tokens">${fmtTokens(r)}</td>
+            </tr>` + detailRow(r);
         }).join('');
         return `<div class="scroll-x"><table class="data-table">
             <thead><tr>
                 <th class="col-160">Time</th><th class="col-140">Client</th>
                 <th class="col-140">IP</th><th class="col-80">Method</th>
-                <th>Path</th><th class="col-80">Status</th>
+                <th>Path</th><th class="col-160">Model</th>
+                <th class="col-120">Engine</th><th class="col-80">Status</th>
+                <th class="col-80">Time</th><th class="col-110">Tokens</th>
             </tr></thead><tbody>${rows}</tbody></table></div>`;
+    }
+
+    // One delegated listener survives table rebuilds; Enter mirrors click for
+    // keyboard users (rows are focusable via tabindex).
+    if (tableWrap) {
+        const toggle = row => {
+            const detail = row.nextElementSibling;
+            if (!detail || !detail.classList.contains('log-detail-row')) return;
+            const hidden = detail.classList.toggle('is-hidden');
+            const rid = row.dataset.rid;
+            if (!rid) return;
+            if (hidden) expanded.delete(rid);
+            else expanded.add(rid);
+        };
+        tableWrap.addEventListener('click', e => {
+            const row = e.target.closest('.log-row');
+            if (row) toggle(row);
+        });
+        tableWrap.addEventListener('keydown', e => {
+            if (e.key === 'Enter') {
+                const row = e.target.closest('.log-row');
+                if (row) toggle(row);
+            }
+        });
     }
 
     function goTo(p) { currentPage = p; refresh(); }

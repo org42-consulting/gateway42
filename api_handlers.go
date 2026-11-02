@@ -185,6 +185,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		slog.Error("engine request", "err", err)
+		detailFromContext(r).setUpstreamErr(err)
 		jsonResponse(w, 502, openaiError("Could not reach engine", "api_error"))
 		return
 	}
@@ -202,6 +203,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if adapter.Type() == EngineOllama {
 		payload = ollamaToOpenAI(result)
 	}
+	recordCompletionDetail(r, payload)
 
 	// Raw values, not marshalled strings: the JSON encoding happens on the
 	// writer goroutine, off this request's latency.
@@ -268,6 +270,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		slog.Error("engine request", "err", err)
+		detailFromContext(r).setUpstreamErr(err)
 		writeAnthropicError(w, 502, "Could not reach engine", "api_error")
 		return
 	}
@@ -281,6 +284,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, 502, "Unexpected engine response", "api_error")
 		return
 	}
+	recordAnthropicDetail(r, msg)
 	logInteraction(user.ID, messages, msg, model)
 	jsonResponse(w, 200, msg)
 }
@@ -308,6 +312,7 @@ func streamMessages(w http.ResponseWriter, r *http.Request, adapter Engine,
 			return
 		}
 		slog.Error("engine stream", "err", err, "model", model)
+		detailFromContext(r).setUpstreamErr(err)
 		writeAnthropicError(w, 502, "Could not reach engine", "api_error")
 		return
 	}
@@ -342,13 +347,16 @@ func streamMessages(w http.ResponseWriter, r *http.Request, adapter Engine,
 		return true
 	}
 
+	detail := detailFromContext(r)
+	detail.setStreamed()
+
 	tr := newAnthropicStream(model)
 	if !send(tr.start()) {
 		outcome = "client disconnected"
 		return
 	}
 	for {
-		payload, auditText, err := stream.Recv()
+		payload, meta, err := stream.Recv()
 		if err == io.EOF {
 			break
 		}
@@ -358,14 +366,18 @@ func streamMessages(w http.ResponseWriter, r *http.Request, adapter Engine,
 			slog.Error("engine stream read", "err", err, "model", model)
 			send(sseEvent{"error", anthropicError(500, "Stream interrupted", "api_error")})
 			outcome = "stream interrupted"
+			detail.setOutcome(outcome)
 			return
 		}
 		if !send(tr.chunk(payload)...) {
 			slog.Info("client disconnected mid-stream", "model", model, "user", userID)
 			outcome = "client disconnected"
+			detail.setOutcome(outcome)
 			return
 		}
-		audit.write(auditText)
+		detail.setFirstToken()
+		detail.applyMeta(meta)
+		audit.write(meta.auditText)
 	}
 	send(tr.end()...)
 }
@@ -456,7 +468,7 @@ func acquireEngine(w http.ResponseWriter, r *http.Request, model string,
 			"invalid_request_error")
 		return nil, nil, false
 	}
-
+	detailFromContext(r).setRouted(adapter.Name(), adapter.Type(), model)
 	// Cap upstream concurrency. Wait up to 250ms for a slot before giving
 	// up — long enough to absorb a momentary spike, short enough that
 	// clients see a clear backpressure signal.
@@ -548,6 +560,7 @@ func streamCompletion(w http.ResponseWriter, r *http.Request, adapter Engine,
 			return
 		}
 		slog.Error("engine stream", "err", err, "model", model)
+		detailFromContext(r).setUpstreamErr(err)
 		jsonResponse(w, 502, openaiError("Could not reach engine", "api_error"))
 		return
 	}
@@ -565,16 +578,19 @@ func streamCompletion(w http.ResponseWriter, r *http.Request, adapter Engine,
 	// completion that did not end normally.
 	audit := streamAudit{limit: cfg.MaxMsgLen}
 	var outcome string
+	detail := detailFromContext(r)
+	detail.setStreamed()
 	defer func() {
 		resp := audit.String()
 		if outcome != "" {
 			resp += "\n[" + outcome + "]"
+			detail.setOutcome(outcome)
 		}
 		logInteraction(userID, messages, resp, model)
 	}()
 
 	for {
-		payload, auditText, err := stream.Recv()
+		payload, meta, err := stream.Recv()
 		if err == io.EOF {
 			break
 		}
@@ -597,11 +613,13 @@ func streamCompletion(w http.ResponseWriter, r *http.Request, adapter Engine,
 			outcome = "client disconnected"
 			return
 		}
+		detail.setFirstToken()
+		detail.applyMeta(meta)
 		// Recorded after the write succeeds, so the audit holds what reached
 		// the client rather than what the engine produced. The text was
 		// extracted by the adapter while it parsed the frame — no second
 		// unmarshal here.
-		audit.write(auditText)
+		audit.write(meta.auditText)
 		flusher.Flush()
 	}
 

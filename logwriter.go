@@ -112,6 +112,7 @@ type requestLogEntry struct {
 	clientIP string
 	userName string
 	status   int
+	detail   *requestDetail
 }
 
 var (
@@ -119,7 +120,7 @@ var (
 	droppedRequest atomic.Uint64
 )
 
-func enqueueRequestLog(method, path, clientIP, userName string, status int) {
+func enqueueRequestLog(method, path, clientIP, userName string, status int, detail *requestDetail) {
 	e := requestLogEntry{
 		ts:       time.Now().UTC().Format(time.RFC3339),
 		method:   method,
@@ -127,6 +128,7 @@ func enqueueRequestLog(method, path, clientIP, userName string, status int) {
 		clientIP: clientIP,
 		userName: userName,
 		status:   status,
+		detail:   detail,
 	}
 	select {
 	case chRequest <- e:
@@ -145,14 +147,42 @@ func flushRequestBatch(batch []requestLogEntry) {
 		slog.Error("request log tx", "err", err)
 		return
 	}
-	stmt, err := tx.Prepare("INSERT INTO request_logs(ts, method, path, client_ip, user_name, status_code) VALUES(?,?,?,?,?,?)")
+	stmt, err := tx.Prepare(`INSERT INTO request_logs(
+			ts, method, path, client_ip, user_name, status_code,
+			request_id, model_requested, model_served, engine_name, engine_type,
+			streamed, ttft_ms, duration_ms, in_tokens, out_tokens,
+			stop_reason, outcome, upstream_error, user_agent)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		tx.Rollback()
 		slog.Error("request log prepare", "err", err)
 		return
 	}
 	for _, e := range batch {
-		if _, err := stmt.Exec(e.ts, e.method, e.path, e.clientIP, e.userName, e.status); err != nil {
+		var (
+			requestID, modelReq, modelServed, engineName, engineType string
+			stopReason, outcome, upstreamErr, userAgent              string
+			streamed                                                 int
+			ttftMS, durationMS, inTok, outTok                        int
+		)
+		if d := e.detail; d != nil {
+			requestID, modelReq, modelServed = d.id, d.modelRequested, d.modelServed
+			engineName, engineType = d.engineName, d.engineType
+			stopReason, outcome = d.stopReason, d.outcome
+			upstreamErr, userAgent = d.upstreamErr, d.userAgent
+			inTok, outTok = d.inTokens, d.outTokens
+			durationMS = int(d.duration.Milliseconds())
+			if d.streamed {
+				streamed = 1
+			}
+			if d.ttft != 0 {
+				ttftMS = int(d.ttft.Milliseconds())
+			}
+		}
+		if _, err := stmt.Exec(e.ts, e.method, e.path, e.clientIP, e.userName, e.status,
+			requestID, modelReq, modelServed, engineName, engineType,
+			streamed, ttftMS, durationMS, inTok, outTok,
+			stopReason, outcome, upstreamErr, userAgent); err != nil {
 			slog.Error("request log exec", "err", err)
 		}
 	}
