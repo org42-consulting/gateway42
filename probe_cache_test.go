@@ -100,3 +100,39 @@ func TestRouteIndexBuiltBeforeInvalidationIsDiscarded(t *testing.T) {
 		t.Error("an index built after the last invalidation must be stored")
 	}
 }
+
+// The sidebar reads engine state straight from the probe cache. The case that
+// matters most is the first probe still in flight: its entry has a zero
+// status, which must read as "unknown", not as an engine that is down.
+func TestPeekProbeState(t *testing.T) {
+	resetProbeCache(t)
+	now := time.Now()
+	running := make(chan struct{})
+	probeCacheMu.Lock()
+	probeCache[1] = probeEntry{inflight: running}
+	probeCache[2] = probeEntry{probeData: probeData{status: true}, expiry: now.Add(time.Minute)}
+	probeCache[3] = probeEntry{probeData: probeData{status: false}, expiry: now.Add(time.Minute)}
+	probeCache[4] = probeEntry{probeData: probeData{status: true}, expiry: now.Add(-time.Second)}
+	probeCache[5] = probeEntry{probeData: probeData{status: false}, expiry: now.Add(-time.Second), inflight: running}
+	probeCacheMu.Unlock()
+
+	tests := []struct {
+		name      string
+		id        int
+		wantState string
+		wantStale bool
+	}{
+		{"never probed", 99, "unknown", true},
+		{"first probe in flight", 1, "unknown", false},
+		{"fresh, up", 2, "online", false},
+		{"fresh, down", 3, "offline", false},
+		{"expired shows last result", 4, "online", true},
+		{"expired, refresh running", 5, "offline", false},
+	}
+	for _, tt := range tests {
+		state, stale := peekProbeState(tt.id)
+		if state != tt.wantState || stale != tt.wantStale {
+			t.Errorf("%s: got (%q, %v), want (%q, %v)", tt.name, state, stale, tt.wantState, tt.wantStale)
+		}
+	}
+}

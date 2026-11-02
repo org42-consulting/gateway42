@@ -5,7 +5,7 @@
 {{end}}
 
 <!-- Engine Status -->
-<div id="engine-status" class="card mb-6">
+<div id="engine-status" class="card">
     <h2>Inference Engine Status</h2>
     <div class="table-wrap">
         <div class="scroll-x">
@@ -53,7 +53,7 @@
 </div>
 
 <!-- Registered Clients -->
-<div class="card mb-6">
+<div class="card card-mt">
     <h2>Registered Clients</h2>
     <p class="section-desc">New clients are disabled by default. Click the status button to activate them.</p>
     <div>
@@ -102,8 +102,10 @@
     </div>
 </div>
 
+<!-- Small cards share a row on wide screens -->
+<div class="card-row">
 <!-- Register New Client -->
-<div class="card card-mt">
+<div class="card">
   <h2>Register New Client</h2>
   <form action="/register" method="post" class="space-y-3">
       <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
@@ -116,7 +118,7 @@
 </div>
 
 <!-- Reset System -->
-<div id="reset-system-card" class="card card-mt card-danger">
+<div id="reset-system-card" class="card card-danger">
     <h2>Reset System</h2>
     <p class="section-desc">Permanently deletes all audit logs and clears all rate-limit counters. Users and settings are not affected.</p>
     <form action="/admin/reset-system" method="post"
@@ -125,6 +127,7 @@
         <input type="hidden" name="next" value="admin_panel">
         <button type="submit" class="btn btn-danger">Reset System</button>
     </form>
+</div>
 </div>
 
 {{end}}

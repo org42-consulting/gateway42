@@ -6,38 +6,43 @@
 
 <div id="engine-settings" class="card">
     <h2>Inference Engine Settings</h2>
-    <form action="/admin/engine-settings" method="post" class="space-y-3">
+    <form action="/admin/engine-settings" method="post" class="space-y-3" id="engine-settings-form">
         <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
-        <div>
-            <label>Engine Type</label>
-            <select name="engine_type" id="engine-type" class="select-sm">
-                <option value="ollama">Ollama</option>
-                <option value="openai_compat">OpenAI-Compatible</option>
-            </select>
-        </div>
-        <div>
-            <label>Engine Name</label>
-            <input type="text" name="engine_name" id="engine-name" placeholder="e.g., Local Ollama">
-        </div>
-        <div>
-            <label>Base URL</label>
-            <input type="text" name="base_url" id="base-url" placeholder="e.g., http://127.0.0.1">
-        </div>
-        <div id="port-field">
-            <label>Port Number</label>
-            <input type="number" name="port" id="port-input" value="11434" placeholder="e.g., 11434">
-        </div>
-        <div id="api-key-field">
-            <label>API Key (optional)</label>
-            <input type="password" name="api_key" id="api-key-input" placeholder="e.g., sk-..." autocomplete="new-password">
+        <div class="form-stack">
+            <div>
+                <label for="engine-type">Engine Type</label>
+                <select name="engine_type" id="engine-type" class="select-sm">
+                    <option value="ollama">Ollama</option>
+                    <option value="openai_compat">OpenAI-Compatible</option>
+                </select>
+            </div>
+            <div>
+                <label for="engine-name">Engine Name</label>
+                <input type="text" name="engine_name" id="engine-name" placeholder="e.g., Local Ollama">
+            </div>
+            <div>
+                <label for="base-url">Base URL</label>
+                <input type="text" name="base_url" id="base-url" placeholder="e.g., http://127.0.0.1">
+            </div>
+            <div id="port-field">
+                <label for="port-input">Port Number</label>
+                <input type="number" name="port" id="port-input" value="11434" placeholder="e.g., 11434">
+            </div>
+            <div id="api-key-field">
+                <label for="api-key-input">API Key (optional)</label>
+                <input type="password" name="api_key" id="api-key-input" placeholder="e.g., sk-..." autocomplete="new-password">
+            </div>
         </div>
         <input type="hidden" name="engine_id" id="engine-id" value="">
         <div class="flex-row form-actions">
             <button class="btn btn-primary" type="submit" id="save-btn">Add Engine</button>
+            <!-- Tests the values typed into this form, before they are saved. -->
+            <button class="btn btn-ghost" type="button" id="test-draft-btn">Test Connection</button>
             <button class="btn btn-ghost is-hidden" type="button" id="cancel-edit-btn">Cancel Edit</button>
             <!-- A link, not a submit: it tests engines already saved, never the values typed into this form. -->
             <a href="/admin/engine-test" class="btn btn-ghost" title="Tests saved engines; click Add Engine first">Test Saved Engines</a>
         </div>
+        <p id="test-draft-result" class="pull-status-text test-draft-result" role="status" aria-live="polite"></p>
     </form>
 </div>
 
@@ -164,11 +169,14 @@
     </div>
 </div>
 
+<!-- Small cards share a row on wide screens -->
+<div class="card-row">
 <!-- Change Admin Password Card -->
-<div class="card card-mt">
+<div class="card">
     <h2>Change Admin Password</h2>
     <form action="/admin/change-password" method="post" class="space-y-3">
         <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
+        <div class="form-grid">
         <div>
             <label>Current Password</label>
             <input type="password" name="current" placeholder="Current password">
@@ -181,12 +189,13 @@
             <label>Confirm New Password</label>
             <input type="password" name="confirm" placeholder="Confirm new password">
         </div>
+        </div>
         <button class="btn btn-primary" type="submit">Update Password</button>
     </form>
 </div>
 
 <!-- Reset System Card -->
-<div class="card card-mt card-danger">
+<div class="card card-danger">
     <h2>Reset System</h2>
     <p class="section-desc">
         Permanently deletes all audit logs and clears all rate-limit counters. Users and settings are not affected.
@@ -197,6 +206,7 @@
         <input type="hidden" name="next" value="settings_page">
         <button type="submit" class="btn btn-danger">Reset System</button>
     </form>
+</div>
 </div>
 
 {{end}}
@@ -256,6 +266,35 @@
         });
     });
     cancelBtn.addEventListener('click', exitEdit);
+
+    // ── Test Connection: try the typed values without saving them ────────────
+    const testBtn    = document.getElementById('test-draft-btn');
+    const testResult = document.getElementById('test-draft-result');
+    const form       = document.getElementById('engine-settings-form');
+
+    testBtn.addEventListener('click', async () => {
+        testBtn.disabled = true;
+        testResult.textContent = 'Testing…';
+        setTone(testResult);
+        try {
+            // URL-encoded, not FormData: the server's ParseForm (and so the
+            // CSRF check) does not read multipart bodies.
+            const resp = await fetch('/admin/engine-test-draft', {
+                method: 'POST',
+                body: new URLSearchParams(new FormData(form)),
+            });
+            const data = await resp.json();
+            testResult.textContent = data.message;
+            setTone(testResult, data.ok ? 'ok' : 'error');
+        } catch (e) {
+            testResult.textContent = 'Test failed: ' + e.message;
+            setTone(testResult, 'error');
+        } finally {
+            testBtn.disabled = false;
+        }
+    });
+    // A result describes the values it tested; once they change, it no longer applies.
+    form.addEventListener('input', () => { testResult.textContent = ''; setTone(testResult); });
 
     const pullEngine = document.getElementById('pull-engine');
     if (pullEngine.options.length <= 1) pullEngine.classList.add('is-hidden');
