@@ -238,6 +238,56 @@ func TestAuthErrorShapeFollowsPath(t *testing.T) {
 	}
 }
 
+// x-api-key authenticates on Anthropic routes only; Bearer works everywhere.
+// A client sending both must authenticate as the Bearer identity.
+func TestAPIKeyHeaderFollowsPath(t *testing.T) {
+	withTestDB(t)
+	if err := createUser("hdr-test", "sk-gw-good", 60); err != nil {
+		t.Fatalf("createUser: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE users SET status='active' WHERE name='hdr-test'`); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+
+	var gotUser *User
+	h := apiAuthMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUser = userFromContext(r)
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	cases := []struct {
+		name, path, bearer, xkey string
+		want                     int
+	}{
+		{"x-api-key on messages", "/v1/messages", "", "sk-gw-good", 200},
+		{"x-api-key on count_tokens", "/v1/messages/count_tokens", "", "sk-gw-good", 200},
+		{"x-api-key rejected on OpenAI path", "/v1/chat/completions", "", "sk-gw-good", 401},
+		{"Bearer on OpenAI path", "/v1/chat/completions", "sk-gw-good", "", 200},
+		{"Bearer wins when both", "/v1/messages", "sk-gw-good", "sk-wrong", 200},
+		{"wrong x-api-key", "/v1/messages", "", "sk-nope", 401},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			gotUser = nil
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest("POST", c.path, nil)
+			if c.bearer != "" {
+				req.Header.Set("Authorization", "Bearer "+c.bearer)
+			}
+			if c.xkey != "" {
+				req.Header.Set("x-api-key", c.xkey)
+			}
+			h.ServeHTTP(rec, req)
+			if rec.Code != c.want {
+				t.Errorf("%s: %d %s, want %d", c.name, rec.Code, rec.Body.String(), c.want)
+			}
+			if c.want == 200 && (gotUser == nil || gotUser.Name != "hdr-test") {
+				t.Errorf("%s: context user = %+v", c.name, gotUser)
+			}
+		})
+	}
+}
+
 func TestMessagesRouteRegistered(t *testing.T) {
 	r := setupRouter()
 	for _, path := range []string{"/v1/messages", "/v1/messages/count_tokens"} {
