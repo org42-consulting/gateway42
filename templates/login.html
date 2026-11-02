@@ -2,13 +2,20 @@
 <html>
 <head>
     <script src="https://cdn.tailwindcss.com"></script>
-    <script>(function(){var t;try{t=localStorage.getItem("theme")}catch(e){}var d=t==="dark"||(t===null&&matchMedia("(prefers-color-scheme:dark)").matches);document.documentElement.setAttribute("data-theme",d?"dark":"light")})()</script>
     <title>Gateway42 — Login</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Poppins:wght@200;300;400;500;600&display=swap" />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Mulish:wght@400;600;700;800&display=swap" />
     <link rel="stylesheet" href="/static/gateway42.css">
 </head>
 <body class="login-page">
+    <!-- #logo-lift: lifts the logo's #990000 red, too dark on the blue background, to #F87171 (the
+         UI's light red). The green channel tells the two colors apart (white G=1, red G=0), so each
+         output channel is white_target*G + red_target*(1-G); white stays white. -->
+    <svg class="svg-defs" aria-hidden="true" focusable="false">
+        <filter id="logo-lift" color-interpolation-filters="sRGB">
+            <feColorMatrix type="matrix" values="0 0.0275 0 0 0.9725  0 0.5569 0 0 0.4431  0 0.5569 0 0 0.4431  0 0 0 1 0"/>
+        </filter>
+    </svg>
     <div class="login-stack">
         <img src="/images/gw42.png" alt="Gateway42" class="login-logo">
         <label class="login-tagline">An opinionated gateway for any LLM.</label>

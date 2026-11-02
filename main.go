@@ -183,6 +183,7 @@ type BaseData struct {
 	Flashes     []FlashMsg
 	CurrentPath string
 	CSRFToken   string
+	NavEngines  []NavEngine // sidebar engine box; nil when not an admin session
 }
 
 // LoginData holds data for the standalone login page. It carries BaseData for
@@ -399,11 +400,17 @@ func isAdminSession(r *http.Request) bool {
 // that built BaseData by hand would render forms that the middleware then
 // rejects. It consumes flashes, so call it exactly once per response.
 func newBaseData(w http.ResponseWriter, r *http.Request) BaseData {
-	return BaseData{
+	bd := BaseData{
 		Flashes:     consumeFlashes(w, r, getSession(r)),
 		CurrentPath: r.URL.Path,
 		CSRFToken:   csrfToken(w, r),
 	}
+	// Admin pages only: the login page must not be a way for anonymous
+	// visitors to trigger probes against the upstream engines.
+	if isAdminSession(r) {
+		bd.NavEngines = navEngines()
+	}
+	return bd
 }
 
 func addFlash(w http.ResponseWriter, r *http.Request, category, message string) {
@@ -748,6 +755,7 @@ func setupRouter() *mux.Router {
 	r.HandleFunc("/admin/panel", handleAdminPanel).Methods("GET")
 	r.HandleFunc("/admin/settings-page", handleAdminSettingsPage).Methods("GET")
 	r.HandleFunc("/admin/engine-test", handleEngineTest).Methods("GET")
+	r.HandleFunc("/admin/engine-test-draft", handleEngineTestDraft).Methods("POST")
 	r.HandleFunc("/admin/ollama-pull-stream", handleOllamaPullStream).Methods("GET")
 	r.HandleFunc("/admin/ollama-delete-model", handleOllamaDeleteModel).Methods("POST")
 	r.HandleFunc("/admin/engine-settings", handleEngineSettings).Methods("POST")

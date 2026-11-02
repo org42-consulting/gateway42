@@ -368,42 +368,15 @@ func handleEngineSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	engineType := r.FormValue("engine_type")
 	engineName := strings.TrimSpace(r.FormValue("engine_name"))
-	baseURL := strings.TrimSpace(r.FormValue("base_url"))
-	portStr := strings.TrimSpace(r.FormValue("port"))
 	apiKey := r.FormValue("api_key")
 	editIDStr := r.FormValue("engine_id")
 
-	// Validate type.
-	if engineType != EngineOllama && engineType != EngineOpenAICompat {
-		addFlash(w, r, "error", "Invalid engine type")
+	engineType, baseURL, portInt, msg := engineFormFields(r)
+	if msg != "" {
+		addFlash(w, r, "error", msg)
 		http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
 		return
-	}
-
-	// URL is required for all types.
-	if baseURL == "" {
-		addFlash(w, r, "error", "Base URL is required")
-		http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
-		return
-	}
-
-	// Port required for Ollama, default 11434.
-	portInt := 11434
-	if engineType == EngineOllama {
-		if portStr == "" {
-			addFlash(w, r, "error", "Port is required for Ollama engines")
-			http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
-			return
-		}
-		var err error
-		portInt, err = strconv.Atoi(portStr)
-		if err != nil || portInt < 1 || portInt > 65535 {
-			addFlash(w, r, "error", "Port must be a number between 1 and 65535")
-			http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
-			return
-		}
 	}
 
 	// Determine if editing existing or creating new.
@@ -499,6 +472,93 @@ func handleEngineSettings(w http.ResponseWriter, r *http.Request) {
 //
 // Fields that belong only to the other engine type are cleared on a type
 // change, so a stale port or key cannot resurface if the type is switched back.
+// engineFormFields reads and validates the engine form fields that saving and
+// testing share. msg is the error to show the admin, empty when the fields are
+// valid. port is 11434 for engine types that do not use one.
+func engineFormFields(r *http.Request) (engineType, baseURL string, port int, msg string) {
+	engineType = r.FormValue("engine_type")
+	baseURL = strings.TrimSpace(r.FormValue("base_url"))
+	portStr := strings.TrimSpace(r.FormValue("port"))
+
+	if engineType != EngineOllama && engineType != EngineOpenAICompat {
+		return "", "", 0, "Invalid engine type"
+	}
+	if baseURL == "" {
+		return "", "", 0, "Base URL is required"
+	}
+	port = 11434
+	if engineType == EngineOllama {
+		if portStr == "" {
+			return "", "", 0, "Port is required for Ollama engines"
+		}
+		var err error
+		port, err = strconv.Atoi(portStr)
+		if err != nil || port < 1 || port > 65535 {
+			return "", "", 0, "Port must be a number between 1 and 65535"
+		}
+	}
+	return engineType, baseURL, port, ""
+}
+
+// handleEngineTestDraft tests the engine settings typed into the form before
+// they are saved. The page calls it with fetch and shows the answer next to
+// the button, so the typed values stay in the form whatever the outcome.
+func handleEngineTestDraft(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	reply := func(ok bool, msg string) {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": ok, "message": msg})
+	}
+	if !isAdminSession(r) {
+		w.WriteHeader(http.StatusUnauthorized)
+		reply(false, "Session expired; log in again")
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		reply(false, "Could not read the form")
+		return
+	}
+	engineType, baseURL, port, msg := engineFormFields(r)
+	if msg != "" {
+		reply(false, msg)
+		return
+	}
+
+	// Build the config exactly as saving would. When editing, start from the
+	// saved engine: a blank API key means "keep the current one", so the test
+	// must use that key too, or it would fail where the saved engine works.
+	ec := EngineConfig{Name: "draft"}
+	if id, err := strconv.Atoi(r.FormValue("engine_id")); err == nil {
+		for _, e := range cachedEngines() {
+			if e.ID == id {
+				ec = e
+				break
+			}
+		}
+	}
+	applyEngineEdit(&ec, engineType, "", baseURL, port, r.FormValue("api_key"))
+
+	adapter, err := newEngine(ec)
+	if err != nil {
+		reply(false, err.Error())
+		return
+	}
+	up, err := adapter.Status()
+	if err != nil {
+		reply(false, "Connection failed: "+err.Error())
+		return
+	}
+	if !up {
+		reply(false, "The engine answered, but does not report itself as ready")
+		return
+	}
+	models, err := adapter.ListModels()
+	if err != nil {
+		reply(true, "Connected, but listing models failed: "+err.Error())
+		return
+	}
+	reply(true, fmt.Sprintf("Connected. %d model(s) available.", len(models)))
+}
+
 func applyEngineEdit(e *EngineConfig, engineType, name, baseURL string, port int, apiKey string) {
 	e.Type = engineType
 	e.BaseURL = baseURL

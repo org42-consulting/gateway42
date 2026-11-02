@@ -2,41 +2,61 @@
 <html>
 <head>
     <script src="https://cdn.tailwindcss.com"></script>
-    <script>(function(){var t;try{t=localStorage.getItem("theme")}catch(e){}var d=t==="dark"||(t===null&&matchMedia("(prefers-color-scheme:dark)").matches);document.documentElement.setAttribute("data-theme",d?"dark":"light")})()</script>
     <title>Gateway42.</title>
     <!-- Read by fetch() callers that POST without a form to build. -->
     <meta name="csrf-token" content="{{$.CSRFToken}}">
     <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Poppins:wght@200;300;400;500;600&display=swap" />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Mulish:wght@400;600;700;800&display=swap" />
     <!-- Keep this link above the point where Tailwind's Play CDN appends its own
          stylesheet (the end of head): the cascade depends on that order. -->
     <link rel="stylesheet" href="/static/gateway42.css">
 </head>
 
 <body>
-    <!-- App bar: logo, navigation, theme toggle, logout -->
-    <header>
-        <div class="header-inner">
-            <img src="/images/gw42.png" alt="Gateway42." class="header-logo">
-            <div class="header-wordmark">
-                <span class="tagline">An opinionated gateway to local LLMs.</span>
-            </div>
-            <nav class="sidebar" aria-label="Primary">
-                <ul class="sidebar-nav">
-                    <li><a href="/admin/panel" class="{{if eq .CurrentPath "/admin/panel"}}active{{end}}">Dashboard</a></li>
-                    <li><a href="/admin/settings-page" class="{{if eq .CurrentPath "/admin/settings-page"}}active{{end}}">Settings</a></li>
-                    <li><a href="/admin/logs" class="{{if hasPrefix .CurrentPath "/admin/logs"}}active{{end}}">Logs</a></li>
-                    <li><a href="/admin/help" class="{{if eq .CurrentPath "/admin/help"}}active{{end}}">Help</a></li>
-                </ul>
-            </nav>
-            <button type="button" class="theme-toggle ml-auto" id="themeToggle" aria-label="Toggle dark mode" title="Toggle dark mode">&#9680;</button>
+    <!-- #logo-lift: lifts the logo's #990000 red, too dark on the blue background, to #F87171 (the
+         UI's light red). The green channel tells the two colors apart (white G=1, red G=0), so each
+         output channel is white_target*G + red_target*(1-G); white stays white. -->
+    <svg class="svg-defs" aria-hidden="true" focusable="false">
+        <filter id="logo-lift" color-interpolation-filters="sRGB">
+            <feColorMatrix type="matrix" values="0 0.0275 0 0 0.9725  0 0.5569 0 0 0.4431  0 0.5569 0 0 0.4431  0 0 0 1 0"/>
+        </filter>
+    </svg>
+    <div class="app-shell">
+    <!-- Sidebar: logo, navigation, engine status, logout -->
+    <aside class="sidebar">
+        <div class="sidebar-brand">
+            <img src="/images/gw42.png" alt="Gateway42." class="sidebar-logo">
+            <span class="tagline">An opinionated gateway to local LLMs.</span>
+        </div>
+        <nav aria-label="Primary">
+            <ul class="sidebar-nav">
+                <li><a href="/admin/panel" class="{{if eq .CurrentPath "/admin/panel"}}active{{end}}"{{if eq .CurrentPath "/admin/panel"}} aria-current="page"{{end}}>
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>Dashboard</a></li>
+                <li><a href="/admin/settings-page" class="{{if eq .CurrentPath "/admin/settings-page"}}active{{end}}"{{if eq .CurrentPath "/admin/settings-page"}} aria-current="page"{{end}}>
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>Settings</a></li>
+                <li><a href="/admin/logs" class="{{if hasPrefix .CurrentPath "/admin/logs"}}active{{end}}"{{if hasPrefix .CurrentPath "/admin/logs"}} aria-current="page"{{end}}>
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12"/><circle cx="4" cy="6" r="1"/><circle cx="4" cy="12" r="1"/><circle cx="4" cy="18" r="1"/></svg>Logs</a></li>
+                <li><a href="/admin/help" class="{{if eq .CurrentPath "/admin/help"}}active{{end}}"{{if eq .CurrentPath "/admin/help"}} aria-current="page"{{end}}>
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9.5 9.5a2.5 2.5 0 1 1 3.5 2.3c-.6.3-1 .9-1 1.6v.6M12 17.5h0"/></svg>Help</a></li>
+            </ul>
+        </nav>
+        <!-- Engine status from the probe cache; never waits on an upstream (see navEngines). -->
+        <section class="engine-box" aria-label="Engine status">
+            <h2 class="engine-box-title">Engines</h2>
+            {{range .NavEngines}}
+            <div class="engine-row engine-{{.State}}"><span class="engine-dot" aria-hidden="true"></span><span class="engine-name">{{.Name}}</span><span class="engine-state">{{.State}}</span></div>
+            {{else}}
+            <a href="/admin/settings-page" class="engine-none">No engines configured</a>
+            {{end}}
+        </section>
+        <div class="sidebar-actions">
             <!-- POST, not a link: logout changes session state, so it goes through the CSRF check like every other admin action. -->
             <form action="/logout" method="post">
                 <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
                 <button class="btn btn-danger">Logout</button>
             </form>
         </div>
-    </header>
+    </aside>
 
     <!-- Main content -->
     <main class="main-content">
@@ -44,7 +64,7 @@
             {{block "content" .}}{{end}}
         </div>
     </main>
-    <script>document.getElementById("themeToggle").onclick=function(){var r=document.documentElement,n=r.getAttribute("data-theme")==="dark"?"light":"dark";r.setAttribute("data-theme",n);try{localStorage.setItem("theme",n)}catch(e){}}</script>
+    </div>
     {{block "scripts" .}}{{end}}
 </body>
 </html>{{end}}

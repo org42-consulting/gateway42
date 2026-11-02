@@ -528,6 +528,58 @@ func warmProbeCache(ctx context.Context) {
 	}
 }
 
+// NavEngine is one row of the sidebar's engine box.
+type NavEngine struct {
+	Name  string
+	State string // "online", "offline" or "unknown"
+}
+
+// navEngines reports every configured engine's state from the probe cache
+// without ever waiting on an upstream: the sidebar is on every admin page, and
+// one dead engine must not slow them all down. When the cache has gaps it
+// starts a background warm-up, so the next page load shows fresh states.
+func navEngines() []NavEngine {
+	engines := cachedEngines()
+	out := make([]NavEngine, 0, len(engines))
+	refresh := false
+	for _, e := range engines {
+		state, stale := peekProbeState(e.ID)
+		refresh = refresh || stale
+		out = append(out, NavEngine{Name: e.Name, State: state})
+	}
+	if refresh {
+		go warmProbeCache(context.Background())
+	}
+	return out
+}
+
+// peekProbeState reads one engine's state from the probe cache without
+// probing. It returns the state to show ("online", "offline" or "unknown")
+// and whether the cache needs a refresh for that engine.
+//
+// An expired entry still shows its last result: a state a few seconds old is
+// more useful than "unknown", and the refresh it triggers replaces it. A
+// refresh already in flight is not stale; starting another would only queue
+// behind it.
+func peekProbeState(id int) (state string, stale bool) {
+	probeCacheMu.Lock()
+	defer probeCacheMu.Unlock()
+	entry, ok := probeCache[id]
+	if !ok {
+		return "unknown", true
+	}
+	// A zero expiry means no probe has finished yet: the entry is the
+	// in-flight marker of the first one, and its zero status is not "down".
+	if entry.expiry.IsZero() {
+		return "unknown", entry.inflight == nil
+	}
+	state = "offline"
+	if entry.status {
+		state = "online"
+	}
+	return state, entry.inflight == nil && !time.Now().Before(entry.expiry)
+}
+
 // probeEngineFull probes an engine adapter for status, model names, and model details.
 func probeEngineFull(e Engine) probeData {
 	status, err := e.Status()
