@@ -2,42 +2,39 @@
 <html>
 <head>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script>(function(){var t;try{t=localStorage.getItem("theme")}catch(e){}var d=t==="dark"||(t===null&&matchMedia("(prefers-color-scheme:dark)").matches);document.documentElement.setAttribute("data-theme",d?"dark":"light")})()</script>
     <title>Gateway42.</title>
     <!-- Read by fetch() callers that POST without a form to build. -->
     <meta name="csrf-token" content="{{$.CSRFToken}}">
     <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Mulish:wght@400;600;700;800&display=swap" />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Poppins:wght@200;300;400;500;600&display=swap" />
     <!-- Keep this link above the point where Tailwind's Play CDN appends its own
          stylesheet (the end of head): the cascade depends on that order. -->
     <link rel="stylesheet" href="/static/gateway42.css">
 </head>
 
 <body>
-    <!-- Navigation sidebar -->
-    <nav class="sidebar">
-        <ul class="sidebar-nav">
-            <li><a href="/admin/panel" class="{{if eq .CurrentPath "/admin/panel"}}active{{end}}">Dashboard</a></li>
-            <li><a href="/admin/settings-page" class="{{if eq .CurrentPath "/admin/settings-page"}}active{{end}}">Settings</a></li>
-            <li><a href="/admin/logs" class="{{if hasPrefix .CurrentPath "/admin/logs"}}active{{end}}">Logs</a></li>
-            <li><a href="/admin/help" class="{{if eq .CurrentPath "/admin/help"}}active{{end}}">Help</a></li>
-        </ul>
-    </nav>
-
-    <!-- Header Bar -->
+    <!-- App bar: logo, navigation, theme toggle, logout -->
     <header>
         <div class="header-inner">
             <img src="/images/gw42.png" alt="Gateway42." class="header-logo">
             <div class="header-wordmark">
-                <span class="brand">Gateway42.</span>
                 <span class="tagline">An opinionated gateway to local LLMs.</span>
             </div>
-            <div class="ml-auto">
-                <!-- POST, not a link: logout changes session state, so it goes through the CSRF check like every other admin action. -->
-                <form action="/logout" method="post">
-                    <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
-                    <button class="btn btn-danger">Logout</button>
-                </form>
-            </div>
+            <nav class="sidebar" aria-label="Primary">
+                <ul class="sidebar-nav">
+                    <li><a href="/admin/panel" class="{{if eq .CurrentPath "/admin/panel"}}active{{end}}">Dashboard</a></li>
+                    <li><a href="/admin/settings-page" class="{{if eq .CurrentPath "/admin/settings-page"}}active{{end}}">Settings</a></li>
+                    <li><a href="/admin/logs" class="{{if hasPrefix .CurrentPath "/admin/logs"}}active{{end}}">Logs</a></li>
+                    <li><a href="/admin/help" class="{{if eq .CurrentPath "/admin/help"}}active{{end}}">Help</a></li>
+                </ul>
+            </nav>
+            <button type="button" class="theme-toggle ml-auto" id="themeToggle" aria-label="Toggle dark mode" title="Toggle dark mode">&#9680;</button>
+            <!-- POST, not a link: logout changes session state, so it goes through the CSRF check like every other admin action. -->
+            <form action="/logout" method="post">
+                <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
+                <button class="btn btn-danger">Logout</button>
+            </form>
         </div>
     </header>
 
@@ -47,6 +44,7 @@
             {{block "content" .}}{{end}}
         </div>
     </main>
+    <script>document.getElementById("themeToggle").onclick=function(){var r=document.documentElement,n=r.getAttribute("data-theme")==="dark"?"light":"dark";r.setAttribute("data-theme",n);try{localStorage.setItem("theme",n)}catch(e){}}</script>
     {{block "scripts" .}}{{end}}
 </body>
 </html>{{end}}
