@@ -373,8 +373,14 @@ func streamMessages(w http.ResponseWriter, r *http.Request, adapter Engine,
 // handleCountTokens serves POST /v1/messages/count_tokens with an estimate;
 // see estimateTokens for why an estimate is enough.
 func handleCountTokens(w http.ResponseWriter, r *http.Request) {
-	if userFromContext(r) == nil {
+	user := userFromContext(r)
+	if user == nil {
 		writeAnthropicError(w, 401, "Invalid API key", "authentication_error")
+		return
+	}
+	// Rate limited like the completion endpoints: no engine is involved, but
+	// each call still decodes and re-encodes a body of up to 8× MaxMsgLen.
+	if !checkRateLimit(w, user, writeAnthropicError) {
 		return
 	}
 	body, ok := decodeAPIBody(w, r, writeAnthropicError)
