@@ -690,10 +690,18 @@ func apiAuthMiddleware(next http.Handler) http.Handler {
 // OpenAI SDKs send "Authorization: Bearer <key>". Anthropic SDKs — and so
 // Claude Code — send "x-api-key: <key>" when configured with
 // ANTHROPIC_API_KEY, and Bearer only with ANTHROPIC_AUTH_TOKEN.
+//
+// x-api-key is accepted on the Anthropic routes only: each protocol's clients
+// keep to their own wire format, so an OpenAI-path request that forgot
+// Authorization still fails loudly instead of authenticating through a header
+// some proxies strip or log differently. Bearer is checked first on every
+// path, so when a client sends both, the Bearer identity wins.
 func apiKeyFromRequest(r *http.Request) string {
-	// TODO(user): decide which headers are accepted, and on which paths.
 	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
 		return auth[7:]
+	}
+	if strings.HasPrefix(r.URL.Path, "/v1/messages") {
+		return r.Header.Get("x-api-key")
 	}
 	return ""
 }
