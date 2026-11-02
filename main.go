@@ -175,13 +175,27 @@ type SysLogEntry struct {
 
 // RequestLogRow represents a row in the HTTP request log
 type RequestLogRow struct {
-	ID         int    `json:"ID"`
-	TS         string `json:"TS"`
-	Method     string `json:"Method"`
-	Path       string `json:"Path"`
-	ClientIP   string `json:"ClientIP"`
-	UserName   string `json:"Name"`
-	StatusCode int    `json:"Status"`
+	ID             int    `json:"ID"`
+	TS             string `json:"TS"`
+	Method         string `json:"Method"`
+	Path           string `json:"Path"`
+	ClientIP       string `json:"ClientIP"`
+	UserName       string `json:"Name"`
+	StatusCode     int    `json:"Status"`
+	RequestID      string `json:"RequestID"`
+	ModelRequested string `json:"ModelRequested"`
+	ModelServed    string `json:"ModelServed"`
+	EngineName     string `json:"EngineName"`
+	EngineType     string `json:"EngineType"`
+	Streamed       int    `json:"Streamed"`
+	TTFTMs         int    `json:"TTFTMs"`
+	DurationMs     int    `json:"DurationMs"`
+	InTokens       int    `json:"InTokens"`
+	OutTokens      int    `json:"OutTokens"`
+	StopReason     string `json:"StopReason"`
+	Outcome        string `json:"Outcome"`
+	UpstreamError  string `json:"UpstreamError"`
+	UserAgent      string `json:"UserAgent"`
 }
 
 // ─── Template data structs ────────────────────────────────────────────────────
@@ -713,6 +727,11 @@ func requestLoggingMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
+		detail, r := newRequestDetail(r)
+		// The client sees the same id the audit row stores, so an error it
+		// displays traces to exactly one row: search the id on the Logs page.
+		w.Header().Set("X-Request-ID", detail.id)
+
 		rec := ensureRecorder(w)
 
 		// Deferred, so a panic below still produces an audit row. This layer sits
@@ -721,6 +740,7 @@ func requestLoggingMiddleware(next http.Handler) http.Handler {
 		// rather than the 200 the recorder still holds.
 		panicking := true
 		defer func() {
+			detail.duration = time.Since(detail.start)
 			status := rec.status
 			if panicking {
 				status = panicStatus(rec)
@@ -733,7 +753,7 @@ func requestLoggingMiddleware(next http.Handler) http.Handler {
 
 			// Non-blocking: enqueueRequestLog drops on overflow rather than
 			// spawning unbounded goroutines.
-			insertRequestLog(r.Method, r.URL.Path, clientIP(r), userName, status)
+			insertRequestLog(r.Method, r.URL.Path, clientIP(r), userName, status, detail)
 		}()
 
 		next.ServeHTTP(rec, r)

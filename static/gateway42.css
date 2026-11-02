@@ -595,6 +595,8 @@ label.login-tagline  { margin-bottom: 26px; }
 .data-table .col-80  { width: 80px; }
 .data-table .col-90  { width: 90px; }
 .data-table .col-100 { width: 100px; }
+.data-table .col-110 { width: 110px; }
+.data-table .col-120 { width: 120px; }
 .data-table .col-140 { width: 140px; }
 .data-table .col-160 { width: 160px; }
 .data-table .col-180 { width: 180px; }
@@ -661,6 +663,30 @@ label.search-label     { margin-top: 16px; }
 .data-table .log-code.is-5xx,
 .data-table .log-code.is-error { color: rgba(255,90,90,.85); }
 .data-table .log-code.is-info  { color: rgba(255,255,255,.65); }
+
+/* Request detail: the row expands in place under its summary row. */
+.data-table .log-model  { color: rgba(255,255,255,.65); }
+.data-table .log-engine { color: rgba(255,255,255,.55); }
+.data-table .log-ms     { white-space: nowrap; color: rgba(255,255,255,.55); font-size: .75rem; }
+.data-table .log-tokens { white-space: nowrap; color: rgba(255,255,255,.55); font-size: .75rem; }
+.data-table tr.log-row  { cursor: pointer; }
+.data-table tr.log-row:hover td { background: rgba(255,255,255,.03); }
+.data-table tr.log-detail-row > td {
+    background: rgba(0,0,0,.18);
+    padding: 12px 16px;
+}
+.detail-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 8px 24px;
+}
+.detail-item  { display: flex; gap: 10px; align-items: baseline; min-width: 0; }
+.detail-key   { color: rgba(255,255,255,.4); font-size: .75rem; white-space: nowrap; min-width: 130px; }
+.detail-val   { color: rgba(255,255,255,.75); font-size: .8125rem; word-break: break-word; }
+.detail-val code { font-size: .75rem; color: rgba(180,200,255,.8); }
+.detail-dim   { color: rgba(255,255,255,.4); }
+.detail-val .is-4xx { color: rgba(255,190,60,.85); }
+.detail-val .is-5xx { color: rgba(255,90,90,.85); }
 
 /* ── Confirm delete ── */
 .card.confirm-card,

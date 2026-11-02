@@ -173,27 +173,40 @@ func TestPassthroughStreamStopsAtDone(t *testing.T) {
 	}
 }
 
-// Recv hands the handler the audit text alongside the payload, extracted in
-// the same pass that shaped it. These pin both extraction paths: ollamaStream
-// reads its typed chunk, passthroughStream parses the frame once.
+// Recv hands the handler the frame metadata alongside the payload, extracted
+// in the same pass that shaped it. These pin both extraction paths:
+// ollamaStream reads its typed chunk, passthroughStream parses the frame once.
 func TestRecvCarriesAuditText(t *testing.T) {
 	ollama := newOllamaTestStream(`{"model":"llama3","message":{"role":"assistant","content":"Hel"},"done":false}
 {"model":"llama3","message":{"content":"lo"},"done":false}
-{"model":"llama3","message":{"content":""},"done":true}
+{"model":"llama3","message":{"content":""},"eval_count":7,"prompt_eval_count":3,"done":true}
 `)
 	var text strings.Builder
+	var last chunkMeta
 	for {
-		_, auditText, err := ollama.Recv()
+		_, meta, err := ollama.Recv()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
 			t.Fatalf("Recv: %v", err)
 		}
-		text.WriteString(auditText)
+		text.WriteString(meta.auditText)
+		last = meta
 	}
 	if text.String() != "Hello" {
 		t.Errorf("ollama audit text = %q, want \"Hello\"", text.String())
+	}
+	// The terminal chunk carries the finish reason and Ollama's eval counts,
+	// which the request log stores as stop_reason and token usage.
+	if last.finish != "stop" {
+		t.Errorf("ollama finish = %q, want \"stop\"", last.finish)
+	}
+	if last.model != "llama3" {
+		t.Errorf("ollama model = %q, want \"llama3\"", last.model)
+	}
+	if last.inTokens != 3 || last.outTokens != 7 {
+		t.Errorf("ollama usage = %d/%d, want 3/7", last.inTokens, last.outTokens)
 	}
 
 	passthrough := newPassthroughTestStream(`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Tokyo\"}"}}]}}]}
@@ -201,12 +214,42 @@ func TestRecvCarriesAuditText(t *testing.T) {
 data: [DONE]
 
 `)
-	_, auditText, err := passthrough.Recv()
+	_, meta, err := passthrough.Recv()
 	if err != nil {
 		t.Fatalf("Recv: %v", err)
 	}
 	want := "\n[tool_call get_weather] {\"city\":\"Tokyo\"}"
-	if auditText != want {
-		t.Errorf("passthrough audit text = %q, want %q", auditText, want)
+	if meta.auditText != want {
+		t.Errorf("passthrough audit text = %q, want %q", meta.auditText, want)
+	}
+}
+
+// The usage block rides on the final chunk when the client asks for it
+// (stream_options.include_usage); metaFromChunk must surface it.
+func TestRecvCarriesUsage(t *testing.T) {
+	s := newPassthroughTestStream(`data: {"model":"gpt-x","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":5}}
+
+data: [DONE]
+
+`)
+	var last chunkMeta
+	for {
+		_, meta, err := s.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Recv: %v", err)
+		}
+		last = meta
+	}
+	if last.inTokens != 11 || last.outTokens != 5 {
+		t.Errorf("usage = %d/%d, want 11/5", last.inTokens, last.outTokens)
+	}
+	if last.finish != "stop" {
+		t.Errorf("finish = %q, want \"stop\"", last.finish)
+	}
+	if last.model != "gpt-x" {
+		t.Errorf("model = %q, want \"gpt-x\"", last.model)
 	}
 }

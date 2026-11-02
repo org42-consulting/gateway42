@@ -179,9 +179,10 @@ type Engine interface {
 
 // ChatStream is a live streaming completion. Recv returns successive SSE data
 // payloads — the bytes that belong after "data: " — already in OpenAI wire
-// shape, the client-visible text extracted from that payload for the audit
-// log, and io.EOF once the upstream stream ends normally. Close must always
-// be called, and releases the underlying response body.
+// shape, the metadata the adapter extracted from that payload (audit text,
+// served model, finish reason, token counts — see chunkMeta), and io.EOF once
+// the upstream stream ends normally. Close must always be called, and releases
+// the underlying response body.
 //
 // This replaces a ChatStream(w, r, …) method that took an http.ResponseWriter.
 // Handing adapters the writer meant SSE framing, error payloads, flushing and
@@ -190,14 +191,14 @@ type Engine interface {
 // framing back off. With a reader the handler owns the wire format once and a
 // test can drive an adapter's translator straight from a bytes.Reader.
 //
-// The audit text rides along for the same reason the payload is pre-shaped:
+// The metadata rides along for the same reason the payload is pre-shaped:
 // the adapter has already parsed the chunk (ollamaStream to translate it,
-// passthroughStream to read it), so it can hand the audit its text for free.
-// Having the handler re-unmarshal every frame was a second full parse of
-// every token of every completion, on the request path, to re-derive text
-// that was in hand one frame earlier.
+// passthroughStream to read it), so it can hand the handler its audit text
+// and usage for free. Having the handler re-unmarshal every frame was a
+// second full parse of every token of every completion, on the request path,
+// to re-derive text that was in hand one frame earlier.
 type ChatStream interface {
-	Recv() (payload []byte, auditText string, err error)
+	Recv() (payload []byte, meta chunkMeta, err error)
 	Close() error
 }
 
@@ -221,10 +222,14 @@ func deltaAuditText(d Delta) string {
 	return b.String()
 }
 
-// auditChunk is the subset of a chat.completion.chunk the audit reads.
+// auditChunk is the subset of a chat.completion.chunk the gateway reads for
+// its own records: audit text, the served model, the finish reason, and the
+// usage block (which OpenAI sends only on the final chunk, if at all).
 type auditChunk struct {
+	Model   string `json:"model"`
 	Choices []struct {
-		Delta struct {
+		FinishReason *string `json:"finish_reason"`
+		Delta        struct {
 			Content   string `json:"content"`
 			ToolCalls []struct {
 				Function struct {
@@ -234,17 +239,23 @@ type auditChunk struct {
 			} `json:"tool_calls"`
 		} `json:"delta"`
 	} `json:"choices"`
+	Usage *Usage `json:"usage"`
 }
 
-// auditTextFromChunk extracts the audit text from an upstream chunk that
+// metaFromChunk extracts the request-log metadata from an upstream chunk that
 // arrives as bytes (the passthrough path). A payload that is not a chunk — an
 // error object, say — contributes nothing: the stream already relayed it.
-func auditTextFromChunk(payload []byte) string {
+func metaFromChunk(payload []byte) chunkMeta {
 	var c auditChunk
 	if json.Unmarshal(payload, &c) != nil {
-		return ""
+		return chunkMeta{}
 	}
 	var b strings.Builder
+	var meta chunkMeta
+	meta.model = c.Model
+	if c.Usage != nil {
+		meta.inTokens, meta.outTokens = c.Usage.PromptTokens, c.Usage.CompletionTokens
+	}
 	for _, ch := range c.Choices {
 		b.WriteString(ch.Delta.Content)
 		for _, tc := range ch.Delta.ToolCalls {
@@ -253,8 +264,12 @@ func auditTextFromChunk(payload []byte) string {
 			}
 			b.WriteString(tc.Function.Arguments)
 		}
+		if ch.FinishReason != nil {
+			meta.finish = *ch.FinishReason
+		}
 	}
-	return b.String()
+	meta.auditText = b.String()
+	return meta
 }
 
 // ollamaStream translates Ollama's newline-delimited JSON into OpenAI chunks.
@@ -272,9 +287,9 @@ type ollamaStream struct {
 	toolCalls int
 }
 
-func (s *ollamaStream) Recv() ([]byte, string, error) {
+func (s *ollamaStream) Recv() ([]byte, chunkMeta, error) {
 	if s.done {
-		return nil, "", io.EOF
+		return nil, chunkMeta{}, io.EOF
 	}
 	for s.scanner.Scan() {
 		line := strings.TrimSpace(s.scanner.Text())
@@ -297,13 +312,19 @@ func (s *ollamaStream) Recv() ([]byte, string, error) {
 		if choice.FinishReason != nil && s.toolCalls > 0 {
 			choice.FinishReason = &finishToolCalls
 		}
-		// The audit text comes out of the typed chunk that is already in
+		// The metadata comes out of the typed chunk that is already in
 		// hand — no second parse, and the tool-call renumbering above is
-		// already reflected in it.
-		auditText := deltaAuditText(choice.Delta)
+		// already reflected in the audit text.
+		meta := chunkMeta{auditText: deltaAuditText(choice.Delta), model: c.Model}
+		if choice.FinishReason != nil {
+			meta.finish = *choice.FinishReason
+		}
+		if c.Usage != nil {
+			meta.inTokens, meta.outTokens = c.Usage.PromptTokens, c.Usage.CompletionTokens
+		}
 		out, err := json.Marshal(c)
 		if err != nil {
-			return nil, "", err
+			return nil, chunkMeta{}, err
 		}
 		s.isFirst = false
 		// Report this chunk, then stop on the next call — the final Ollama
@@ -312,12 +333,12 @@ func (s *ollamaStream) Recv() ([]byte, string, error) {
 		if fin, _ := chunk["done"].(bool); fin {
 			s.done = true
 		}
-		return out, auditText, nil
+		return out, meta, nil
 	}
 	if err := s.scanner.Err(); err != nil {
-		return nil, "", err
+		return nil, chunkMeta{}, err
 	}
-	return nil, "", io.EOF
+	return nil, chunkMeta{}, io.EOF
 }
 
 func (s *ollamaStream) Close() error { return s.body.Close() }
@@ -333,9 +354,9 @@ type passthroughStream struct {
 	done    bool
 }
 
-func (s *passthroughStream) Recv() ([]byte, string, error) {
+func (s *passthroughStream) Recv() ([]byte, chunkMeta, error) {
 	if s.done {
-		return nil, "", io.EOF
+		return nil, chunkMeta{}, io.EOF
 	}
 	for s.scanner.Scan() {
 		payload, ok := strings.CutPrefix(strings.TrimSpace(s.scanner.Text()), "data:")
@@ -349,16 +370,16 @@ func (s *passthroughStream) Recv() ([]byte, string, error) {
 			// Swallow the upstream terminator; the handler emits its own, so
 			// a stream that ends without one still terminates correctly.
 			s.done = true
-			return nil, "", io.EOF
+			return nil, chunkMeta{}, io.EOF
 		}
-		// One parse serves both the audit text and the (pass-through) payload;
-		// the bytes go to the client unmodified either way.
-		return []byte(payload), auditTextFromChunk([]byte(payload)), nil
+		// One parse serves the audit text, the served model and the usage
+		// block; the bytes go to the client unmodified either way.
+		return []byte(payload), metaFromChunk([]byte(payload)), nil
 	}
 	if err := s.scanner.Err(); err != nil {
-		return nil, "", err
+		return nil, chunkMeta{}, err
 	}
-	return nil, "", io.EOF
+	return nil, chunkMeta{}, io.EOF
 }
 
 func (s *passthroughStream) Close() error { return s.body.Close() }
