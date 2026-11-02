@@ -159,8 +159,11 @@ The script will:
 Or directly with launchctl:
 
 ```bash
-# View status and exit code
-launchctl list com.gateway42.service
+# View status, pid and last exit code
+launchctl print gui/$(id -u)/com.gateway42.service
+
+# Restart
+launchctl kickstart -k gui/$(id -u)/com.gateway42.service
 
 # Follow logs
 tail -f ~/Library/Logs/gateway42/gateway.log
