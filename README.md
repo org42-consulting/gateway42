@@ -12,7 +12,7 @@ Gateway42. sits between your users and your AI inference backends, exposing an *
 - [What Gateway42. adds](#what-gateway42-adds) · [Design philosophy](#design-philosophy)
 - [Quick start](#quick-start-not-for-production) · [Install as a service](#installing-gateway42-as-a-service-launchd)
 - [Multi-engine support](#multi-engine-support) · [Engine selection](#engine-selection)
-- [API reference](#api-reference) · [Parameters](#parameters) · [Streaming](#streaming) · [Error codes](#error-codes)
+- [API reference](#api-reference) · [Claude Code / Anthropic API](#claude-code--anthropic-messages-api) · [Parameters](#parameters) · [Streaming](#streaming) · [Error codes](#error-codes)
 - [Rate limiting](#rate-limiting) · [Concurrency and load shedding](#concurrency-and-load-shedding)
 - [Observability](#observability) · [Security model](#security-model) · [Storage and data handling](#storage-and-data-handling)
 - [Admin dashboard](#admin-dashboard) · [Audit logs](#audit-logs)
@@ -197,8 +197,9 @@ You can add, edit, and remove engines from the Settings page — no restart requ
 
 ## API reference
 
-Gateway42. exposes an **OpenAI-compatible API**.
-Point any OpenAI client at Gateway42. by changing the base URL and providing a Gateway42 API key.
+Gateway42. exposes an **OpenAI-compatible API** and an **Anthropic Messages API**, so both OpenAI
+clients and Claude Code / the Anthropic SDKs can use it.
+Point a client at Gateway42. by changing the base URL and providing a Gateway42 API key.
 
 ### Base URL
 
@@ -221,12 +222,14 @@ Requests with a missing, invalid, or deactivated key are rejected with `401 Unau
 | Endpoint | Method | Description |
 | -------- | ------ | ----------- |
 | `/v1/chat/completions` | POST | Chat completion. Accepts OpenAI-format bodies. Set `"stream": true` for SSE streaming. |
-| `/v1/models` | GET | Returns the combined catalogue of every reachable engine, in OpenAI format. Duplicates are collapsed; an engine that is down is skipped rather than failing the listing. |
+| `/v1/messages` | POST | Anthropic Messages API, translated onto the same engines — see [Claude Code](#claude-code--anthropic-messages-api). |
+| `/v1/messages/count_tokens` | POST | Estimated input token count (≈ 4 bytes per token) in Anthropic format. |
+| `/v1/models` | GET | Returns the combined catalogue of every reachable engine. Each entry carries both OpenAI (`object`, `owned_by`) and Anthropic (`type`, `display_name`, `created_at`) fields. Duplicates are collapsed; an engine that is down is skipped rather than failing the listing. |
 | `/health` | GET | Returns `{"status": "ok"}`. No auth required. Use for uptime monitoring. |
 | `/metrics` | GET | Prometheus exposition. Requires an admin session cookie, or `Authorization: Bearer <GW42_METRICS_TOKEN>` when that variable is set — see [Observability](#prometheus-metrics). |
 
 `OPTIONS` on any `/v1/` path is answered as a CORS preflight. Any other path under `/v1/` returns
-`404` — the surface is deliberately just these two endpoints.
+`404` — the surface is deliberately just these endpoints.
 
 ### Example — cURL
 
@@ -256,6 +259,34 @@ response = client.chat.completions.create(
 )
 print(response.choices[0].message.content)
 ```
+
+### Claude Code / Anthropic Messages API
+
+`POST /v1/messages` accepts Anthropic-format requests — system prompt, content blocks, images,
+`tools`/`tool_choice`, `tool_use`/`tool_result` turns, streaming — and translates them onto the
+OpenAI-shaped pipeline every engine already speaks. Routing, rate limits, concurrency slots,
+metrics and the audit log are shared with `/v1/chat/completions`. Errors on these paths use
+Anthropic's envelope (`{"type":"error","error":{…}}`), with `not_found_error` for an unknown
+model and `overloaded_error` when the engine is busy.
+
+To run Claude Code through Gateway42.:
+
+```bash
+export ANTHROPIC_BASE_URL=http://<host>:7000
+export ANTHROPIC_AUTH_TOKEN=<api_key>          # sent as Authorization: Bearer
+# Claude Code asks for Claude model names by default; map every tier to a gateway model.
+export ANTHROPIC_MODEL=<model-id-from-/v1/models>
+export ANTHROPIC_DEFAULT_OPUS_MODEL=$ANTHROPIC_MODEL
+export ANTHROPIC_DEFAULT_SONNET_MODEL=$ANTHROPIC_MODEL
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=$ANTHROPIC_MODEL
+claude
+```
+
+Not translated: Anthropic server tools (`web_search`, `code_execution`, … — no local engine can run
+them, so they are not offered to the model), extended `thinking`, `top_k` and prompt caching
+(`cache_control` is accepted and ignored). Claude Code relies heavily on tool calling, so use a model
+that supports it. It also assumes a 200k context window for model IDs it does not recognise; see
+the Claude Code model-config docs to set the real window for your model.
 
 ### Parameters
 
@@ -465,7 +496,7 @@ All series use the `gw42_` prefix:
 | `gw42_logs_dropped_total` | counter | `kind` | Log entries dropped under write backpressure (`interaction` or `request`) |
 | `gw42_panics_total` | counter | `path` | Handler panics recovered — see below for why this is separate |
 
-Path labels are bucketed to keep cardinality bounded: `/v1/chat/completions`, `/v1/models`,
+Path labels are bucketed to keep cardinality bounded: `/v1/chat/completions`, `/v1/messages`, `/v1/models`,
 `/health`, `/metrics` and the bare admin paths stay distinct, while `/admin/...` collapses to
 `/admin/*` and numeric-tail routes like `/toggle/42` collapse to `/toggle/*`. Without this, one
 series per user ID would accumulate forever.

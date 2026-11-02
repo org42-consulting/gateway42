@@ -112,8 +112,11 @@ func handleListModels(w http.ResponseWriter, r *http.Request) {
 				Created: int64(created),
 				// The engine that actually holds this model, not a blanket
 				// value taken from engines[0].
-				OwnedBy: e.Type,
-				Size:    int64(toInt(m["size"])),
+				OwnedBy:     e.Type,
+				Type:        "model",
+				DisplayName: name,
+				CreatedAt:   time.Unix(int64(created), 0).UTC().Format(time.RFC3339),
+				Size:        int64(toInt(m["size"])),
 			})
 		}
 	}
@@ -124,7 +127,12 @@ func handleListModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	jsonResponse(w, 200, ModelList{Object: "list", Data: modelList})
+	list := ModelList{Object: "list", Data: modelList}
+	if len(modelList) > 0 {
+		list.FirstID = &modelList[0].ID
+		list.LastID = &modelList[len(modelList)-1].ID
+	}
+	jsonResponse(w, 200, list)
 }
 
 // ─────────────────────────────── API: chat completions ────────────────────────
@@ -136,24 +144,11 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !isAllowed(user.ID, user.RateLimit) {
-		metricRateLimited.Inc()
-		jsonResponse(w, 429, openaiError("Rate limit exceeded", "rate_limit_error"))
+	if !checkRateLimit(w, user, writeOpenAIError) {
 		return
 	}
-
-	// Bound the request body. Allow ~8× MaxMsgLen so a multi-turn conversation
-	// of bounded-length messages still fits; truncateInput then trims each field.
-	r.Body = http.MaxBytesReader(w, r.Body, int64(cfg.MaxMsgLen)*8)
-
-	var data map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&data); err != nil || data == nil {
-		var mbe *http.MaxBytesError
-		if errors.As(err, &mbe) {
-			jsonResponse(w, 413, openaiError("Request body too large", "invalid_request_error"))
-			return
-		}
-		jsonResponse(w, 400, openaiError("Invalid JSON body", "invalid_request_error"))
+	data, ok := decodeAPIBody(w, r, writeOpenAIError)
+	if !ok {
 		return
 	}
 	if _, ok := data["messages"]; !ok {
@@ -165,45 +160,13 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	messages := sanitizeMessages(rawMsgs)
 	model, _ := data["model"].(string)
 
-	// Route on the requested model rather than always taking the first engine,
-	// so a multi-engine deployment reaches whichever host actually holds it.
-	adapter, rerr := selectEngine(model)
-	switch rerr {
-	case routeNoEngines:
-		jsonResponse(w, 502, openaiError("No engines configured", "api_error"))
-		return
-	case routeModelNotFound:
-		jsonResponse(w, 404, openaiError(
-			fmt.Sprintf("Model '%s' is not available on any configured engine", model),
-			"invalid_request_error"))
+	adapter, release, ok := acquireEngine(w, r, model, writeOpenAIError)
+	if !ok {
 		return
 	}
+	defer release()
 
-	// Cap upstream concurrency. Wait up to 250ms for a slot before giving
-	// up — long enough to absorb a momentary spike, short enough that
-	// clients see a clear backpressure signal.
-	acqCtx, acqCancel := context.WithTimeout(r.Context(), 250*time.Millisecond)
-	gotSlot := adapter.TryAcquire(acqCtx)
-	acqCancel()
-	if !gotSlot {
-		metricUpstreamBusy.WithLabelValues(adapter.Type()).Inc()
-		w.Header().Set("Retry-After", "2")
-		jsonResponse(w, 503, openaiError("Engine busy, please retry", "api_error"))
-		return
-	}
-	defer adapter.Release()
-	// Saturation per engine, where the busy counter only shows that *some*
-	// engine of a type refused. Cardinality is bounded by the engine count.
-	metricEngineInflight.WithLabelValues(adapter.Name()).Inc()
-	defer metricEngineInflight.WithLabelValues(adapter.Name()).Dec()
-
-	// Build the request for the engine — translate only for Ollama adapters.
-	var engineReq map[string]interface{}
-	if adapter.Type() == EngineOllama {
-		engineReq = openAIToOllama(data, messages)
-	} else {
-		engineReq = openAICompatRequest(data, messages)
-	}
+	engineReq := buildEngineRequest(adapter, data, messages)
 
 	if streaming, _ := data["stream"].(bool); streaming {
 		streamCompletion(w, r, adapter, engineReq, user.ID, model, messages)
@@ -244,6 +207,284 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// writer goroutine, off this request's latency.
 	logInteraction(user.ID, messages, payload, model)
 	jsonResponse(w, 200, payload)
+}
+
+// ─────────────────────────────── API: Anthropic messages ──────────────────────
+
+// handleMessages serves the Anthropic Messages API (POST /v1/messages), which
+// is what Claude Code and the Anthropic SDKs call. The request is translated
+// to the OpenAI shape and sent down the same path as /v1/chat/completions;
+// see anthropic.go.
+func handleMessages(w http.ResponseWriter, r *http.Request) {
+	user := userFromContext(r)
+	if user == nil {
+		writeAnthropicError(w, 401, "Invalid API key", "authentication_error")
+		return
+	}
+	if !checkRateLimit(w, user, writeAnthropicError) {
+		return
+	}
+	body, ok := decodeAPIBody(w, r, writeAnthropicError)
+	if !ok {
+		return
+	}
+	model, _ := body["model"].(string)
+	if model == "" {
+		writeAnthropicError(w, 400, "'model' is required", "invalid_request_error")
+		return
+	}
+	if _, ok := body["messages"].([]interface{}); !ok {
+		writeAnthropicError(w, 400, "'messages' is required", "invalid_request_error")
+		return
+	}
+
+	data, rawMsgs := anthropicToOpenAI(body)
+	messages := sanitizeMessages(rawMsgs)
+
+	adapter, release, ok := acquireEngine(w, r, model, writeAnthropicError)
+	if !ok {
+		return
+	}
+	defer release()
+
+	engineReq := buildEngineRequest(adapter, data, messages)
+
+	if streaming, _ := data["stream"].(bool); streaming {
+		// OpenAI-compatible servers report usage in a stream only when asked.
+		// Claude Code tracks its context window from message_delta.usage, so
+		// without this every streamed turn would look like zero tokens.
+		// (Ollama always reports usage on its final line.)
+		if adapter.Type() != EngineOllama {
+			engineReq["stream_options"] = map[string]interface{}{"include_usage": true}
+		}
+		streamMessages(w, r, adapter, engineReq, user.ID, model, messages)
+		return
+	}
+
+	result, err := adapter.Chat(r.Context(), engineReq)
+	if err != nil {
+		if r.Context().Err() != nil {
+			slog.Info("client disconnected before completion", "model", model, "user", user.ID)
+			return
+		}
+		slog.Error("engine request", "err", err)
+		writeAnthropicError(w, 502, "Could not reach engine", "api_error")
+		return
+	}
+	var payload interface{} = result
+	if adapter.Type() == EngineOllama {
+		payload = ollamaToOpenAI(result)
+	}
+	msg, err := openAIToAnthropic(payload, model)
+	if err != nil {
+		slog.Error("translate engine response", "err", err, "model", model)
+		writeAnthropicError(w, 502, "Unexpected engine response", "api_error")
+		return
+	}
+	logInteraction(user.ID, messages, msg, model)
+	jsonResponse(w, 200, msg)
+}
+
+// streamMessages relays a streaming completion as Anthropic SSE events. It
+// mirrors streamCompletion — same deadline, disconnect and audit handling —
+// with anthropicStream turning each OpenAI chunk into typed events.
+func streamMessages(w http.ResponseWriter, r *http.Request, adapter Engine,
+	engineReq map[string]interface{}, userID int, model string,
+	messages []map[string]interface{}) {
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeAnthropicError(w, 500, "Streaming not supported", "api_error")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), upstreamChatTimeout)
+	defer cancel()
+
+	stream, err := adapter.StreamChat(ctx, engineReq)
+	if err != nil {
+		if ctx.Err() != nil && r.Context().Err() != nil {
+			slog.Info("client disconnected before stream started", "model", model, "user", userID)
+			return
+		}
+		slog.Error("engine stream", "err", err, "model", model)
+		writeAnthropicError(w, 502, "Could not reach engine", "api_error")
+		return
+	}
+	defer stream.Close()
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+
+	audit := streamAudit{limit: cfg.MaxMsgLen}
+	var outcome string
+	defer func() {
+		resp := audit.String()
+		if outcome != "" {
+			resp += "\n[" + outcome + "]"
+		}
+		logInteraction(userID, messages, resp, model)
+	}()
+
+	send := func(events ...sseEvent) bool {
+		for _, ev := range events {
+			b, err := json.Marshal(ev.data)
+			if err != nil {
+				continue
+			}
+			if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.name, b); err != nil {
+				return false
+			}
+		}
+		flusher.Flush()
+		return true
+	}
+
+	tr := newAnthropicStream(model)
+	if !send(tr.start()) {
+		outcome = "client disconnected"
+		return
+	}
+	for {
+		payload, auditText, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			// Anthropic's in-stream error event: the client surfaces it
+			// instead of treating the truncated message as complete.
+			slog.Error("engine stream read", "err", err, "model", model)
+			send(sseEvent{"error", anthropicError(500, "Stream interrupted", "api_error")})
+			outcome = "stream interrupted"
+			return
+		}
+		if !send(tr.chunk(payload)...) {
+			slog.Info("client disconnected mid-stream", "model", model, "user", userID)
+			outcome = "client disconnected"
+			return
+		}
+		audit.write(auditText)
+	}
+	send(tr.end()...)
+}
+
+// handleCountTokens serves POST /v1/messages/count_tokens with an estimate;
+// see estimateTokens for why an estimate is enough.
+func handleCountTokens(w http.ResponseWriter, r *http.Request) {
+	user := userFromContext(r)
+	if user == nil {
+		writeAnthropicError(w, 401, "Invalid API key", "authentication_error")
+		return
+	}
+	// Rate limited like the completion endpoints: no engine is involved, but
+	// each call still decodes and re-encodes a body of up to 8× MaxMsgLen.
+	if !checkRateLimit(w, user, writeAnthropicError) {
+		return
+	}
+	body, ok := decodeAPIBody(w, r, writeAnthropicError)
+	if !ok {
+		return
+	}
+	jsonResponse(w, 200, map[string]int{
+		"input_tokens": estimateTokens(body["system"], body["messages"], body["tools"]),
+	})
+}
+
+// ─────────────────────────────── Shared admission ─────────────────────────────
+
+// apiErrorWriter writes an error in one API's envelope. The admission steps
+// below are shared by /v1/chat/completions and /v1/messages; only the shape
+// of the error body differs between them.
+type apiErrorWriter func(w http.ResponseWriter, status int, message, errType string)
+
+func writeOpenAIError(w http.ResponseWriter, status int, message, errType string) {
+	jsonResponse(w, status, openaiError(message, errType))
+}
+
+func writeAnthropicError(w http.ResponseWriter, status int, message, errType string) {
+	jsonResponse(w, status, anthropicError(status, message, errType))
+}
+
+// checkRateLimit applies the user's per-minute limit. It runs before the body
+// is read, so a client over its limit costs no parsing.
+func checkRateLimit(w http.ResponseWriter, user *User, writeErr apiErrorWriter) bool {
+	if !isAllowed(user.ID, user.RateLimit) {
+		metricRateLimited.Inc()
+		writeErr(w, 429, "Rate limit exceeded", "rate_limit_error")
+		return false
+	}
+	return true
+}
+
+// decodeAPIBody reads a bounded JSON object body.
+//
+// The bound is ~8× MaxMsgLen so a multi-turn conversation of bounded-length
+// messages still fits; truncateInput then trims each field.
+func decodeAPIBody(w http.ResponseWriter, r *http.Request, writeErr apiErrorWriter) (map[string]interface{}, bool) {
+	r.Body = http.MaxBytesReader(w, r.Body, int64(cfg.MaxMsgLen)*8)
+	var data map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&data); err != nil || data == nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			writeErr(w, 413, "Request body too large", "invalid_request_error")
+			return nil, false
+		}
+		writeErr(w, 400, "Invalid JSON body", "invalid_request_error")
+		return nil, false
+	}
+	return data, true
+}
+
+// acquireEngine routes model to an engine and takes one of its concurrency
+// slots. On success the caller must defer release; on failure the error has
+// already been written.
+func acquireEngine(w http.ResponseWriter, r *http.Request, model string,
+	writeErr apiErrorWriter) (adapter Engine, release func(), ok bool) {
+
+	// Route on the requested model rather than always taking the first engine,
+	// so a multi-engine deployment reaches whichever host actually holds it.
+	adapter, rerr := selectEngine(model)
+	switch rerr {
+	case routeNoEngines:
+		writeErr(w, 502, "No engines configured", "api_error")
+		return nil, nil, false
+	case routeModelNotFound:
+		writeErr(w, 404,
+			fmt.Sprintf("Model '%s' is not available on any configured engine", model),
+			"invalid_request_error")
+		return nil, nil, false
+	}
+
+	// Cap upstream concurrency. Wait up to 250ms for a slot before giving
+	// up — long enough to absorb a momentary spike, short enough that
+	// clients see a clear backpressure signal.
+	acqCtx, acqCancel := context.WithTimeout(r.Context(), 250*time.Millisecond)
+	gotSlot := adapter.TryAcquire(acqCtx)
+	acqCancel()
+	if !gotSlot {
+		metricUpstreamBusy.WithLabelValues(adapter.Type()).Inc()
+		w.Header().Set("Retry-After", "2")
+		writeErr(w, 503, "Engine busy, please retry", "api_error")
+		return nil, nil, false
+	}
+	// Saturation per engine, where the busy counter only shows that *some*
+	// engine of a type refused. Cardinality is bounded by the engine count.
+	metricEngineInflight.WithLabelValues(adapter.Name()).Inc()
+	return adapter, func() {
+		metricEngineInflight.WithLabelValues(adapter.Name()).Dec()
+		adapter.Release()
+	}, true
+}
+
+// buildEngineRequest translates the OpenAI-shaped request for the engine —
+// only Ollama adapters need it.
+func buildEngineRequest(adapter Engine, data map[string]interface{}, messages []map[string]interface{}) map[string]interface{} {
+	if adapter.Type() == EngineOllama {
+		return openAIToOllama(data, messages)
+	}
+	return openAICompatRequest(data, messages)
 }
 
 // openAICompatRequest builds the body for an OpenAI-compatible engine: the
