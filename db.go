@@ -201,6 +201,13 @@ func createSchema() error {
 		`CREATE INDEX IF NOT EXISTS idx_rate_limit_user_timestamp ON rate_limit_entries(user_id, timestamp)`,
 		`CREATE INDEX IF NOT EXISTS idx_request_logs_ts ON request_logs(ts)`,
 		`CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts)`,
+		// getUserLogs filters by user and orders by ts. idx_logs_user_id
+		// satisfies the filter but leaves SQLite to sort every matching row;
+		// this composite serves the whole query in index order, which is the
+		// difference between a seek and a sort once a user has thousands of
+		// rows. The single-column index stays: the retention prune and any
+		// user-only filter can still use it, and SQLite picks per query.
+		`CREATE INDEX IF NOT EXISTS idx_logs_user_ts ON logs(user_id, ts)`,
 	}
 	for _, s := range stmts {
 		if _, err := tx.Exec(s); err != nil {
@@ -592,9 +599,10 @@ func deleteUser(userID int) error {
 
 // ── Log queries ───────────────────────────────────────────────────────────────
 
-// logInteraction enqueues an audit row. The actual INSERT is performed by
-// the batched writer in logwriter.go.
-func logInteraction(userID int, prompt, response, model string) {
+// logInteraction enqueues an audit row. The actual INSERT — and the JSON
+// encoding of anything that is not already a string — is performed by the
+// batched writer in logwriter.go, off the request path.
+func logInteraction(userID int, prompt, response interface{}, model string) {
 	enqueueInteractionLog(userID, prompt, response, model)
 }
 

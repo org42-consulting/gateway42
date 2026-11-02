@@ -82,21 +82,36 @@ func TestProbeStartedBeforeInvalidationIsNotCached(t *testing.T) {
 	}
 }
 
+// Invalidation no longer erases the index: it keeps the previous one as a
+// stale fallback (built zeroed) so routing never blocks on a synchronous
+// rebuild. What must still hold is the generation guard — a build assembled
+// from pre-invalidation probes may not overwrite the stale-marked index,
+// while a build started after the invalidation may.
 func TestRouteIndexBuiltBeforeInvalidationIsDiscarded(t *testing.T) {
 	invalidateRouteIndex()
 	t.Cleanup(invalidateRouteIndex)
 
+	// An index published after the last invalidation is live…
 	gen := routeIndexGeneration()
-	invalidateRouteIndex()
-	storeRouteIndex(&routeIndex{byModel: map[string][]int{"old": {1}}, built: time.Now()}, gen)
+	storeRouteIndex(&routeIndex{byModel: map[string][]int{"live": {1}}, built: time.Now()}, gen)
 
-	if idx := routeIndexPtr.Load(); idx != nil {
+	// …invalidation keeps it, marked stale…
+	gen = routeIndexGeneration()
+	invalidateRouteIndex()
+	if idx := routeIndexPtr.Load(); idx == nil || !idx.built.IsZero() {
+		t.Errorf("invalidation should leave the previous index in place with built zeroed, got %v", idx)
+	}
+
+	// …a build that started before the invalidation is rejected…
+	storeRouteIndex(&routeIndex{byModel: map[string][]int{"old": {1}}, built: time.Now()}, gen)
+	if idx := routeIndexPtr.Load(); idx.byModel["old"] != nil {
 		t.Errorf("stale index stored after invalidation: %v", idx.byModel)
 	}
 
+	// …and a build that started after it is accepted.
 	gen = routeIndexGeneration()
 	storeRouteIndex(&routeIndex{byModel: map[string][]int{"new": {1}}, built: time.Now()}, gen)
-	if idx := routeIndexPtr.Load(); idx == nil {
+	if idx := routeIndexPtr.Load(); idx.byModel["new"] == nil {
 		t.Error("an index built after the last invalidation must be stored")
 	}
 }

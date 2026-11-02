@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"embed"
 	"encoding/json"
@@ -72,6 +73,12 @@ type Config struct {
 	// "Authorization: Bearer <token>". Without it /metrics needs an admin
 	// session cookie, which Prometheus cannot present.
 	MetricsToken string
+
+	// SessionKey, when set, derives the cookie store's hash and block keys
+	// from it, so admin sessions survive a restart. Unset keeps the previous
+	// behaviour: random keys, every session invalidated on restart — which
+	// is the safer default, since a forgotten key is also an unrotated one.
+	SessionKey string
 }
 
 var cfg Config
@@ -110,6 +117,7 @@ func loadConfig() Config {
 		UpstreamConcurrency: getEnvInt("GW42_UPSTREAM_CONCURRENCY", 8),
 		LogRetentionDays:    getEnvInt("GW42_LOG_RETENTION_DAYS", 30),
 		MetricsToken:        getEnv("GW42_METRICS_TOKEN", ""),
+		SessionKey:          getEnv("GW42_SESSION_KEY", ""),
 	}
 	return c
 }
@@ -919,14 +927,25 @@ func main() {
 			"path", cfg.LogFile, "err", logFileErr)
 	}
 
-	// Session store (random keys, sessions invalidated on restart). The second
-	// key turns on AES encryption: with the hash key alone the cookie is only
-	// signed, so its contents — CSRF token, flash messages — are readable by
-	// anything that can see the cookie.
-	hashKey := make([]byte, 32)
-	blockKey := make([]byte, 32)
-	rand.Read(hashKey)
-	rand.Read(blockKey)
+	// Session store. The second key turns on AES encryption: with the hash
+	// key alone the cookie is only signed, so its contents — CSRF token,
+	// flash messages — are readable by anything that can see the cookie.
+	//
+	// With GW42_SESSION_KEY set, both keys are derived from it (one SHA-256
+	// per key, domain-separated by suffix, so the two 32-byte keys never
+	// share bytes) and sessions survive a restart. Unset, the keys are random
+	// and a restart logs everyone out, as before.
+	var hashKey, blockKey []byte
+	if cfg.SessionKey != "" {
+		h := sha256.Sum256([]byte(cfg.SessionKey + "|hash"))
+		b := sha256.Sum256([]byte(cfg.SessionKey + "|block"))
+		hashKey, blockKey = h[:], b[:]
+	} else {
+		hashKey = make([]byte, 32)
+		blockKey = make([]byte, 32)
+		rand.Read(hashKey)
+		rand.Read(blockKey)
+	}
 	sessionStore = sessions.NewCookieStore(hashKey, blockKey)
 	sessionStore.Options = &sessions.Options{
 		MaxAge:   cfg.SessionTTL,
@@ -953,6 +972,10 @@ func main() {
 	if err := reloadEngineCache(); err != nil {
 		slog.Error("could not load engines on startup", "err", err)
 	}
+	// Pre-build the routing index off the startup path: without this the
+	// first routed request after a restart pays for every engine's probe
+	// synchronously (currentRouteIndex's cold-start wait).
+	go refreshRouteIndexAsync()
 
 	// Templates
 	initTemplates()

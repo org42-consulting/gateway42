@@ -13,6 +13,18 @@ import (
 // "streamed", so the audit trail had no record of what any streaming client
 // was told — and a client that hung up mid-stream was not logged at all.
 
+// auditedResponse renders a logged row's response the way the writer stores
+// it. Entries now carry raw values — encoding moved to the flush — and the
+// stream path's response is assembled text, so it must already be a string.
+func auditedResponse(t *testing.T, e interactionLogEntry) string {
+	t.Helper()
+	s, ok := e.response.(string)
+	if !ok {
+		t.Fatalf("stream path must log a string response, got %T", e.response)
+	}
+	return s
+}
+
 func drainInteractionLog() []interactionLogEntry {
 	var out []interactionLogEntry
 	for {
@@ -49,8 +61,8 @@ func TestStreamedCompletionAuditsResponseText(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("got %d interaction rows, want 1", len(rows))
 	}
-	if rows[0].response != "Hello" {
-		t.Errorf("audited response = %q, want the streamed text \"Hello\"", rows[0].response)
+	if got := auditedResponse(t, rows[0]); got != "Hello" {
+		t.Errorf("audited response = %q, want the streamed text \"Hello\"", got)
 	}
 	if rows[0].userID != 42 || rows[0].model != "m" {
 		t.Errorf("row = %+v, want user 42 / model m", rows[0])
@@ -66,8 +78,8 @@ data: [DONE]
 	if len(rows) != 1 {
 		t.Fatalf("got %d interaction rows, want 1", len(rows))
 	}
-	if !strings.Contains(rows[0].response, "get_weather") {
-		t.Errorf("audited response = %q, want the tool call recorded", rows[0].response)
+	if got := auditedResponse(t, rows[0]); !strings.Contains(got, "get_weather") {
+		t.Errorf("audited response = %q, want the tool call recorded", got)
 	}
 }
 
@@ -92,8 +104,8 @@ func TestStreamAbandonedByClientIsStillAudited(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("got %d interaction rows, want 1 — a disconnected stream must still be audited", len(rows))
 	}
-	if !strings.HasPrefix(rows[0].response, "Hel") || !strings.Contains(rows[0].response, "disconnected") {
-		t.Errorf("audited response = %q, want the partial text marked as disconnected", rows[0].response)
+	if got := auditedResponse(t, rows[0]); !strings.HasPrefix(got, "Hel") || !strings.Contains(got, "disconnected") {
+		t.Errorf("audited response = %q, want the partial text marked as disconnected", got)
 	}
 }
 
@@ -101,7 +113,9 @@ func TestStreamAuditIsBounded(t *testing.T) {
 	var a streamAudit
 	a.limit = 10
 	for i := 0; i < 100; i++ {
-		a.add([]byte(`{"choices":[{"delta":{"content":"0123456789"}}]}`))
+		// write takes the extracted text, not the frame: extraction is the
+		// adapter's job now (see ChatStream.Recv).
+		a.write("0123456789")
 	}
 	if n := len(a.String()); n > 10 {
 		t.Errorf("audit buffer grew to %d bytes, want at most the limit of 10", n)

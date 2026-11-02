@@ -22,6 +22,12 @@ import (
 // sharedTransport pools idle TCP connections across all engine adapters.
 // Streaming and non-streaming requests reuse this transport; per-call
 // timeouts are applied via context.WithTimeout rather than client.Timeout.
+//
+// DialContext is not boilerplate: without it the zero-value dialer has no
+// connect timeout, so an engine whose host accepts TCP slowly (or black-holes
+// packets) could sit in dial forever — ResponseHeaderTimeout only starts
+// counting once the connection exists. 10s is generous for a LAN peer and
+// still well under the 30s response-header budget.
 var sharedTransport = &http.Transport{
 	MaxIdleConns:          200,
 	MaxIdleConnsPerHost:   32,
@@ -30,6 +36,12 @@ var sharedTransport = &http.Transport{
 	TLSHandshakeTimeout:   10 * time.Second,
 	ExpectContinueTimeout: 1 * time.Second,
 	ResponseHeaderTimeout: 30 * time.Second,
+	DialContext: (&net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext,
+	// Upstream TLS engines get HTTP/2 multiplexing; plain HTTP is unaffected.
+	ForceAttemptHTTP2: true,
 }
 
 // sharedClient has no Timeout — long-lived streaming responses must not
@@ -167,7 +179,8 @@ type Engine interface {
 
 // ChatStream is a live streaming completion. Recv returns successive SSE data
 // payloads — the bytes that belong after "data: " — already in OpenAI wire
-// shape, and io.EOF once the upstream stream ends normally. Close must always
+// shape, the client-visible text extracted from that payload for the audit
+// log, and io.EOF once the upstream stream ends normally. Close must always
 // be called, and releases the underlying response body.
 //
 // This replaces a ChatStream(w, r, …) method that took an http.ResponseWriter.
@@ -176,9 +189,72 @@ type Engine interface {
 // not be exercised without standing up an httptest recorder and parsing the
 // framing back off. With a reader the handler owns the wire format once and a
 // test can drive an adapter's translator straight from a bytes.Reader.
+//
+// The audit text rides along for the same reason the payload is pre-shaped:
+// the adapter has already parsed the chunk (ollamaStream to translate it,
+// passthroughStream to read it), so it can hand the audit its text for free.
+// Having the handler re-unmarshal every frame was a second full parse of
+// every token of every completion, on the request path, to re-derive text
+// that was in hand one frame earlier.
 type ChatStream interface {
-	Recv() ([]byte, error)
+	Recv() (payload []byte, auditText string, err error)
 	Close() error
+}
+
+// deltaAuditText renders a delta's client-visible text for the audit log:
+// the content plus each tool call as "[tool_call name] arguments". OpenAI
+// streams a call as a name on its first fragment and argument fragments
+// after; Ollama sends both at once. Writing the name when it appears and
+// every fragment as it arrives reassembles both shapes.
+func deltaAuditText(d Delta) string {
+	if len(d.ToolCalls) == 0 {
+		return d.Content
+	}
+	var b strings.Builder
+	b.WriteString(d.Content)
+	for _, tc := range d.ToolCalls {
+		if tc.Function.Name != "" {
+			b.WriteString("\n[tool_call " + tc.Function.Name + "] ")
+		}
+		b.WriteString(tc.Function.Arguments)
+	}
+	return b.String()
+}
+
+// auditChunk is the subset of a chat.completion.chunk the audit reads.
+type auditChunk struct {
+	Choices []struct {
+		Delta struct {
+			Content   string `json:"content"`
+			ToolCalls []struct {
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
+		} `json:"delta"`
+	} `json:"choices"`
+}
+
+// auditTextFromChunk extracts the audit text from an upstream chunk that
+// arrives as bytes (the passthrough path). A payload that is not a chunk — an
+// error object, say — contributes nothing: the stream already relayed it.
+func auditTextFromChunk(payload []byte) string {
+	var c auditChunk
+	if json.Unmarshal(payload, &c) != nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, ch := range c.Choices {
+		b.WriteString(ch.Delta.Content)
+		for _, tc := range ch.Delta.ToolCalls {
+			if tc.Function.Name != "" {
+				b.WriteString("\n[tool_call " + tc.Function.Name + "] ")
+			}
+			b.WriteString(tc.Function.Arguments)
+		}
+	}
+	return b.String()
 }
 
 // ollamaStream translates Ollama's newline-delimited JSON into OpenAI chunks.
@@ -196,9 +272,9 @@ type ollamaStream struct {
 	toolCalls int
 }
 
-func (s *ollamaStream) Recv() ([]byte, error) {
+func (s *ollamaStream) Recv() ([]byte, string, error) {
 	if s.done {
-		return nil, io.EOF
+		return nil, "", io.EOF
 	}
 	for s.scanner.Scan() {
 		line := strings.TrimSpace(s.scanner.Text())
@@ -221,9 +297,13 @@ func (s *ollamaStream) Recv() ([]byte, error) {
 		if choice.FinishReason != nil && s.toolCalls > 0 {
 			choice.FinishReason = &finishToolCalls
 		}
+		// The audit text comes out of the typed chunk that is already in
+		// hand — no second parse, and the tool-call renumbering above is
+		// already reflected in it.
+		auditText := deltaAuditText(choice.Delta)
 		out, err := json.Marshal(c)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		s.isFirst = false
 		// Report this chunk, then stop on the next call — the final Ollama
@@ -232,12 +312,12 @@ func (s *ollamaStream) Recv() ([]byte, error) {
 		if fin, _ := chunk["done"].(bool); fin {
 			s.done = true
 		}
-		return out, nil
+		return out, auditText, nil
 	}
 	if err := s.scanner.Err(); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return nil, io.EOF
+	return nil, "", io.EOF
 }
 
 func (s *ollamaStream) Close() error { return s.body.Close() }
@@ -253,9 +333,9 @@ type passthroughStream struct {
 	done    bool
 }
 
-func (s *passthroughStream) Recv() ([]byte, error) {
+func (s *passthroughStream) Recv() ([]byte, string, error) {
 	if s.done {
-		return nil, io.EOF
+		return nil, "", io.EOF
 	}
 	for s.scanner.Scan() {
 		payload, ok := strings.CutPrefix(strings.TrimSpace(s.scanner.Text()), "data:")
@@ -269,14 +349,16 @@ func (s *passthroughStream) Recv() ([]byte, error) {
 			// Swallow the upstream terminator; the handler emits its own, so
 			// a stream that ends without one still terminates correctly.
 			s.done = true
-			return nil, io.EOF
+			return nil, "", io.EOF
 		}
-		return []byte(payload), nil
+		// One parse serves both the audit text and the (pass-through) payload;
+		// the bytes go to the client unmodified either way.
+		return []byte(payload), auditTextFromChunk([]byte(payload)), nil
 	}
 	if err := s.scanner.Err(); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return nil, io.EOF
+	return nil, "", io.EOF
 }
 
 func (s *passthroughStream) Close() error { return s.body.Close() }
@@ -348,8 +430,15 @@ func saveEngines(engines []EngineConfig) error {
 	if err := setSetting("engines", string(b)); err != nil {
 		return err
 	}
-	invalidateProbeCache()
-	return reloadEngineCache()
+	if err := reloadEngineCache(); err != nil {
+		return err
+	}
+	// After the reload, not before: the async warm reads the adapter cache, so
+	// a new engine must be in it by the time the warm lists engines. On a
+	// failed reload the in-memory set is unchanged, and leaving its probe data
+	// cached is exactly right.
+	onEnginesChanged()
+	return nil
 }
 
 // newEngine creates an Engine implementation from a config.
@@ -551,6 +640,59 @@ func navEngines() []NavEngine {
 		go warmProbeCache(context.Background())
 	}
 	return out
+}
+
+// peekProbeData reads one engine's full probe data without probing. found is
+// false when there is nothing to show: no entry at all, or the in-flight
+// marker of a first probe that has not finished — its zero values would read
+// as "down with no models" rather than "not yet known". stale marks data past
+// its expiry; a refresh already in flight is not stale, since another warm
+// would only queue behind it.
+func peekProbeData(id int) (pd probeData, found, stale bool) {
+	probeCacheMu.Lock()
+	defer probeCacheMu.Unlock()
+	entry, ok := probeCache[id]
+	if !ok {
+		return probeData{}, false, true
+	}
+	if entry.expiry.IsZero() {
+		return probeData{}, false, entry.inflight == nil
+	}
+	return entry.probeData, true, entry.inflight == nil && !time.Now().Before(entry.expiry)
+}
+
+// cachedProbeSnapshot returns probe data for every cached engine that has
+// finished at least one probe, and whether any engine needs a refresh. It
+// never waits on an upstream: the point is that a page renders from what the
+// cache already holds — even expired data — while a refresh runs behind it,
+// instead of paying for a probe round on the request path.
+func cachedProbeSnapshot() (map[int]probeData, bool) {
+	engines := cachedEngines()
+	snap := make(map[int]probeData, len(engines))
+	stale := false
+	for _, e := range engines {
+		pd, found, needsRefresh := peekProbeData(e.ID)
+		if found {
+			snap[e.ID] = pd
+		}
+		stale = stale || needsRefresh
+	}
+	return snap, stale
+}
+
+// onEnginesChanged is what every engine or model mutation calls: it drops the
+// probe cache and the routing index derived from it, then immediately starts
+// refilling both off the request path. Invalidation alone made the next reader
+// pay — a cold route index is a synchronous rebuild, and a cold probe cache
+// plus a peek-less reader is a blocking warm. Kicking the refill here means
+// the next page load renders from the previous snapshot instead.
+//
+// The warm runs detached (no caller context): a pull handler returning must
+// not cancel the refresh its own change just triggered.
+func onEnginesChanged() {
+	invalidateProbeCache()
+	go warmProbeCache(context.Background())
+	refreshRouteIndexAsync()
 }
 
 // peekProbeState reads one engine's state from the probe cache without

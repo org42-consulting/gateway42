@@ -56,6 +56,31 @@ var (
 		Help: "Requests rejected because the engine concurrency cap was full.",
 	}, []string{"engine"})
 
+	// Completions currently held open against each engine. The busy counter
+	// says a cap was hit; this says how close each engine is running to it,
+	// which is what tells you to raise GW42_UPSTREAM_CONCURRENCY before the
+	// rejections start. Labelled by engine name, so cardinality is bounded
+	// by the configured engine count.
+	metricEngineInflight = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "gw42_engine_inflight",
+		Help: "Upstream completions in flight, by engine.",
+	}, []string{"engine"})
+
+	// Queue depth as gauge funcs rather than counters the writers keep in
+	// step: len(chan) is the truth at scrape time, and there is no increment
+	// pair to get wrong. Same metric name, distinguished by the kind label.
+	_ = promauto.NewGaugeFunc(prometheus.GaugeOpts{
+		Name:        "gw42_log_queue_depth",
+		Help:        "Entries buffered in an async log writer queue.",
+		ConstLabels: prometheus.Labels{"kind": "interaction"},
+	}, func() float64 { return float64(len(chInteraction)) })
+
+	_ = promauto.NewGaugeFunc(prometheus.GaugeOpts{
+		Name:        "gw42_log_queue_depth",
+		Help:        "Entries buffered in an async log writer queue.",
+		ConstLabels: prometheus.Labels{"kind": "request"},
+	}, func() float64 { return float64(len(chRequest)) })
+
 	// Panics are counted apart from the status metric because the two answer
 	// different questions. A panic before anything is written shows up as a 500
 	// there; a panic mid-stream shows up as the 200 the client actually got,
