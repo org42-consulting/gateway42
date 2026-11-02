@@ -16,6 +16,7 @@ DB_DIR="${DATA_DIR}/db"
 LOG_DIR="${HOME}/Library/Logs/gateway42"
 PLIST_DIR="${HOME}/Library/LaunchAgents"
 PLIST_PATH="${PLIST_DIR}/${LABEL}.plist"
+DOMAIN="gui/$(id -u)"
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 info()  { echo "  [info]  $*"; }
@@ -24,7 +25,18 @@ err()   { echo "  [error] $*" >&2; exit 1; }
 warn()  { echo "  [warn]  $*"; }
 
 service_loaded() {
-    launchctl list "${LABEL}" &>/dev/null
+    launchctl print "${DOMAIN}/${LABEL}" &>/dev/null
+}
+
+stop_service() {
+    launchctl bootout "${DOMAIN}/${LABEL}" 2>/dev/null || true
+    # bootout returns before launchd finishes tearing the job down; a
+    # bootstrap issued too early fails with "5: Input/output error".
+    for _ in {1..20}; do
+        service_loaded || return 0
+        sleep 0.5
+    done
+    warn "Service still registered after 10s; bootstrap may fail"
 }
 
 # ── uninstall ─────────────────────────────────────────────────────────────────
@@ -32,9 +44,7 @@ if [[ "${1:-}" == "uninstall" ]]; then
     echo "Uninstalling gateway42 service..."
     if service_loaded; then
         info "Stopping and unloading service..."
-        launchctl bootout "gui/$(id -u)/${LABEL}" 2>/dev/null \
-            || launchctl unload "${PLIST_PATH}" 2>/dev/null \
-            || true
+        stop_service
         ok "Service stopped"
     else
         warn "Service was not loaded"
@@ -86,10 +96,7 @@ info "  Logs  → ${LOG_DIR}/"
 # 4. Stop existing service if running
 if service_loaded; then
     info "Stopping existing service..."
-    launchctl bootout "gui/$(id -u)/${LABEL}" 2>/dev/null \
-        || launchctl unload "${PLIST_PATH}" 2>/dev/null \
-        || true
-    sleep 1
+    stop_service
 fi
 
 # 5. Write plist (absolute paths — launchd does not expand ~ or $HOME)
@@ -147,8 +154,7 @@ PLIST
 ok "Plist written to ${PLIST_PATH}"
 
 # 6. Load the service
-launchctl bootstrap "gui/$(id -u)" "${PLIST_PATH}" \
-    || launchctl load "${PLIST_PATH}" \
+launchctl bootstrap "${DOMAIN}" "${PLIST_PATH}" \
     || err "Failed to load service. Check the plist with: plutil -lint ${PLIST_PATH}"
 
 ok "Service loaded"
@@ -158,9 +164,10 @@ echo " gateway42 is running on port 7000"
 echo " Admin panel: http://localhost:7000"
 echo ""
 echo " Manage the service:"
-echo "   Status:  launchctl list ${LABEL}"
+echo "   Status:  launchctl print ${DOMAIN}/${LABEL}"
 echo "   Logs:    tail -f ${LOG_DIR}/gateway.log"
-echo "   Stop:    launchctl stop ${LABEL}"
-echo "   Start:   launchctl start ${LABEL}"
+echo "   Restart: launchctl kickstart -k ${DOMAIN}/${LABEL}"
+echo "   Stop:    launchctl bootout ${DOMAIN}/${LABEL}"
+echo "   Start:   launchctl bootstrap ${DOMAIN} ${PLIST_PATH}"
 echo "   Remove:  ./install.sh uninstall"
 echo "────────────────────────────────────────"
