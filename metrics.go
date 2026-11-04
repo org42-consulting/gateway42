@@ -20,9 +20,12 @@ var (
 	}, []string{"path", "method", "status"})
 
 	metricRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "gw42_http_request_duration_seconds",
-		Help:    "HTTP request latency in seconds.",
-		Buckets: prometheus.ExponentialBucketsRange(0.001, 60, 12),
+		Name: "gw42_http_request_duration_seconds",
+		Help: "HTTP request latency in seconds.",
+		// Upper end follows the streaming ceiling (streamMax): a completion
+		// that keeps producing tokens is healthy, not stuck, so it must stay
+		// inside the histogram rather than landing in +Inf.
+		Buckets: prometheus.ExponentialBucketsRange(0.001, 1800, 16),
 	}, []string{"path", "method"})
 
 	metricInFlight = promauto.NewGaugeVec(prometheus.GaugeOpts{

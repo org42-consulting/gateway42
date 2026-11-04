@@ -222,6 +222,13 @@ data: [DONE]
 A client that accumulates deltas should treat a frame carrying `error` as a truncated completion
 rather than as content.
 
+A stream is bounded by silence, not by how long it takes: it is closed after 60 s in which the engine
+sent nothing, or after 30 minutes in total. A completion that keeps producing tokens is not cut for
+running long, so a long agent turn on a reasoning model arrives complete rather than truncated. A
+non-streaming completion is different — it sends nothing until it is finished, so it keeps a single
+120 s budget, and in practice the 30 s response-header limit is the tighter of the two. Streaming is
+therefore the better default for anything that may generate at length.
+
 ## Usage Examples
 
 ### curl

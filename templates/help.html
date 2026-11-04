@@ -336,6 +336,14 @@ print(response.choices[0].message.content)</pre>
         On a non-streaming request the field is dropped, since it describes a stream that is not
         happening.
     </p>
+    <p>
+        A stream is bounded by <em>silence</em>, not by how long it runs: it is closed after
+        <code>60s</code> in which the engine sent nothing, or after <code>30 minutes</code> in total.
+        A completion that keeps producing tokens is never cut for running long, so a long agent turn
+        arrives complete. A non-streaming completion sends nothing until it is finished and so keeps a
+        single <code>120s</code> budget, with the <code>30s</code> response-header limit tighter in
+        practice &mdash; stream anything that may generate at length.
+    </p>
 
     <h3>Error Codes</h3>
     <table class="help-table">

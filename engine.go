@@ -53,11 +53,111 @@ var sharedClient = &http.Client{Transport: sharedTransport}
 // the entire roundtrip including body read must complete quickly.
 var controlClient = &http.Client{Transport: sharedTransport, Timeout: 5 * time.Second}
 
-// upstreamChatTimeout caps a single completion. It is an upper bound for a
-// wedged engine, not a target: the request context is the primary deadline, so
-// a client that hangs up releases the engine's concurrency slot immediately
-// rather than holding it for the remainder of this budget.
+// upstreamChatTimeout caps a single non-streaming completion. A non-streaming
+// response sends nothing until it is finished, so elapsed time is the only
+// progress signal there is and a total budget is the only bound that can catch
+// a wedged engine. It is an upper bound, not a target; the request context is
+// the primary deadline, so a client that hangs up releases the engine's
+// concurrency slot immediately rather than holding it for the rest of this
+// budget. Streaming completions are bounded by silence instead — see
+// streamDeadline — because there a long generation is not a stalled one.
 const upstreamChatTimeout = 120 * time.Second
+
+// A stream is bounded by inactivity rather than by total duration. Measured on
+// the local engine at ~58 generated tokens/s, 120s of wall clock is only ~6.9k
+// output tokens, which a single agent completion legitimately exceeds; a wedged
+// engine by contrast stops sending bytes. streamIdle is the gap that marks a
+// stream dead, and streamMax is the backstop for an engine that dribbles bytes
+// forever, since a stream holds a goroutine and one of the
+// GW42_UPSTREAM_CONCURRENCY slots for as long as it lives.
+//
+// Vars, not consts, so tests can drive both bounds without waiting on them.
+var (
+	streamIdle = 60 * time.Second
+	streamMax  = 30 * time.Minute
+)
+
+// errStreamIdle and errStreamDeadline name the two ways a stream deadline gives
+// up. They exist so the audit record can tell "the gateway capped this" from
+// "the transport failed" — a bare context.Canceled from a timer cannot.
+var (
+	errStreamIdle     = errors.New("stream idle timeout")
+	errStreamDeadline = errors.New("stream duration limit")
+)
+
+// streamDeadline bounds an in-flight stream by inactivity, with an overall
+// ceiling. The caller touches it after every chunk read; the derived context
+// cancels when the gap between touches exceeds idle, when max elapses from
+// construction, or when parent is cancelled — a client hanging up, which is
+// always the fastest possible release of the upstream slot.
+//
+// context.WithCancelCause is what keeps those three distinguishable: a plain
+// Timer-driven cancel would reach every Recv as an undifferentiated
+// context.Canceled, which is exactly the ambiguity that made the old
+// whole-stream cap uninterpretable in the logs.
+type streamDeadline struct {
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+	timer  *time.Timer
+	idle   time.Duration
+	max    time.Time // zero when unbounded
+}
+
+func newStreamDeadline(parent context.Context, idle, overall time.Duration) *streamDeadline {
+	ctx, cancel := context.WithCancelCause(parent)
+	d := &streamDeadline{ctx: ctx, cancel: cancel, idle: idle}
+	if overall > 0 {
+		d.max = time.Now().Add(overall)
+	}
+	d.timer = time.AfterFunc(d.until(), d.fired)
+	return d
+}
+
+// fired runs on the timer goroutine. It can only have been armed for the sooner
+// of the two deadlines, so the elapsed one is decided by comparing against max.
+func (d *streamDeadline) fired() {
+	if !d.max.IsZero() && !time.Now().Before(d.max) {
+		d.cancel(errStreamDeadline)
+		return
+	}
+	d.cancel(errStreamIdle)
+}
+
+// touch records progress, re-arming the timer for the sooner of the idle gap
+// and whatever is left of the overall ceiling.
+func (d *streamDeadline) touch() { d.timer.Reset(d.until()) }
+
+func (d *streamDeadline) until() time.Duration {
+	left := d.idle
+	if !d.max.IsZero() {
+		if until := time.Until(d.max); until < left {
+			left = until
+		}
+	}
+	if left < 0 {
+		left = 0
+	}
+	return left
+}
+
+// cause reports why the deadline fired, or nil if it has not. Cancellation from
+// parent is deliberately not reported here — a client that hung up is not a
+// timeout, and the caller already knows by reading r.Context().
+func (d *streamDeadline) cause() error {
+	switch cause := context.Cause(d.ctx); {
+	case errors.Is(cause, errStreamIdle), errors.Is(cause, errStreamDeadline):
+		return cause
+	default:
+		return nil
+	}
+}
+
+// stop disarms the timer. The cause of a cancel that already happened survives
+// it, so a deferred stop does not erase the reason a stream was capped.
+func (d *streamDeadline) stop() {
+	d.timer.Stop()
+	d.cancel(context.Canceled)
+}
 
 // maxStreamLineSize bounds a single SSE/JSONL line. The default bufio.Scanner
 // 64 KiB cap silently drops larger lines, which can happen when a model emits

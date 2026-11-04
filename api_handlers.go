@@ -299,12 +299,12 @@ func streamMessages(w http.ResponseWriter, r *http.Request, adapter Engine,
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), upstreamChatTimeout)
-	defer cancel()
+	deadline := newStreamDeadline(r.Context(), streamIdle, streamMax)
+	defer deadline.stop()
 
-	stream, err := adapter.StreamChat(ctx, engineReq)
+	stream, err := adapter.StreamChat(deadline.ctx, engineReq)
 	if err != nil {
-		if ctx.Err() != nil && r.Context().Err() != nil {
+		if r.Context().Err() != nil {
 			slog.Info("client disconnected before stream started", "model", model, "user", userID)
 			return
 		}
@@ -359,13 +359,23 @@ func streamMessages(w http.ResponseWriter, r *http.Request, adapter Engine,
 		}
 		if err != nil {
 			// Anthropic's in-stream error event: the client surfaces it
-			// instead of treating the truncated message as complete.
-			slog.Error("engine stream read", "err", err, "model", model)
+			// instead of treating the truncated message as complete. The
+			// deadline cause replaces the read error when the gateway capped
+			// the stream, so the audit can tell that from a transport failure.
+			why := err
+			if cause := deadline.cause(); cause != nil {
+				why = cause
+			}
+			slog.Error("engine stream read", "err", why, "model", model)
 			send(sseEvent{"error", anthropicError(500, "Stream interrupted", "api_error")})
 			outcome = "stream interrupted"
 			detail.setOutcome(outcome)
+			detail.setUpstreamErr(why)
 			return
 		}
+		// Touched on the read, not after the write — the bound tracks whether
+		// the engine is alive, not how fast this client drains.
+		deadline.touch()
 		if !send(tr.chunk(payload)...) {
 			slog.Info("client disconnected mid-stream", "model", model, "user", userID)
 			outcome = "client disconnected"
@@ -564,17 +574,21 @@ func streamCompletion(w http.ResponseWriter, r *http.Request, adapter Engine,
 	}
 
 	// The adapter's stream outlives StreamChat, so the deadline is owned here.
-	// Deriving from r.Context() means a client hanging up cancels the upstream
-	// read, which releases the engine's concurrency slot immediately.
-	ctx, cancel := context.WithTimeout(r.Context(), upstreamChatTimeout)
-	defer cancel()
+	// It bounds silence rather than total duration (see streamDeadline): the
+	// old whole-stream cap cut healthy generations. Deriving from r.Context()
+	// still means a client hanging up cancels the upstream read immediately,
+	// which releases the engine's concurrency slot at once.
+	deadline := newStreamDeadline(r.Context(), streamIdle, streamMax)
+	defer deadline.stop()
 
-	stream, err := adapter.StreamChat(ctx, engineReq)
+	stream, err := adapter.StreamChat(deadline.ctx, engineReq)
 	if err != nil {
 		// Nothing has been written yet, so a real status code is still
 		// possible — better than a 200 carrying an error-shaped SSE frame,
-		// which is what the old per-adapter code had to do.
-		if ctx.Err() != nil && r.Context().Err() != nil {
+		// which is what the old per-adapter code had to do. Only the request
+		// context says whether the client left; a deadline that fired here is
+		// reported upstream instead.
+		if r.Context().Err() != nil {
 			slog.Info("client disconnected before stream started", "model", model, "user", userID)
 			return
 		}
@@ -617,13 +631,28 @@ func streamCompletion(w http.ResponseWriter, r *http.Request, adapter Engine,
 			// Headers are already out, so the status cannot change. Emitting
 			// an error frame before [DONE] is the only way to tell a client
 			// that the completion it received is truncated.
-			slog.Error("engine stream read", "err", err, "model", model)
+			//
+			// The deadline cause replaces the read error when the gateway
+			// itself ended the stream: Recv can only report a cancelled read,
+			// which would hide that this was a timeout rather than a network
+			// failure — the gap that made the old cap uninterpretable in the
+			// request log.
+			why := err
+			if cause := deadline.cause(); cause != nil {
+				why = cause
+			}
+			slog.Error("engine stream read", "err", why, "model", model)
 			if b, mErr := json.Marshal(openaiError("Stream interrupted", "api_error")); mErr == nil {
 				fmt.Fprintf(w, "data: %s\n\n", b)
 			}
 			outcome = "stream interrupted"
+			detail.setUpstreamErr(why)
 			break
 		}
+		// Touched on the read, not after the write: the bound measures whether
+		// the engine is alive, and a client that drains slowly must not get its
+		// own completion killed for reading it carefully.
+		deadline.touch()
 		if _, err := fmt.Fprintf(w, "data: %s\n\n", payload); err != nil {
 			// Client went away mid-stream. Returning unwinds the deferred
 			// Close and Release rather than writing into a dead connection

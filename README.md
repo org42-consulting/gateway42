@@ -378,11 +378,19 @@ data: [DONE]
 ```
 
 Treat a frame carrying `error` as a truncated completion rather than as content. There is no server
-`WriteTimeout`, deliberately — a long generation is not a stalled connection — so a slow stream is
-bounded by the 120 s upstream call timeout, not by the HTTP server.
+`WriteTimeout`, deliberately — a long generation is not a stalled connection.
+
+A stream is bounded by **silence rather than elapsed time**: it is cut after 60 s in which the engine
+sent nothing, and at 30 minutes however steadily tokens arrived. A completion that keeps producing is
+never cut for running long, which is the part that matters — at the ~58 tokens/s measured on the local
+engine, two minutes is only about 6,900 output tokens, routinely exceeded by an agent prompt on a
+reasoning model. Non-streaming completions keep a single 120 s budget, because a response that sends
+nothing until it is finished offers no other progress signal.
 
 Hanging up mid-stream is handled: a client disconnect cancels the upstream call, which releases the
-engine's concurrency slot immediately instead of leaving it held for the remainder of the timeout.
+engine's concurrency slot immediately rather than waiting for the read to finish. A stream the gateway
+had to cap is recorded in the request log with the reason in `upstream_error`, so a truncated answer
+is distinguishable from a network failure without reading the process log.
 
 ### Error Codes
 
@@ -469,9 +477,9 @@ problem, and clients would see timeouts with no explanation instead of an explic
 back off on.
 
 The slot is held for the whole upstream call — including the full duration of a stream — and
-released when the response completes, when the client disconnects, or when the 120 s upstream
-timeout fires. Because a disconnect propagates cancellation upstream, abandoned requests do not
-occupy slots until their timeout expires.
+released when the response completes, when the client disconnects, or when the stream's bound fires:
+60 s of silence, or 30 minutes in total. Because a disconnect propagates cancellation upstream,
+abandoned requests do not occupy slots until their timeout expires.
 
 Rejections are counted in `gw42_upstream_busy_total`, labelled by engine, so a persistently busy
 engine is visible rather than something users report anecdotally.
@@ -499,7 +507,7 @@ All series use the `gw42_` prefix:
 | Metric | Type | Labels | What it tells you |
 | ------ | ---- | ------ | ----------------- |
 | `gw42_http_requests_total` | counter | `path`, `method`, `status` | Request volume and error rate |
-| `gw42_http_request_duration_seconds` | histogram | `path`, `method` | End-to-end latency, 1 ms–60 s buckets |
+| `gw42_http_request_duration_seconds` | histogram | `path`, `method` | End-to-end latency, 1 ms–30 min buckets. The upper end reaches the streaming ceiling so a long generation is measurable rather than landing in `+Inf` |
 | `gw42_inflight_requests` | gauge | `path` | Requests in progress right now |
 | `gw42_upstream_duration_seconds` | histogram | `engine`, `op` | Engine latency, 5 ms–120 s buckets. `op` is `chat`, `stream`, `list_models`, or `status`. For `stream` it is the time until the engine accepted the stream (response headers), not the whole generation |
 | `gw42_upstream_errors_total` | counter | `engine`, `op` | Engine failures, separated from client errors |
@@ -794,15 +802,18 @@ export PORT=7000
 
 ### Timeouts and limits
 
-These are compile-time constants rather than environment variables. They are listed because they
-determine observable behaviour:
+These are fixed in source rather than configured by environment variables. They are listed because
+they determine observable behaviour:
 
 | Setting | Value | Why |
 | ------- | ----- | --- |
 | Read header timeout | 10 s | Bounds slow-header attacks without limiting body upload time. |
 | Idle timeout | 120 s | How long a keep-alive connection may sit unused. |
-| Write timeout | **none** | Deliberate. Any fixed write deadline would kill long streams mid-generation; stream duration is bounded by the upstream timeout instead. |
-| Upstream chat timeout | 120 s | Applies to a non-streaming completion and to establishing a stream. |
+| Write timeout | **none** | Deliberate. Any fixed write deadline would kill a long generation mid-stream. |
+| Upstream response headers | 30 s | An engine that accepts the connection but never answers is failed here. It applies before any body, so it also bounds how long a stream may take to *start*. For a non-streaming completion the headers arrive together with the finished answer, which caps that shape at 30 s of generation regardless of the budget below — the reason streaming is the better default. |
+| Upstream stream idle | 60 s | The silence that marks a stream dead. Every chunk from the engine resets it, so a completion is cut for stalling, never for running long. |
+| Upstream stream ceiling | 30 min | Backstop for an engine that dribbles bytes forever. A stream holds an engine slot for all of it, so this cannot simply be unbounded. |
+| Upstream chat timeout | 120 s | Whole-call budget for a non-streaming completion, which sends nothing until it is finished and so gives no progress signal to bound instead. |
 | Concurrency acquire wait | 250 ms | How long a request waits for an engine slot before `503`. |
 | Shutdown drain | 30 s | In-flight requests finish before the process exits. |
 | Engine probe cache | 10 s | How stale dashboard health and model lists may be. |
@@ -843,6 +854,7 @@ The race detector works without a C toolchain because the SQLite driver is pure 
 | `compat_request_test.go` | The OpenAI-compatible request body: an explicit `stream` boolean, sanitised messages, the parameter allow-list, and that a stream asks the engine for usage via `stream_options.include_usage` — with the client's own sub-fields carried through and the caller's decoded request left unmutated. |
 | `probe_cache_test.go` | A probe or routing index computed before an invalidation is discarded, so a pull or delete is visible at once. |
 | `stream_audit_test.go` | Streamed completions are audited with the text and tool calls the client received, including streams the client abandoned. |
+| `stream_deadline_test.go` | The streaming bound: steady progress past what the old whole-stream cap allowed survives, while engine silence is cut at the idle gap; the overall ceiling fires despite progress; a client disconnect is never recorded as a timeout; a capped stream records `upstream_error`, marks its outcome, emits the error frame before `[DONE]`, and cancels the upstream read rather than being abandoned. |
 | `logout_test.go` | Logout is a POST behind the CSRF check, not a GET any page could trigger. |
 | `static_css_test.go` | No template contains a `<style>` block or `style` attribute, both layouts link the stylesheet, and the router serves it as `text/css`. |
 | `compat_baseurl_test.go` | OpenAI-compatible base URLs work with or without `/v1` (a proxy prefix is kept), and Test Saved Engines names the upstream status and guides an admin with nothing saved. |
@@ -873,8 +885,8 @@ Single `package main`, one file per concern:
 | ---- | ----- | -------------- |
 | `main.go` | 1141 | Config, routing table, middleware chain, panic recovery, server lifecycle, graceful shutdown. |
 | `handlers.go` | 1289 | Admin web UI handlers only. |
-| `api_handlers.go` | 743 | The `/v1/*` OpenAI-compatible surface. Separate from the admin UI so a change to one cannot alter the other's contract. |
-| `engine.go` | 1189 | The `Engine` interface and its two adapters, plus the probe cache and stream implementations. |
+| `api_handlers.go` | 772 | The `/v1/*` OpenAI-compatible surface. Separate from the admin UI so a change to one cannot alter the other's contract. |
+| `engine.go` | 1289 | The `Engine` interface and its two adapters, plus the probe cache, stream implementations and the streaming deadline. |
 | `routing.go` | 256 | Model-name → engine resolution and the cached routing index. |
 | `openai.go` | 466 | Request and response translation between OpenAI and Ollama shapes. |
 | `anthropic.go` | 579 | The Anthropic Messages API front-end: both translation directions and the streaming block sequencer. |
@@ -886,7 +898,7 @@ Single `package main`, one file per concern:
 | `auth.go` | 188 | Password hashing, API-key generation, and the admin login throttle. |
 | `csrf.go` | 116 | CSRF token issue and verification. |
 | `ratelimit.go` | 94 | Per-user token buckets. |
-| `metrics.go` | 207 | Prometheus collectors and the path bucketer. |
+| `metrics.go` | 210 | Prometheus collectors and the path bucketer. |
 
 Templates, static images and the stylesheet are compiled into the binary with `embed.FS`, so
 deployment is a single file with no asset directory to ship alongside it.
