@@ -303,10 +303,11 @@ the Claude Code model-config docs to set the real window for your model.
 | `temperature` | `temperature` | |
 | `top_p` | `top_p` | |
 | `max_tokens` | `num_predict` | |
+| `max_completion_tokens` | `num_predict` | Wins over `max_tokens` when both are sent — OpenAI treats `max_tokens` as this field's deprecated alias |
 | `seed` | `seed` | |
 | `stop` | `stop` | String or list of strings; a bare string is wrapped into a list |
-| `presence_penalty` | `repeat_last_n` | **Lossy.** Ollama has no presence penalty; `repeat_last_n` is a lookback window measured in tokens, not a penalty weight. The value is passed through as-is, so treat the mapping as approximate rather than equivalent. |
-| `frequency_penalty` | `repeat_penalty` | Mapped as `1.0 + value` |
+| `presence_penalty` | `presence_penalty` | Direct — Ollama takes this parameter under its own name |
+| `frequency_penalty` | `frequency_penalty` | Direct |
 | `tools` | `tools` | Same schema, forwarded as-is. `tool_choice: "none"` withholds them; other `tool_choice` values are ignored (Ollama has no equivalent). |
 | `response_format` | `format` | `json_object` → `"json"`; `json_schema` → the schema object. |
 
@@ -772,7 +773,7 @@ The race detector works without a C toolchain because the SQLite driver is pure 
 | `engine_config_test.go` | Ollama URL assembly (no doubled port, default scheme and port), engine-edit merging (a blank key keeps the stored one), and Ollama engine selection for pull/delete. |
 | `engine_delete_test.go` | Model deletion reports upstream refusals, with the reason bounded so it fits a session-cookie flash. |
 | `logging_test.go` | `LOG_LEVEL` parsing and `LOG_FILE` output, including not double-writing when stderr is already that file. |
-| `tools_test.go` | The tool-use loop in both directions: message fields kept through sanitising, OpenAI → Ollama history translation (argument objects, `tool_name` from `tool_call_id`, image parts), `response_format` → `format`, and Ollama tool calls returned in OpenAI shape with cross-chunk indexes and `finish_reason: "tool_calls"`. |
+| `tools_test.go` | The tool-use loop in both directions: message fields kept through sanitising, OpenAI → Ollama history translation (argument objects, `tool_name` from `tool_call_id`, image parts), `response_format` → `format`, the sampling-parameter mappings (both penalties under their native names, `max_completion_tokens` winning over `max_tokens`), and Ollama tool calls returned in OpenAI shape with cross-chunk indexes and `finish_reason: "tool_calls"`. |
 | `pull_csrf_test.go` | A model pull — a GET, so outside the CSRF middleware — is refused without the session's token. |
 | `metrics_auth_test.go` | `/metrics` access by admin session and by `GW42_METRICS_TOKEN`, and that an unset token is not an open door. |
 | `engine_save_test.go` | Against a real SQLite file: a failed read of the engine list aborts an add or remove instead of saving a list that drops every other engine. |
@@ -782,6 +783,9 @@ The race detector works without a C toolchain because the SQLite driver is pure 
 | `logout_test.go` | Logout is a POST behind the CSRF check, not a GET any page could trigger. |
 | `static_css_test.go` | No template contains a `<style>` block or `style` attribute, both layouts link the stylesheet, and the router serves it as `text/css`. |
 | `compat_baseurl_test.go` | OpenAI-compatible base URLs work with or without `/v1` (a proxy prefix is kept), and Test Saved Engines names the upstream status and guides an admin with nothing saved. |
+| `engine_test_draft_test.go` | Test Connection builds the config the way saving would, so an edit with the API key left blank is tested with the stored key rather than an empty one. |
+| `anthropic_test.go` | The Anthropic front-end: tool loops both ways, a tool-only turn keeping null content, `max_tokens`/bad-arguments handling, content-block sequencing across a stream, an Ollama tool reply arriving as one `tool_use` delta, and error `type` names following the Anthropic vocabulary Claude Code switches on. |
+| `request_detail_test.go` | The per-request detail collector: routing, timing and token facts reaching the log row, a request that never reaches a handler still producing one, `X-Request-ID` matching the stored id, and the migration that gives an existing database the detail columns and rebuilds its contentless FTS table. |
 
 The template test matters more than it sounds: `html/template` resolves field names at render time,
 so a mistyped `{{.FieldName}}` is invisible until someone loads the page.
@@ -802,19 +806,21 @@ Single `package main`, one file per concern:
 
 | File | Lines | Responsibility |
 | ---- | ----- | -------------- |
-| `main.go` | 1005 | Config, routing table, middleware chain, panic recovery, server lifecycle, graceful shutdown. |
-| `handlers.go` | 1153 | Admin web UI handlers only. |
-| `api_handlers.go` | 486 | The `/v1/*` OpenAI-compatible surface. Separate from the admin UI so a change to one cannot alter the other's contract. |
-| `engine.go` | 945 | The `Engine` interface and its two adapters, plus the probe cache and stream implementations. |
-| `routing.go` | 217 | Model-name → engine resolution and the cached routing index. |
+| `main.go` | 1099 | Config, routing table, middleware chain, panic recovery, server lifecycle, graceful shutdown. |
+| `handlers.go` | 1239 | Admin web UI handlers only. |
+| `api_handlers.go` | 724 | The `/v1/*` OpenAI-compatible surface. Separate from the admin UI so a change to one cannot alter the other's contract. |
+| `engine.go` | 1189 | The `Engine` interface and its two adapters, plus the probe cache and stream implementations. |
+| `routing.go` | 256 | Model-name → engine resolution and the cached routing index. |
 | `openai.go` | 466 | Request and response translation between OpenAI and Ollama shapes. |
-| `types.go` | 156 | Typed structs for responses Gateway42. authors. |
-| `db.go` | 821 | Schema, migrations, both connection pools, queries, FTS5 setup, retention pruning. |
-| `logwriter.go` | 289 | Asynchronous batched log writers. |
+| `anthropic.go` | 579 | The Anthropic Messages API front-end: both translation directions and the streaming block sequencer. |
+| `types.go` | 168 | Typed structs for responses Gateway42. authors. |
+| `db.go` | 920 | Schema, migrations, both connection pools, queries, FTS5 setup, retention pruning. |
+| `request_detail.go` | 220 | The per-request detail collector handlers fill and the request log reads. |
+| `logwriter.go` | 334 | Asynchronous batched log writers. |
 | `auth.go` | 90 | Password hashing and API-key generation. |
 | `csrf.go` | 116 | CSRF token issue and verification. |
-| `ratelimit.go` | 89 | Per-user token buckets. |
-| `metrics.go` | 181 | Prometheus collectors and the path bucketer. |
+| `ratelimit.go` | 94 | Per-user token buckets. |
+| `metrics.go` | 207 | Prometheus collectors and the path bucketer. |
 
 Templates, static images and the stylesheet are compiled into the binary with `embed.FS`, so
 deployment is a single file with no asset directory to ship alongside it.

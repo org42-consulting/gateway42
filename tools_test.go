@@ -130,6 +130,52 @@ func TestOpenAIToOllamaHonoursToolChoiceNone(t *testing.T) {
 	}
 }
 
+func TestOpenAIToOllamaMapsPenaltiesToNativeOptions(t *testing.T) {
+	data := decodeJSON(t, `{"model":"m","temperature":0.7,
+		"presence_penalty":0.5,"frequency_penalty":-0.25}`).(map[string]interface{})
+
+	options, _ := openAIToOllama(data, nil)["options"].(map[string]interface{})
+	// Ollama takes both penalties under these exact names. Routing them
+	// elsewhere is not merely lossy: the old presence_penalty → repeat_last_n
+	// put a -2..2 weight into an integer lookback-window count, so the
+	// fractional value most clients send was rejected upstream.
+	if got := options["presence_penalty"]; got != 0.5 {
+		t.Errorf("presence_penalty = %#v, want 0.5 passed through", got)
+	}
+	if got := options["frequency_penalty"]; got != -0.25 {
+		t.Errorf("frequency_penalty = %#v, want -0.25 passed through", got)
+	}
+	if v, ok := options["repeat_last_n"]; ok {
+		t.Errorf("repeat_last_n = %#v; a penalty weight must not become a token window", v)
+	}
+	if v, ok := options["repeat_penalty"]; ok {
+		t.Errorf("repeat_penalty = %#v; frequency_penalty has a native option", v)
+	}
+}
+
+func TestOpenAIToOllamaTokenCapPrefersMaxCompletionTokens(t *testing.T) {
+	// Current OpenAI SDKs send max_completion_tokens. Mapping only max_tokens
+	// left the cap unset for them, so a client that asked for 60 tokens got the
+	// model's full default generation and no finish_reason: "length".
+	for _, tc := range []struct {
+		name   string
+		fields string
+		want   float64
+	}{
+		{"max_tokens", `"max_tokens":40`, 40},
+		{"max_completion_tokens", `"max_completion_tokens":60`, 60},
+		{"both: current name wins", `"max_tokens":40,"max_completion_tokens":60`, 60},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data := decodeJSON(t, `{"model":"m",`+tc.fields+`}`).(map[string]interface{})
+			options, _ := openAIToOllama(data, nil)["options"].(map[string]interface{})
+			if got := options["num_predict"]; got != tc.want {
+				t.Errorf("num_predict = %#v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestOllamaMessagesTranslatesToolLoop(t *testing.T) {
 	withMaxMsgLen(t, 1000)
 	msgs := ollamaMessages(sanitizeMessages(decodeJSON(t, toolLoopHistory).([]interface{})))

@@ -27,11 +27,12 @@ func openAIToOllama(data map[string]interface{}, messages []map[string]interface
 
 	// Direct parameter mappings
 	paramMap := map[string]string{
-		"temperature":      "temperature",
-		"top_p":            "top_p",
-		"seed":             "seed",
-		"max_tokens":       "num_predict",
-		"presence_penalty": "repeat_last_n",
+		"temperature":       "temperature",
+		"top_p":             "top_p",
+		"seed":              "seed",
+		"max_tokens":        "num_predict",
+		"presence_penalty":  "presence_penalty",
+		"frequency_penalty": "frequency_penalty",
 	}
 	for openaiKey, ollamaKey := range paramMap {
 		if v, ok := data[openaiKey]; ok {
@@ -39,14 +40,12 @@ func openAIToOllama(data map[string]interface{}, messages []map[string]interface
 		}
 	}
 
-	// frequency_penalty → repeat_penalty = 1.0 + value
-	if fp, ok := data["frequency_penalty"]; ok {
-		switch v := fp.(type) {
-		case float64:
-			options["repeat_penalty"] = 1.0 + v
-		case int:
-			options["repeat_penalty"] = 1.0 + float64(v)
-		}
+	// max_completion_tokens overrides max_tokens for num_predict. Both cap
+	// output length and cannot both apply; OpenAI defines max_completion_tokens
+	// as the current name and max_tokens as its deprecated alias, so a client
+	// that sends both wants the former.
+	if mct, ok := data["max_completion_tokens"]; ok {
+		options["num_predict"] = mct
 	}
 
 	// stop can be string or list → always list
@@ -281,8 +280,9 @@ func newToolCallID() string {
 // non-null. It is never called mid-stream.
 //
 // Ollama reports done_reason on its final object: "stop" when the model emitted
-// an end token, "length" when it hit num_predict (which max_tokens maps to).
-// OpenAI's vocabulary is "stop" | "length" | "content_filter" | "tool_calls".
+// an end token, "length" when it hit num_predict (which max_tokens and
+// max_completion_tokens map to). OpenAI's vocabulary is "stop" | "length" |
+// "content_filter" | "tool_calls".
 //
 // "length" is the value that matters: it is how a client learns its completion
 // was truncated, and callers continue or retry on it. Labelling a truncated

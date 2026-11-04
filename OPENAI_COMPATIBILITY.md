@@ -136,9 +136,10 @@ For Ollama engines, parameters are instead mapped into Ollama's `options` object
 | `top_p` | `top_p` | Direct |
 | `seed` | `seed` | Direct |
 | `max_tokens` | `num_predict` | Direct |
+| `max_completion_tokens` | `num_predict` | Wins over `max_tokens` when both are sent; OpenAI treats `max_tokens` as its deprecated alias |
 | `stop` | `stop` | A bare string is wrapped into a list |
-| `frequency_penalty` | `repeat_penalty` | `1.0 + value` |
-| `presence_penalty` | `repeat_last_n` | Approximate: Ollama has no presence penalty, and `repeat_last_n` is a lookback window in tokens, not a penalty weight. Treat this mapping as lossy. |
+| `frequency_penalty` | `frequency_penalty` | Direct — Ollama takes this parameter under its own name |
+| `presence_penalty` | `presence_penalty` | Direct — Ollama takes this parameter under its own name |
 | `tools` | `tools` | Same schema. `tool_choice: "none"` withholds them; other values are ignored |
 | `response_format` | `format` | `json_object` → `"json"`; `json_schema` → the schema object |
 

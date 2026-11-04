@@ -294,10 +294,11 @@ print(response.choices[0].message.content)</pre>
             <tr><td><code>temperature</code></td><td><code>temperature</code></td><td></td></tr>
             <tr><td><code>top_p</code></td><td><code>top_p</code></td><td></td></tr>
             <tr><td><code>max_tokens</code></td><td><code>num_predict</code></td><td></td></tr>
+            <tr><td><code>max_completion_tokens</code></td><td><code>num_predict</code></td><td>Wins over <code>max_tokens</code> when both are sent.</td></tr>
             <tr><td><code>seed</code></td><td><code>seed</code></td><td></td></tr>
             <tr><td><code>stop</code></td><td><code>stop</code></td><td>String or list of strings.</td></tr>
-            <tr><td><code>presence_penalty</code></td><td><code>repeat_last_n</code></td><td></td></tr>
-            <tr><td><code>frequency_penalty</code></td><td><code>repeat_penalty</code></td><td>Mapped as <code>1.0 + value</code>.</td></tr>
+            <tr><td><code>presence_penalty</code></td><td><code>presence_penalty</code></td><td>Direct — Ollama takes this parameter under its own name.</td></tr>
+            <tr><td><code>frequency_penalty</code></td><td><code>frequency_penalty</code></td><td>Direct — Ollama takes this parameter under its own name.</td></tr>
             <tr><td><code>tools</code></td><td><code>tools</code></td><td>Forwarded as-is. <code>tool_choice: "none"</code> withholds them. Tool calls come back in OpenAI format with <code>finish_reason: "tool_calls"</code>.</td></tr>
             <tr><td><code>response_format</code></td><td><code>format</code></td><td><code>json_object</code> → <code>"json"</code>; <code>json_schema</code> → the schema.</td></tr>
         </tbody>
