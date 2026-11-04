@@ -11,6 +11,9 @@
     --radius-sm:   4px;
     --radius-md:   12px;
     --radius-lg:   26px;
+    /* One source for the bar's height: the sidebar hangs off it. v2.1 hardcoded the
+       same relationship as a `top: 48px` plus a `padding-top: 74px` pair. */
+    --header-h:    48px;
 }
 
 *, *::before, *::after { box-sizing: border-box; }
@@ -26,15 +29,31 @@ body {
         #0c4a6e;
 }
 
-/* ── App shell: sidebar + main content ── */
-.app-shell { display: flex; min-height: 100vh; }
+/* ── Header bar: brand and logout, above the shell ── */
+.site-header {
+    position: sticky;
+    top: 0;
+    z-index: 200;
+    background: rgba(0,0,0,.55);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+}
+.header-inner  { display: flex; align-items: center; gap: 10px; padding: 4px 20px 4px 4px; }
+.header-logo   { height: 40px; padding: 4px 8px 4px 4px; border-right: 1px solid var(--color-blue-3); filter: url(#logo-lift); }
+.header-wordmark { display: flex; flex-direction: column; }
+.header-wordmark .brand   { font-size: 14px; font-weight: 800; color: #fff; line-height: 1.2; }
+.header-wordmark .tagline { font-size: 11px; font-weight: 400; color: rgba(255,255,255,.55); }
+.header-actions { margin-left: auto; }
 
-/* ── Navigation sidebar: logo, nav, engine status, logout ── */
+/* ── App shell: sidebar + main content ── */
+.app-shell { display: flex; min-height: calc(100vh - var(--header-h)); }
+
+/* ── Navigation sidebar: nav and engine status ── */
 .sidebar {
     flex: 0 0 240px;
     position: sticky;
-    top: 0;
-    height: 100vh;
+    top: var(--header-h);
+    height: calc(100vh - var(--header-h));
     overflow-y: auto;
     display: flex;
     flex-direction: column;
@@ -44,9 +63,6 @@ body {
     -webkit-backdrop-filter: blur(16px);
     z-index: 100;
 }
-.sidebar-brand { display: flex; flex-direction: column; gap: 6px; padding: 0 20px 22px; }
-.sidebar-logo  { width: 130px; height: auto; filter: url(#logo-lift); }
-.sidebar-brand .tagline { font-size: 11px; line-height: 1.4; color: rgba(255,255,255,.55); }
 
 .sidebar-nav { list-style: none; padding: 0; margin: 0; }
 .sidebar-nav li { margin: 0; }
@@ -54,12 +70,13 @@ body {
     display: flex;
     align-items: center;
     gap: 12px;
-    padding: 12px 20px;
+    padding: 12px 10px;
     color: rgba(255,255,255,.72);
     text-decoration: none;
     font-size: .9rem;
     transition: all .2s;
     border-left: 3px solid transparent;
+    margin-left: 10px;
 }
 .sidebar-nav svg {
     width: 18px; height: 18px; flex: none;
@@ -70,6 +87,7 @@ body {
     background: var(--ai-bg);
     color: var(--ai-electric);
     border-left: 3px solid var(--ai-electric);
+    box-shadow: 0 5px 6px 0 rgba(0, 0, 0, 0.2);
 }
 
 /* Engine status from the probe cache (see navEngines). */
@@ -99,21 +117,18 @@ body {
 .engine-offline .engine-state { color: #f87171; }
 .engine-none { color: rgba(255,255,255,.55); }
 
-.sidebar-actions { display: flex; margin: 14px 14px 0; }
-.sidebar-actions form { margin-left: auto; }
-
 /* Phones and narrow windows: the sidebar becomes a top block with the nav in a scrolling row. */
 @media (max-width: 860px) {
     .app-shell { flex-direction: column; }
     .sidebar { position: static; height: auto; flex: none; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 10px 8px; padding: 10px 14px; }
-    .sidebar-brand { padding: 0; }
-    .sidebar-brand .tagline, .engine-box { display: none; }
-    .sidebar-logo { width: 100px; }
-    .sidebar-actions { margin: 0 0 0 auto; }
+    .engine-box { display: none; }
     .sidebar nav { order: 5; width: 100%; overflow-x: auto; }
     .sidebar-nav { display: flex; }
     .sidebar-nav a { gap: 8px; padding: 10px 10px; border-left: 0; border-bottom: 3px solid transparent; white-space: nowrap; }
     .sidebar-nav a.active { border-left: 0; border-bottom: 3px solid var(--ai-electric); }
+    /* The bar keeps the mark and the logout; the tagline is the first thing to go. */
+    .header-inner { padding: 4px 14px 4px 4px; }
+    .header-wordmark .tagline { display: none; }
 }
 
 /* ── Main content area: fills the space next to the sidebar ── */

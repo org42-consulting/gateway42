@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -105,6 +106,103 @@ func TestAllPagesParse(t *testing.T) {
 	for _, page := range []string{"dashboard", "settings", "logs", "help", "confirm_delete", "login"} {
 		if tmpls[page] == nil {
 			t.Errorf("%s: template not registered", page)
+		}
+	}
+}
+
+// The header bar carries the brand and the logout; the sidebar carries the
+// navigation and engine status. v2.2 deleted the bar and moved the brand into
+// the sidebar, so nothing renders it now except this: restoring the bar without
+// removing that copy would show the brand twice on every admin page.
+func TestHeaderBarCarriesBrandAndLogout(t *testing.T) {
+	initTemplates()
+	tmpl := tmpls["dashboard"]
+	if tmpl == nil {
+		t.Fatal("dashboard template not registered")
+	}
+
+	data := DashboardData{BaseData: BaseData{
+		CurrentPath: "/admin/panel",
+		CSRFToken:   "tok",
+		NavEngines:  []NavEngine{{Name: "oMLX", State: "online"}},
+	}}
+	var sb strings.Builder
+	if err := tmpl.ExecuteTemplate(&sb, "base.html", data); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := sb.String()
+
+	// Everything left of the shell is the bar.
+	header, _, _ := strings.Cut(out, `class="app-shell"`)
+	for _, want := range []string{
+		`<header class="site-header">`,
+		`class="header-logo"`,
+		`<span class="brand">Gateway42.</span>`,
+		`An opinionated gateway to local LLMs.`,
+	} {
+		if !strings.Contains(header, want) {
+			t.Errorf("header bar missing %q", want)
+		}
+	}
+
+	// Logout belongs to the bar now, and must stay a CSRF-carrying POST —
+	// v2.1 submitted it with GET, which is what logout_test.go exists to stop.
+	if !strings.Contains(header, `<form class="header-actions" action="/logout" method="post">`) {
+		t.Error("logout is not a CSRF-carrying POST inside the header bar")
+	}
+	if !strings.Contains(header, `name="_csrf" value="tok"`) {
+		t.Error("logout form lost its CSRF token")
+	}
+	if got := strings.Count(out, `action="/logout"`); got != 1 {
+		t.Errorf("got %d logout forms, want exactly 1", got)
+	}
+
+	// The brand renders once, not once per region it now appears in.
+	if got := strings.Count(out, "An opinionated gateway"); got != 1 {
+		t.Errorf("got %d taglines, want exactly 1", got)
+	}
+	for _, gone := range []string{"sidebar-brand", "sidebar-logo", "sidebar-actions"} {
+		if strings.Contains(out, gone) {
+			t.Errorf("%s is still in the markup — its content did not move to the bar", gone)
+		}
+	}
+
+	// What v2.2 added stays: active-link marking and live engine state.
+	for _, want := range []string{`aria-current="page"`, `class="engine-row engine-online"`, "oMLX"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("sidebar lost %q", want)
+		}
+	}
+}
+
+// The stylesheet is not compiled against the templates, so a class the markup
+// uses and the CSS stopped defining is invisible to every other check here.
+func TestStylesheetDefinesTheHeaderBar(t *testing.T) {
+	b, err := os.ReadFile("static/gateway42.css")
+	if err != nil {
+		t.Fatalf("read stylesheet: %v", err)
+	}
+	css := string(b)
+
+	for _, want := range []string{
+		".site-header", ".header-inner", ".header-logo", ".header-wordmark", ".header-actions",
+	} {
+		if !strings.Contains(css, want+" ") && !strings.Contains(css, want+" {") {
+			t.Errorf("stylesheet does not define %s, which base.html uses", want)
+		}
+	}
+	// One source for the bar's height. v2.1 expressed the same relationship as a
+	// `top: 48px` on the sidebar and a `padding-top: 74px` on the content, a
+	// hand-kept pair; both offsets are computed from the token now.
+	if !strings.Contains(css, "--header-h:") {
+		t.Error("stylesheet lost the --header-h token the bar offsets derive from")
+	}
+	if got := strings.Count(css, "var(--header-h)"); got < 2 {
+		t.Errorf("only %d rules offset from --header-h, want the shell and the sidebar", got)
+	}
+	for _, gone := range []string{".sidebar-brand", ".sidebar-logo", ".sidebar-actions"} {
+		if strings.Contains(css, gone) {
+			t.Errorf("stylesheet still styles %s for markup that no longer exists", gone)
 		}
 	}
 }

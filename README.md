@@ -843,7 +843,7 @@ The race detector works without a C toolchain because the SQLite driver is pure 
 | `stream_test.go` | Stream translation: Ollama NDJSON → OpenAI chunks, SSE passthrough unwrapping, terminal-chunk handling. |
 | `recovery_test.go` | Panic recovery: the JSON envelope on `/v1/`, plain text on the admin UI, an SSE error frame when the response is already committed mid-stream, and that a committed body is never appended to. Also that the `statusRecorder` wrapper stays transparent about the writer's other interfaces — `Flusher`, `Hijacker` and `io.ReaderFrom` are not promoted through an embedded interface, so each is asserted and delegated to, including that a hijacked response gets no panic body appended to its raw protocol bytes. |
 | `metrics_test.go` | That a recovered panic is counted, with the status the client actually saw; that a mid-stream panic counts as `200` and raises `gw42_panics_total`; that the in-flight gauge unwinds; that one `statusRecorder` is shared; and that a panicked request still produces an audit row. |
-| `tmpl_render_check_test.go` | Every template renders against its real data shape, so a typo in an admin page is caught at test time rather than in the browser. Also checks that an engine's API key never reaches the settings page. |
+| `tmpl_render_check_test.go` | Every template renders against its real data shape, so a typo in an admin page is caught at test time rather than in the browser. Also checks that an engine's API key never reaches the settings page, that the header bar carries the brand and the logout exactly once with the sidebar keeping navigation and engine status, and that the stylesheet still defines the classes that markup uses. |
 | `engine_config_test.go` | Ollama URL assembly (no doubled port, default scheme and port), engine-edit merging (a blank key keeps the stored one), and Ollama engine selection for pull/delete. |
 | `engine_delete_test.go` | Model deletion reports upstream refusals, with the reason bounded so it fits a session-cookie flash. |
 | `logging_test.go` | `LOG_LEVEL` parsing and `LOG_FILE` output, including not double-writing when stderr is already that file. |
@@ -913,6 +913,15 @@ mind when editing it:
   (`.help-section code`, not `code`) rather than relying on order.
 - **The login page shares the file.** Its differences are scoped under `body.login-page`, including
   undoing base rules it never had (the card hover glow, `.btn` line-height).
+- **`--header-h` must equal the bar's real height.** The sidebar hangs off it
+  (`top: var(--header-h)`, `height: calc(100vh - var(--header-h))`), and so does the shell's
+  `min-height`. The bar is 48px — a 40px logo plus the 4px padding on each side of `.header-inner`.
+  A token that no longer exists, or a logo resized without updating it, fails silently in a
+  particular way worth knowing: `calc()` against an undefined custom property is invalid at
+  computed-value time, so `height` and `top` fall back to `auto`, and a `position: sticky` sidebar
+  with `top: auto` behaves as static — the rail scrolls off the top and stops short of the bottom on
+  the pages long enough to scroll. Nothing in the test suite catches the value being wrong; only
+  measuring the rendered bar does.
 
 
 ## Known Design Constraints

@@ -21,13 +21,26 @@
             <feColorMatrix type="matrix" values="0 0.0275 0 0 0.9725  0 0.5569 0 0 0.4431  0 0.5569 0 0 0.4431  0 0 0 1 0"/>
         </filter>
     </svg>
-    <div class="app-shell">
-    <!-- Sidebar: logo, navigation, engine status, logout -->
-    <aside class="sidebar">
-        <div class="sidebar-brand">
-            <img src="/images/gw42.png" alt="Gateway42." class="sidebar-logo">
-            <span class="tagline">An opinionated gateway to local LLMs.</span>
+    <!-- Header bar, restored from v2.1: brand left, logout right. The logo keeps #logo-lift
+         because the mark's #990000 red reads as near-black on this dark bar. -->
+    <header class="site-header">
+        <div class="header-inner">
+            <img src="/images/gw42.png" alt="Gateway42." class="header-logo">
+            <div class="header-wordmark">
+                <span class="brand">Gateway42.</span>
+                <span class="tagline">An opinionated gateway to local LLMs.</span>
+            </div>
+            <!-- POST, not a link: logout changes session state, so it goes through the CSRF
+                 check like every other admin action. v2.1 used GET; that was fixed after it. -->
+            <form class="header-actions" action="/logout" method="post">
+                <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
+                <button class="btn btn-danger">Logout</button>
+            </form>
         </div>
+    </header>
+    <div class="app-shell">
+    <!-- Sidebar: navigation, engine status -->
+    <aside class="sidebar">
         <nav aria-label="Primary">
             <ul class="sidebar-nav">
                 <li><a href="/admin/panel" class="{{if eq .CurrentPath "/admin/panel"}}active{{end}}"{{if eq .CurrentPath "/admin/panel"}} aria-current="page"{{end}}>
@@ -49,13 +62,6 @@
             <a href="/admin/settings-page" class="engine-none">No engines configured</a>
             {{end}}
         </section>
-        <div class="sidebar-actions">
-            <!-- POST, not a link: logout changes session state, so it goes through the CSRF check like every other admin action. -->
-            <form action="/logout" method="post">
-                <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
-                <button class="btn btn-danger">Logout</button>
-            </form>
-        </div>
     </aside>
 
     <!-- Main content -->
