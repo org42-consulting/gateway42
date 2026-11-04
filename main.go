@@ -224,6 +224,10 @@ type DashboardData struct {
 	EngineURLs   map[string]string   // engineID → "host:port"
 	EngineStatus map[string]bool     // engineID → reachable
 	EngineModels map[string][]string // engineID → model names
+	// Usage is nil when the aggregate could not be read. The rest of the page
+	// still renders: a usage query failing should not blank a dashboard whose
+	// only other job is telling the operator whether engines are up.
+	Usage *UsagePanel
 }
 
 // SettingsData holds data for the settings page
@@ -499,6 +503,7 @@ func engineEndpoint(cfg EngineConfig) string {
 func initTemplates() {
 	funcMap := template.FuncMap{
 		"hasPrefix": strings.HasPrefix,
+		"humanNum":  humanNum,
 	}
 
 	tmpls = make(map[string]*template.Template)

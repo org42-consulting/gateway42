@@ -147,6 +147,24 @@ func handleAdminPanel(w http.ResponseWriter, r *http.Request) {
 		enginesModels[fmt.Sprintf("%d", e.ID)] = pd.models
 	}
 
+	// Window comes from a query-string link, so it is validated against
+	// usageWindows rather than parsed — the value reaches a SQL comparison.
+	window := usageWindowFor(r.URL.Query().Get("usage"))
+	since := time.Now().UTC().Add(-24 * time.Hour * time.Duration(usageWindows[window].days)).Format(time.RFC3339)
+	usage, err := getUsageByClient(since)
+
+	var panel *UsagePanel
+	if err != nil {
+		// Leave the panel nil rather than rendering an empty one: a nil panel
+		// says "usage unavailable", where an empty one would claim nobody
+		// spent any tokens. The engine-status table on this page is the
+		// operational signal, and losing it to a failed aggregate would be the
+		// worse trade, so the page still renders.
+		slog.Error("getUsageByClient", "err", err, "window", window)
+	} else {
+		panel = buildUsagePanel(usage, window, len(users))
+	}
+
 	renderPage(w, "dashboard", DashboardData{
 		BaseData:     newBaseData(w, r),
 		Users:        users,
@@ -154,6 +172,7 @@ func handleAdminPanel(w http.ResponseWriter, r *http.Request) {
 		EngineURLs:   enginesURLs,
 		EngineStatus: enginesStatus,
 		EngineModels: enginesModels,
+		Usage:        panel,
 	})
 }
 

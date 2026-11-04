@@ -327,6 +327,10 @@ covers the standard fields plus the tool-calling and structured-output ones: `te
 `top_logprobs`, `service_tier`, and `provider_options`. Parameters outside the list are dropped.
 `stream` is always sent as an explicit boolean — `false` when the client omitted it — so the upstream
 answers in the shape the gateway expects to read.
+`stream_options` is added rather than forwarded: on a stream the gateway sets `include_usage` itself,
+because an engine that was never asked for usage reports none and the request is then logged as free
+rather than unmeasured. A client's own sub-fields are carried through; on a non-stream the field is
+dropped. See [Streaming](#streaming) for what that means on the wire.
 Whether an allowed parameter actually *works* depends on the upstream engine, not on Gateway42. —
 LM Studio and vLLM support different subsets.
 
@@ -354,7 +358,11 @@ What that guarantees:
   exists rather than a key that is missing — some SDKs fault on absence. On the last chunk it is
   `"length"` if the reply was cut off by `max_tokens`, otherwise `"stop"`.
 - **`usage` appears only on the final chunk.** A client that sums usage across chunks gets the right
-  total instead of over-counting.
+  total instead of over-counting. Which final chunk depends on the upstream: an Ollama engine's counts
+  are folded into the terminating chunk above, while an OpenAI-compatible upstream is forwarded
+  verbatim, so its usage arrives in OpenAI's own extra chunk — the one whose `choices` array is empty.
+  The gateway asks compat engines for that figure with `include_usage`, so it arrives even when the
+  client did not request it. Index `choices` defensively rather than assuming every chunk has one.
 - **The stream always ends `data: [DONE]`**, even if the upstream closes without sending its own
   terminator.
 - **Buffering is disabled** (`X-Accel-Buffering: no`, `Cache-Control: no-cache`) and every chunk is
@@ -531,6 +539,30 @@ it directly rather than inferring panics from the `5xx` rate.
 A recovered panic also produces a request-log row, carrying the same status the client saw: `500`
 when nothing had been written, or the already-committed status when it had.
 
+### Where token counts live
+
+Token counts are deliberately **not** Prometheus series. They are per-client and per-model facts
+whose value is historic rather than instantaneous, and exporting them as series would mean a label
+combination per client-model pair accumulating forever — the same cardinality problem the path
+bucketer above exists to avoid.
+
+They live in the request log instead, one pair of integers per completion, and the dashboard's
+[Token Usage panel](#token-usage) aggregates them on demand. Query `request_logs` directly for
+anything the panel does not show:
+
+```sql
+SELECT user_name, model_served, SUM(in_tokens + out_tokens) AS tokens
+FROM request_logs
+WHERE ts >= '2026-10-01T00:00:00Z'
+  AND path IN ('/v1/chat/completions', '/v1/messages')
+GROUP BY user_name, model_served
+ORDER BY tokens DESC;
+```
+
+Streaming completions carry usage too: the gateway asks OpenAI-compatible engines for it with
+`stream_options.include_usage`, so a streamed request is measured rather than logged as free.
+Ollama reports counts on its final line without being asked.
+
 ### Application logs
 
 Structured `slog` output goes to stderr, to `LOG_FILE`, and to an in-memory ring buffer that the admin **System
@@ -543,6 +575,7 @@ exported from that page.
 | Concern | How it is handled |
 | ------- | ----------------- |
 | Admin password | PBKDF2-SHA256, 260,000 iterations, per-password random salt, stored in the Werkzeug `pbkdf2:sha256:…$salt$hash` format. Verified with a constant-time compare. |
+| Admin login attempts | Five failed attempts **since the last successful login** open a lockout that doubles per subsequent breach (1 min up to 15 min), answered `429` with `Retry-After`. Counted rather than time-decayed: the guard's job is to bound the derive function's cost, which needs no clock. It is checked **before** the password is verified, so a brute-force run stops costing 260,000 derive rounds per guess — the CPU is the thing being protected, not just the guess rate. Deliberately global rather than per-client-address, because the address an attempt appears to come from is client-supplied (below); one correct password clears the guard entirely. |
 | API keys | Generated from 20 bytes of `crypto/rand`, URL-safe base64 (~27 chars). Stored as a **SHA-256 hash** — the plaintext key exists only in the response that creates it. Existing plaintext keys are rehashed automatically on startup. |
 | Key display | Shown exactly once, at creation or reset, in the body of that response — never in a flash or cookie. There is no way to recover a key afterwards; issue a new one, which invalidates the old immediately. |
 | New users | Created **DISABLED**. A key cannot be used until an admin activates the account, so a key leaked in transit is not live by default. |
@@ -558,7 +591,9 @@ Two things to be aware of:
 - **`X-Forwarded-For` is trusted for logging only.** When present it is logged in preference to the
   socket address, so a reverse-proxied deployment records the real client. That header is
   client-supplied and therefore spoofable when Gateway42. is exposed directly. It is never used for
-  authentication, authorization, or rate-limit identity — those key off the API key.
+  authentication, authorization, or rate-limit identity — those key off the API key — and the admin
+  login lockout is global for exactly this reason: an IP-keyed budget would be renewable at will by
+  changing the header, and could be aimed at a real admin.
 - **The `/v1` surface carries no CSRF protection and needs none.** It is token-authenticated and
   stateless, so there is no ambient browser credential to abuse. The admin UI is cookie-authenticated
   and is protected. Do not put a `/v1` route behind the session cookie, or the two models collide.
@@ -642,6 +677,34 @@ New users are registered with a unique API key and start in **DISABLED** status.
 | Delete | Permanently removes the user and their log entries. CSV export must be done first. |
 
 <img width="1555" height="906" alt="Image" src="https://github.com/user-attachments/assets/370260c3-4222-4f07-a983-c4e7bdf73713" />
+
+### Token Usage
+
+Between engine health and the client list, the dashboard shows what each client actually spent, broken
+down by model, over a 24-hour, 7-day or 30-day window.
+
+This reads the request log the gateway already writes — there is no second counter, no separate
+pipeline, and nothing new on the request path. The aggregate runs once per dashboard load, on the
+read-only connection pool, and the page does not auto-refresh, so the cost is one indexed grouped
+query when an admin looks.
+
+What the panel is careful to say:
+
+- **`unreported` is not the same as free.** A completion whose engine returned no usage is
+  indistinguishable in storage from one that genuinely cost nothing, so those requests are counted
+  separately rather than folded into a zero. A client showing `27 unreported` means the numbers are
+  missing, not that the traffic was cheap.
+- **A deleted client keeps its history.** Client names are copied onto each log row when it is
+  written, so usage from last week does not disappear when the client is removed — those rows carry a
+  `DELETED` badge instead of silently vanishing.
+- **Counts only include completions.** `/v1/models` and `/v1/messages/count_tokens` are logged too,
+  but they always carry zero tokens, so including them would make a client that merely polls the model
+  list look like a heavy free user.
+- **Token figures are abbreviated to three significant figures** (`1.28M`). The exact numbers are one
+  click away in the request log; the panel's job is proportion.
+
+If the aggregate query fails, the card says so and the rest of the dashboard still renders — engine
+health is the operational signal here, and it should not be lost to a failed report.
 
 ### Engine Management (Settings page)
 
@@ -767,7 +830,7 @@ The race detector works without a C toolchain because the SQLite driver is pure 
 | ---- | ------ |
 | `types_test.go` | The wire contract of authored responses — that `finish_reason` is present-and-null rather than absent, that `usage` fields serialise when zero, that `usage` appears only on the final chunk, and that `finish_reason` reports `"length"` for a truncated Ollama reply. |
 | `stream_test.go` | Stream translation: Ollama NDJSON → OpenAI chunks, SSE passthrough unwrapping, terminal-chunk handling. |
-| `recovery_test.go` | Panic recovery: the JSON envelope on `/v1/`, plain text on the admin UI, an SSE error frame when the response is already committed mid-stream, and that a committed body is never appended to. |
+| `recovery_test.go` | Panic recovery: the JSON envelope on `/v1/`, plain text on the admin UI, an SSE error frame when the response is already committed mid-stream, and that a committed body is never appended to. Also that the `statusRecorder` wrapper stays transparent about the writer's other interfaces — `Flusher`, `Hijacker` and `io.ReaderFrom` are not promoted through an embedded interface, so each is asserted and delegated to, including that a hijacked response gets no panic body appended to its raw protocol bytes. |
 | `metrics_test.go` | That a recovered panic is counted, with the status the client actually saw; that a mid-stream panic counts as `200` and raises `gw42_panics_total`; that the in-flight gauge unwinds; that one `statusRecorder` is shared; and that a panicked request still produces an audit row. |
 | `tmpl_render_check_test.go` | Every template renders against its real data shape, so a typo in an admin page is caught at test time rather than in the browser. Also checks that an engine's API key never reaches the settings page. |
 | `engine_config_test.go` | Ollama URL assembly (no doubled port, default scheme and port), engine-edit merging (a blank key keeps the stored one), and Ollama engine selection for pull/delete. |
@@ -777,7 +840,7 @@ The race detector works without a C toolchain because the SQLite driver is pure 
 | `pull_csrf_test.go` | A model pull — a GET, so outside the CSRF middleware — is refused without the session's token. |
 | `metrics_auth_test.go` | `/metrics` access by admin session and by `GW42_METRICS_TOKEN`, and that an unset token is not an open door. |
 | `engine_save_test.go` | Against a real SQLite file: a failed read of the engine list aborts an add or remove instead of saving a list that drops every other engine. |
-| `compat_request_test.go` | The OpenAI-compatible request body: an explicit `stream` boolean, sanitised messages, and the parameter allow-list. |
+| `compat_request_test.go` | The OpenAI-compatible request body: an explicit `stream` boolean, sanitised messages, the parameter allow-list, and that a stream asks the engine for usage via `stream_options.include_usage` — with the client's own sub-fields carried through and the caller's decoded request left unmutated. |
 | `probe_cache_test.go` | A probe or routing index computed before an invalidation is discarded, so a pull or delete is visible at once. |
 | `stream_audit_test.go` | Streamed completions are audited with the text and tool calls the client received, including streams the client abandoned. |
 | `logout_test.go` | Logout is a POST behind the CSRF check, not a GET any page could trigger. |
@@ -786,6 +849,8 @@ The race detector works without a C toolchain because the SQLite driver is pure 
 | `engine_test_draft_test.go` | Test Connection builds the config the way saving would, so an edit with the API key left blank is tested with the stored key rather than an empty one. |
 | `anthropic_test.go` | The Anthropic front-end: tool loops both ways, a tool-only turn keeping null content, `max_tokens`/bad-arguments handling, content-block sequencing across a stream, an Ollama tool reply arriving as one `tool_use` delta, and error `type` names following the Anthropic vocabulary Claude Code switches on. |
 | `request_detail_test.go` | The per-request detail collector: routing, timing and token facts reaching the log row, a request that never reaches a handler still producing one, `X-Request-ID` matching the stored id, and the migration that gives an existing database the detail columns and rebuilds its contentless FTS table. |
+| `login_guard_test.go` | The admin login throttle: the lockout engaging on the fifth failure since the last success, its length doubling to the ceiling, a successful password clearing both the counter and an active lockout, and — through the real handler — a 429 with `Retry-After` that refuses even the correct password until the lockout passes, which is what keeps the PBKDF2 derive function from running at all. |
+| `usage_test.go` | The token-usage panel, both halves: against a real SQLite file that the window and path filters hold, that an unresolved model falls back to the requested name, that a deleted client's history survives unregistered, and that zero-token requests are tallied as unreported rather than as free; then the grouping into per-client rows with ranked bars, and the dashboard rendering with a panel, without one, and with the aggregate unavailable. |
 
 The template test matters more than it sounds: `html/template` resolves field names at render time,
 so a mistyped `{{.FieldName}}` is invisible until someone loads the page.
@@ -806,18 +871,19 @@ Single `package main`, one file per concern:
 
 | File | Lines | Responsibility |
 | ---- | ----- | -------------- |
-| `main.go` | 1099 | Config, routing table, middleware chain, panic recovery, server lifecycle, graceful shutdown. |
-| `handlers.go` | 1239 | Admin web UI handlers only. |
-| `api_handlers.go` | 724 | The `/v1/*` OpenAI-compatible surface. Separate from the admin UI so a change to one cannot alter the other's contract. |
+| `main.go` | 1141 | Config, routing table, middleware chain, panic recovery, server lifecycle, graceful shutdown. |
+| `handlers.go` | 1289 | Admin web UI handlers only. |
+| `api_handlers.go` | 743 | The `/v1/*` OpenAI-compatible surface. Separate from the admin UI so a change to one cannot alter the other's contract. |
 | `engine.go` | 1189 | The `Engine` interface and its two adapters, plus the probe cache and stream implementations. |
 | `routing.go` | 256 | Model-name → engine resolution and the cached routing index. |
 | `openai.go` | 466 | Request and response translation between OpenAI and Ollama shapes. |
 | `anthropic.go` | 579 | The Anthropic Messages API front-end: both translation directions and the streaming block sequencer. |
 | `types.go` | 168 | Typed structs for responses Gateway42. authors. |
-| `db.go` | 920 | Schema, migrations, both connection pools, queries, FTS5 setup, retention pruning. |
+| `db.go` | 994 | Schema, migrations, both connection pools, queries, FTS5 setup, retention pruning. |
 | `request_detail.go` | 220 | The per-request detail collector handlers fill and the request log reads. |
 | `logwriter.go` | 334 | Asynchronous batched log writers. |
-| `auth.go` | 90 | Password hashing and API-key generation. |
+| `usage.go` | 204 | The dashboard's token-usage panel: window allow-list, per-client grouping, quantized bar widths, count abbreviation. Reads the request log rather than capturing anything new. |
+| `auth.go` | 188 | Password hashing, API-key generation, and the admin login throttle. |
 | `csrf.go` | 116 | CSRF token issue and verification. |
 | `ratelimit.go` | 94 | Per-user token buckets. |
 | `metrics.go` | 207 | Prometheus collectors and the path bucketer. |

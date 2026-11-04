@@ -24,7 +24,7 @@
 <!-- Dashboard -->
 <div class="card help-section">
     <h2>Dashboard</h2>
-    <p>The Dashboard is the main landing page after login. It shows two panels:</p>
+    <p>The Dashboard is the main landing page after login. Its panels cover:</p>
 
     <h3>Engine Status</h3>
     <p>
@@ -32,6 +32,21 @@
         details and the list of available models. This panel is refreshed every time the page loads.
         If an engine is unreachable, its status shows <strong>INACTIVE</strong> and its model list
         is unavailable. Configure engines on the <strong>Settings</strong> page.
+    </p>
+
+    <h3>Token Usage</h3>
+    <p>
+        Token totals for chat requests over the last 24 hours, 7 days, or 30 days, grouped by client
+        and then by the model that served the request. Clients are ranked by total tokens; the bar
+        shows each client's share against the largest one in the window. Counts come from the request
+        log the gateway already writes, so nothing is sampled, and the figures are abbreviated to
+        three significant figures &mdash; exact numbers are on the <strong>Logs</strong> page.
+    </p>
+    <p>
+        A request whose engine returned no usage is counted as <em>unreported</em> and labelled as
+        such, rather than added to the total as a zero: unmeasured is not the same as free.
+        <code>in_tokens</code> is what the engine counted as input and <code>out_tokens</code> what it
+        generated. Deleted clients keep their history and are marked <strong>DELETED</strong>.
     </p>
 
     <h3>Registered Users</h3>
@@ -306,11 +321,20 @@ print(response.choices[0].message.content)</pre>
 
     <h3>Parameters — OpenAI-compatible engine</h3>
     <p>
-        When routing to an OpenAI-compatible engine, all standard OpenAI parameters pass through directly
-        with no translation: <code>temperature</code>, <code>top_p</code>, <code>seed</code>,
+        When routing to an OpenAI-compatible engine, the standard OpenAI parameters pass through
+        without translation: <code>temperature</code>, <code>top_p</code>, <code>seed</code>,
         <code>max_tokens</code>, <code>max_completion_tokens</code>, <code>frequency_penalty</code>,
         <code>presence_penalty</code>, <code>stop</code>, <code>response_format</code>,
         <code>tools</code>, <code>tool_choice</code>, and others.
+    </p>
+    <p>
+        <code>stream_options</code> is the exception, and it is changed in your favour rather than
+        dropped: on a stream, <code>include_usage</code> is forced on so the request can be measured,
+        and your other sub-fields are forwarded unchanged. The practical effect is that a streamed
+        response always ends with a usage chunk, even if you asked not to get one. It carries an empty
+        <code>choices</code> array, so index defensively rather than assuming every chunk has a choice.
+        On a non-streaming request the field is dropped, since it describes a stream that is not
+        happening.
     </p>
 
     <h3>Error Codes</h3>

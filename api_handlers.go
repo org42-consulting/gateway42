@@ -252,13 +252,10 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	engineReq := buildEngineRequest(adapter, data, messages)
 
 	if streaming, _ := data["stream"].(bool); streaming {
-		// OpenAI-compatible servers report usage in a stream only when asked.
-		// Claude Code tracks its context window from message_delta.usage, so
-		// without this every streamed turn would look like zero tokens.
-		// (Ollama always reports usage on its final line.)
-		if adapter.Type() != EngineOllama {
-			engineReq["stream_options"] = map[string]interface{}{"include_usage": true}
-		}
+		// Asking the engine for usage is openAICompatRequest's job now, and it
+		// runs for every non-Ollama adapter — so the Claude Code case (its
+		// context window comes from message_delta.usage, and a stream without
+		// usage would read as zero tokens) is covered from one place.
 		streamMessages(w, r, adapter, engineReq, user.ID, model, messages)
 		return
 	}
@@ -508,6 +505,16 @@ func buildEngineRequest(adapter Engine, data map[string]interface{}, messages []
 // stream is always a bool: the handler reads a missing value as "not
 // streaming", and forwarding the absence as null would leave the upstream to
 // decide — or, on a strict one, reject the request.
+//
+// A stream carries usage only if the engine was asked for it, so this is where
+// the gateway asks. Without include_usage every streamed completion to this
+// engine type logs zero tokens, which the request log and the usage panel both
+// read as a free request rather than an unmeasured one. Ollama needs nothing:
+// it reports counts on its final line. This is the single owner for both
+// front-ends, since buildEngineRequest routes here for every non-Ollama
+// adapter. A caller's own stream_options sub-fields are carried through, with
+// include_usage forced on — usage on a response the gateway is auditing is
+// never unwanted, and an accurate audit is not negotiable.
 func openAICompatRequest(data map[string]interface{}, messages []map[string]interface{}) map[string]interface{} {
 	streaming, _ := data["stream"].(bool)
 	req := map[string]interface{}{
@@ -524,6 +531,18 @@ func openAICompatRequest(data map[string]interface{}, messages []map[string]inte
 			"user", "n":
 			req[key] = data[key]
 		}
+	}
+	if streaming {
+		// Copied rather than written through: the decoded request belongs to
+		// the caller, and sanitizeContent established that these builders do not
+		// mutate it behind the caller's back.
+		client, _ := data["stream_options"].(map[string]interface{})
+		so := make(map[string]interface{}, len(client)+1)
+		for k, v := range client {
+			so[k] = v
+		}
+		so["include_usage"] = true
+		req["stream_options"] = so
 	}
 	return req
 }

@@ -612,6 +612,42 @@ label.login-tagline  { margin-bottom: 26px; }
 .data-table input.rate-input { width: 60px; padding: 3px; }
 .flex-row.row-actions { gap: 6px; }
 
+/* Token usage. The window switcher reuses .pagination .page-btn rather than
+   inventing a second pill style; only its baseline alignment is its own. */
+.flex-row.usage-toolbar { align-items: baseline; gap: 16px; margin-bottom: 16px; }
+.data-table td.usage-num { white-space: nowrap; font-variant-numeric: tabular-nums; color: rgba(255,255,255,.75); }
+.data-table td.usage-num.is-lead { color: #fff; font-weight: 700; }
+.data-table tr.usage-client-row > td { background: rgba(255,255,255,.025); }
+.data-table tr.usage-client-row:hover > td { background: rgba(255,255,255,.05); }
+.data-table .usage-client { font-weight: 700; color: rgba(255,255,255,.92); }
+.data-table .usage-note { display: block; margin-top: 3px; }
+/* Indents a model tag under the client that spent the tokens. Anchored because
+   it styles a cell, and `.data-table td` sets that cell's padding. */
+.data-table .cell-model { padding-left: 26px; }
+.usage-bar {
+    display: block; height: 6px; border-radius: 3px; overflow: hidden;
+    background: rgba(255,255,255,.07); min-width: 120px;
+}
+.usage-bar-fill { display: block; height: 100%; border-radius: 3px; background: var(--ai-electric); }
+/* Quantized bar widths. A data-driven width would have to be a style attribute,
+   which static_css_test forbids, so Go computes the class instead (usageBarClass).
+   Scoped to .usage-bar: a bare .ub-10 would not outrank `.data-table td`. */
+.usage-bar .ub-0   { width: 0; }
+.usage-bar .ub-10  { width: 10%; }
+.usage-bar .ub-20  { width: 20%; }
+.usage-bar .ub-30  { width: 30%; }
+.usage-bar .ub-40  { width: 40%; }
+.usage-bar .ub-50  { width: 50%; }
+.usage-bar .ub-60  { width: 60%; }
+.usage-bar .ub-70  { width: 70%; }
+.usage-bar .ub-80  { width: 80%; }
+.usage-bar .ub-90  { width: 90%; }
+.usage-bar .ub-100 { width: 100%; }
+.data-table tfoot td { border-top: 1px solid rgba(255,255,255,.12); border-bottom: none; font-weight: 700; color: rgba(255,255,255,.85); }
+.data-table tfoot .usage-foot-hint { font-weight: 400; }
+.usage-foot-note { font-size: .75rem; color: rgba(255,255,255,.4); margin: 14px 0 0; }
+.usage-foot-note code { font-size: .6875rem; color: rgba(180,200,255,.8); }
+
 /* ── Settings ── */
 .flex-row.form-actions { padding-top: 4px; }
 .flex-row.tag-list     { gap: 4px; }

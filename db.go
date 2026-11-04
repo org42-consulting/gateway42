@@ -792,6 +792,80 @@ func getRequestLogsPage(search string, limit, offset int) ([]RequestLogRow, erro
 	return out, sqlRows.Err()
 }
 
+// ── Usage queries ─────────────────────────────────────────────────────────────
+
+// usageRow is one (client, model) aggregate over a window. It stays flat and
+// unexported because the dashboard wants clients with their models nested,
+// which reads better as a Go grouping pass than as a second result set.
+type usageRow struct {
+	UserName   string
+	Model      string
+	Requests   int
+	InTokens   int
+	OutTokens  int
+	Streamed   int
+	Unreported int
+	UserID     sql.NullInt64
+	Status     sql.NullString
+}
+
+// getUsageByClient aggregates token usage per client and model for rows at or
+// after an RFC3339 UTC cut-off.
+//
+// since is a string rather than a time.Time on purpose: ts is written as
+// fixed-width RFC3339 in UTC, so a text comparison is chronological and
+// idx_request_logs_ts stays usable — the same property pruneLogs depends on.
+//
+// The path filter is load-bearing. requestLoggingMiddleware logs every /v1/
+// path, and /v1/models and /v1/messages/count_tokens always carry zero tokens,
+// so without it a client that only polls the model list appears to be a heavy
+// free user and the request counts stop meaning "completions".
+//
+// A row whose counts are both zero is tallied into Unreported instead of being
+// counted as free, because "the engine never answered" and "the stream died
+// before its usage line" are indistinguishable from a genuine zero-token
+// completion in the stored data.
+//
+// The join to users is a LEFT JOIN: user_name is denormalised into request_logs
+// at insert, so a client deleted last week still owns rows, and dropping them
+// would make the window's history depend on who is still registered.
+func getUsageByClient(since string) ([]usageRow, error) {
+	rows, err := dbRead.Query(
+		`SELECT a.user_name, a.model, a.requests, a.in_tokens, a.out_tokens,
+			a.streamed, a.unreported, u.id, u.status
+		FROM (
+			SELECT user_name,
+				COALESCE(NULLIF(model_served,''), NULLIF(model_requested,''), '(unknown)') AS model,
+				COUNT(*) AS requests,
+				SUM(in_tokens) AS in_tokens,
+				SUM(out_tokens) AS out_tokens,
+				SUM(streamed) AS streamed,
+				SUM(CASE WHEN in_tokens=0 AND out_tokens=0 THEN 1 ELSE 0 END) AS unreported
+			FROM request_logs
+			WHERE ts >= ? AND path IN ('/v1/chat/completions','/v1/messages')
+			GROUP BY user_name, model
+		) a
+		LEFT JOIN users u ON u.name = a.user_name
+		ORDER BY a.in_tokens + a.out_tokens DESC, a.user_name, a.model`,
+		since,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []usageRow
+	for rows.Next() {
+		var r usageRow
+		if err := rows.Scan(&r.UserName, &r.Model, &r.Requests, &r.InTokens, &r.OutTokens,
+			&r.Streamed, &r.Unreported, &r.UserID, &r.Status); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // ── Admin queries ─────────────────────────────────────────────────────────────
 
 type AdminUser struct {

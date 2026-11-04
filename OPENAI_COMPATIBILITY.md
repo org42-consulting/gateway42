@@ -128,6 +128,12 @@ tool-calling and structured-output fields (`tools`, `tool_choice`, `parallel_too
 on Gateway42. Anything outside that list is dropped. `stream` is always forwarded as a boolean, `false`
 when the client omitted it, never `null`.
 
+`stream_options` is the one field the gateway rewrites rather than forwards. On a stream it is added
+if absent, and `include_usage` is forced on if the client left it out or set it `false` — an engine
+asked for usage is an engine that reports it, and a completion the gateway cannot measure is an audit
+hole rather than a free request. Your own sub-fields ride along untouched. On a non-stream it is
+dropped, because the field describes a stream that is not happening.
+
 For Ollama engines, parameters are instead mapped into Ollama's `options` object:
 
 | OpenAI | Ollama | Note |
@@ -170,6 +176,14 @@ displayed exactly once, at creation. A disabled user's key stops working immedia
 - Responses are Server-Sent Events, each line prefixed `data: `, terminated by `data: [DONE]`
 - The final chunk before `[DONE]` carries `usage`
 - The first chunk's delta includes `"role": "assistant"`
+
+That usage chunk is guaranteed rather than best-effort: on the OpenAI-compatible path the gateway asks
+for it with `include_usage`, so it arrives even if your request set `include_usage: false`. There it
+takes OpenAI's own shape — a separate final chunk whose `choices` array is empty — because compat
+streams are forwarded verbatim. (An Ollama engine's counts are instead folded into the terminating
+chunk that carries `finish_reason`, so there is no extra chunk to notice.) Well-behaved SDKs skip an
+empty `choices`, but strict client code that assumes every chunk carries a choice should index
+defensively.
 
 ## Errors
 

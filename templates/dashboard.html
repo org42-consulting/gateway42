@@ -52,6 +52,94 @@
     </div>
 </div>
 
+<!-- Token Usage -->
+{{with .Usage}}
+<div class="card card-mt">
+    <h2>Token Usage</h2>
+    <div class="flex-row usage-toolbar">
+        <div class="pagination">
+            <a href="/admin/panel?usage=24h" class="page-btn{{if eq .Window "24h"}} is-current{{end}}">24 hours</a>
+            <a href="/admin/panel?usage=7d" class="page-btn{{if eq .Window "7d"}} is-current{{end}}">7 days</a>
+            <a href="/admin/panel?usage=30d" class="page-btn{{if eq .Window "30d"}} is-current{{end}}">30 days</a>
+        </div>
+        <p class="section-desc flush toolbar-right">Last {{.WindowLabel}} of chat traffic, by client and model.</p>
+    </div>
+    <div class="table-wrap">
+        <div class="scroll-x">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Client</th>
+                        <th class="col-90">Requests</th>
+                        <th class="col-110">Input</th>
+                        <th class="col-110">Output</th>
+                        <th class="col-110">Total</th>
+                        <th class="col-180">Share</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {{range $c := .Clients}}
+                    <tr class="usage-client-row">
+                        <td>
+                            <span class="usage-client">{{$c.Name}}</span>
+                            {{if not $c.Registered}}
+                                <span class="badge badge-disabled">DELETED</span>
+                            {{end}}
+                            {{if $c.Unreported}}
+                                <span class="text-hint usage-note">{{$c.Unreported}} unreported</span>
+                            {{end}}
+                        </td>
+                        <td class="usage-num">{{$c.Requests}}</td>
+                        <td class="usage-num">{{humanNum $c.InTokens}}</td>
+                        <td class="usage-num">{{humanNum $c.OutTokens}}</td>
+                        <td class="usage-num is-lead">{{humanNum $c.Total}}</td>
+                        <td>
+                            <span class="usage-bar"><span class="usage-bar-fill {{$c.Bar}}"></span></span>
+                        </td>
+                    </tr>
+                    {{range $m := $c.Models}}
+                    <tr>
+                        <td class="cell-model"><span class="model-tag">{{$m.Model}}</span></td>
+                        <td class="usage-num">{{$m.Requests}}</td>
+                        <td class="usage-num">{{humanNum $m.InTokens}}</td>
+                        <td class="usage-num">{{humanNum $m.OutTokens}}</td>
+                        <td class="usage-num">{{humanNum $m.Total}}</td>
+                        <td>
+                            {{if $m.Unreported}}<span class="text-hint">{{$m.Unreported}} unreported</span>{{end}}
+                        </td>
+                    </tr>
+                    {{end}}
+                    {{else}}
+                    <tr>
+                        <td colspan="6" class="text-hint empty-row">No chat requests in the last {{.WindowLabel}}.</td>
+                    </tr>
+                    {{end}}
+                </tbody>
+                {{$t := .Totals}}
+                {{if $t.Clients}}
+                <tfoot>
+                    <tr>
+                        <td>{{$t.Clients}} of {{.KnownClients}} clients</td>
+                        <td class="usage-num">{{$t.Requests}}</td>
+                        <td class="usage-num">{{humanNum $t.InTokens}}</td>
+                        <td class="usage-num">{{humanNum $t.OutTokens}}</td>
+                        <td class="usage-num is-lead">{{humanNum $t.Total}}</td>
+                        <td>{{if $t.Unreported}}<span class="text-hint usage-foot-hint">{{$t.Unreported}} unreported</span>{{end}}</td>
+                    </tr>
+                </tfoot>
+                {{end}}
+            </table>
+        </div>
+    </div>
+    <p class="usage-foot-note">Counts come from the request log the gateway already writes. <code>unreported</code> means the engine returned no usage for that request, which is not the same as free.</p>
+</div>
+{{else}}
+<div class="card card-mt">
+    <h2>Token Usage</h2>
+    <p class="section-desc flush">Usage could not be read &mdash; see the server log. Engines and clients are unaffected.</p>
+</div>
+{{end}}
+
 <!-- Registered Clients -->
 <div class="card card-mt">
     <h2>Registered Clients</h2>
