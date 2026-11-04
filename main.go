@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -626,6 +627,42 @@ func (r *statusRecorder) Flush() {
 	if f, ok := r.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// Hijack forwards the raw-connection handoff. The embedded field is the
+// http.ResponseWriter *interface*, so the concrete writer's own Hijack is not
+// promoted through it — without this method the wrapper silently fails every
+// http.Hijacker assertion, and the first handler that wanted to upgrade a
+// connection or take over the socket would get its error far from the cause.
+//
+// A successful hijack is recorded as committed. The status is then whatever was
+// already flushed, or nothing at all if the handler wrote its protocol bytes
+// directly, and marking it written is what keeps writePanicResponse from
+// appending an "Internal server error" body to a connection that now carries
+// raw protocol. A failed hijack leaves the response amendable as before.
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("response writer does not implement http.Hijacker")
+	}
+	conn, rw, err := h.Hijack()
+	if err == nil {
+		r.wrote = true
+	}
+	return conn, rw, err
+}
+
+// ReadFrom preserves io.Copy's copy-to-completion fast path — sendfile for the
+// embedded static files — which the same interface-embedding gap would
+// otherwise cost. The fallback is only about not losing the fast path
+// gratuitously; the response is committed by the first byte either way, which
+// is why the flag is set for both branches.
+func (r *statusRecorder) ReadFrom(src io.Reader) (n int64, err error) {
+	defer func() { r.wrote = true }()
+	if rf, ok := r.ResponseWriter.(io.ReaderFrom); ok {
+		return rf.ReadFrom(src)
+	}
+	return io.Copy(r.ResponseWriter, src)
 }
 
 // ensureRecorder returns the statusRecorder already in play, or installs one.

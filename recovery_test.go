@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -167,5 +170,143 @@ func TestRecoveryWrapperPreservesFlusher(t *testing.T) {
 
 	if !sawFlusher {
 		t.Error("handler did not see an http.Flusher; SSE streaming would be refused")
+	}
+}
+
+// The same wrapper must stay transparent about the writer's other capabilities.
+// statusRecorder embeds the http.ResponseWriter interface, so the concrete
+// server writer's Hijack and ReadFrom are not promoted through it: each has to
+// be forwarded by hand or it quietly disappears, and the failure surfaces far
+// from the cause — a refused upgrade, or static files copied through a buffer.
+
+// Compile-time guards: the assertions handlers make are interface assertions,
+// so a missing method compiles fine and fails at runtime, in production.
+var (
+	_ http.Hijacker = (*statusRecorder)(nil)
+	_ io.ReaderFrom = (*statusRecorder)(nil)
+)
+
+// hijackRecorder stands in for the server's real ResponseWriter, which can
+// hijack. httptest.ResponseRecorder cannot, so the test supplies it.
+type hijackRecorder struct {
+	*httptest.ResponseRecorder
+	hijacked bool
+	peers    []net.Conn
+}
+
+func (h *hijackRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h.hijacked = true
+	conn, peer := net.Pipe()
+	h.peers = append(h.peers, peer)
+	return conn, bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn)), nil
+}
+
+func (h *hijackRecorder) closePeers() {
+	for _, c := range h.peers {
+		_ = c.Close()
+	}
+}
+
+// readerFromRecorder reports whether the fast path was taken; httptest's
+// recorder has no ReadFrom, so without one the delegation is unobservable.
+type readerFromRecorder struct {
+	*httptest.ResponseRecorder
+	used bool
+}
+
+func (r *readerFromRecorder) ReadFrom(src io.Reader) (int64, error) {
+	r.used = true
+	return io.Copy(r.ResponseRecorder, src)
+}
+
+func TestStatusRecorderHijackDelegates(t *testing.T) {
+	inner := &hijackRecorder{ResponseRecorder: httptest.NewRecorder()}
+	t.Cleanup(inner.closePeers)
+	rec := newStatusRecorder(inner)
+
+	conn, rw, err := rec.Hijack()
+	if err != nil {
+		t.Fatalf("Hijack: %v", err)
+	}
+	if conn == nil || rw == nil {
+		t.Error("Hijack returned a nil connection or buffer")
+	}
+	if !inner.hijacked {
+		t.Error("the underlying writer was never asked to hijack")
+	}
+	// A hijack commits the response: what follows are protocol bytes, not an
+	// HTTP body, and the panic handler must not append to them.
+	if !rec.wrote {
+		t.Error("a successful hijack did not mark the response committed")
+	}
+}
+
+func TestStatusRecorderHijackErrorLeavesResponseAmendable(t *testing.T) {
+	// httptest's recorder cannot hijack, which is the case a handler would see
+	// as a clean error rather than a panic.
+	rec := newStatusRecorder(httptest.NewRecorder())
+	if _, _, err := rec.Hijack(); err == nil {
+		t.Error("want an error when the underlying writer cannot hijack")
+	}
+	if rec.wrote {
+		t.Error("a failed hijack marked the response committed, so recovery would " +
+			"refuse to write a status for a response that has no body yet")
+	}
+}
+
+func TestPanicAfterHijackWritesNoBody(t *testing.T) {
+	inner := &hijackRecorder{ResponseRecorder: httptest.NewRecorder()}
+	t.Cleanup(inner.closePeers)
+	rec := newStatusRecorder(inner)
+
+	if _, _, err := rec.Hijack(); err != nil {
+		t.Fatalf("Hijack: %v", err)
+	}
+	writePanicResponse(rec, httptest.NewRequest(http.MethodGet, "/admin/panel", nil))
+
+	if got := inner.Body.String(); got != "" {
+		t.Errorf("panic recovery wrote %q onto a hijacked connection, which now "+
+			"carries raw protocol bytes rather than an HTTP body", got)
+	}
+}
+
+func TestStatusRecorderReadFromUsesFastPath(t *testing.T) {
+	inner := &readerFromRecorder{ResponseRecorder: httptest.NewRecorder()}
+	rec := newStatusRecorder(inner)
+
+	n, err := rec.ReadFrom(strings.NewReader("payload"))
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	if n != int64(len("payload")) {
+		t.Errorf("copied %d bytes, want %d", n, len("payload"))
+	}
+	if !inner.used {
+		t.Error("io.Copy's fast path was not used; static files would be copied " +
+			"through a buffer instead of handed to the kernel")
+	}
+	if inner.Body.String() != "payload" {
+		t.Errorf("body = %q, want the payload", inner.Body.String())
+	}
+	if !rec.wrote {
+		t.Error("ReadFrom did not mark the response committed")
+	}
+}
+
+func TestStatusRecorderReadFromFallsBack(t *testing.T) {
+	// httptest's recorder has no ReadFrom, so this exercises the fallback and
+	// the commit flag on that path.
+	inner := httptest.NewRecorder()
+	rec := newStatusRecorder(inner)
+
+	n, err := rec.ReadFrom(strings.NewReader("payload"))
+	if err != nil || n != int64(len("payload")) {
+		t.Fatalf("ReadFrom = %d, %v", n, err)
+	}
+	if inner.Body.String() != "payload" {
+		t.Errorf("body = %q, want the payload", inner.Body.String())
+	}
+	if !rec.wrote {
+		t.Error("ReadFrom did not mark the response committed")
 	}
 }

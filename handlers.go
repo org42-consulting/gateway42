@@ -54,12 +54,43 @@ func handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	password := r.FormValue("password")
 
+	// Before the derive function, not after it: 260,000 PBKDF2 rounds is
+	// exactly the work this guard exists to skip (see loginGuard in auth.go).
+	if ok, retryAfter := adminLogin.allow(time.Now()); !ok {
+		// Round up once so the header and the message cannot disagree.
+		secs := int((retryAfter + time.Second - 1) / time.Second)
+		w.Header().Set("Retry-After", strconv.Itoa(secs))
+		slog.Warn("admin login throttled", "ip", clientIP(r), "retry_after_s", secs)
+		// A plain 429 rather than this handler's usual flash-and-redirect: the
+		// browser does not follow a redirect on a 429, so a flash would sit in
+		// the session until some later page render and surface as stale advice
+		// on an unrelated request — possibly the successful login that follows.
+		http.Error(w, fmt.Sprintf("Too many failed attempts. Try again in %s.",
+			time.Duration(secs)*time.Second), http.StatusTooManyRequests)
+		return
+	}
+
 	admin, err := getAdmin()
-	if err != nil || admin == nil || !verifyPassword(admin.PasswordHash, password) {
+	if err != nil {
+		// The gateway's own fault, not a wrong password. Counting it would let a
+		// database hiccup spend the attempt budget and answer a server-side
+		// problem with a 429.
+		slog.Error("getAdmin", "err", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	if admin == nil || !verifyPassword(admin.PasswordHash, password) {
+		if lockout := adminLogin.failed(time.Now()); lockout > 0 {
+			slog.Warn("admin login locked out", "ip", clientIP(r), "lockout", lockout)
+		}
 		addFlash(w, r, "error", "Invalid password")
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
+	// The password was right, so any backlog of near-misses is cleared before
+	// the session work below — which can itself fail, and a failed cookie save
+	// is not a reason to hold the next attempt against the caller.
+	adminLogin.succeeded()
 
 	sess := getSession(r)
 	sess.Values["admin"] = true
