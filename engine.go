@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"gateway42/internal/wire"
 	"io"
 	"net"
 	"net/http"
@@ -307,7 +308,7 @@ type ChatStream interface {
 // streams a call as a name on its first fragment and argument fragments
 // after; Ollama sends both at once. Writing the name when it appears and
 // every fragment as it arrives reassembles both shapes.
-func deltaAuditText(d Delta) string {
+func deltaAuditText(d wire.Delta) string {
 	if len(d.ToolCalls) == 0 {
 		return d.Content
 	}
@@ -339,7 +340,7 @@ type auditChunk struct {
 			} `json:"tool_calls"`
 		} `json:"delta"`
 	} `json:"choices"`
-	Usage *Usage `json:"usage"`
+	Usage *wire.Usage `json:"usage"`
 }
 
 // metaFromChunk extracts the request-log metadata from an upstream chunk that
@@ -410,7 +411,7 @@ func (s *ollamaStream) Recv() ([]byte, chunkMeta, error) {
 			s.toolCalls++
 		}
 		if choice.FinishReason != nil && s.toolCalls > 0 {
-			choice.FinishReason = &finishToolCalls
+			choice.FinishReason = &wire.FinishToolCalls
 		}
 		// The metadata comes out of the typed chunk that is already in
 		// hand — no second parse, and the tool-call renumbering above is

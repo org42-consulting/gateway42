@@ -17,6 +17,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"gateway42/internal/wire"
 	"strings"
 )
 
@@ -349,12 +350,12 @@ func toolInput(args string) json.RawMessage {
 
 // openAIToAnthropic converts a non-streaming chat completion — either the
 // typed body ollamaToOpenAI produced or a relayed OpenAI-compatible map — to
-// an Anthropic message. Round-tripping through ChatCompletion gives both
+// an Anthropic message. Round-tripping through wire.ChatCompletion gives both
 // sources one typed shape to read.
 func openAIToAnthropic(payload interface{}, model string) (*AnthropicMessage, error) {
-	var cc ChatCompletion
+	var cc wire.ChatCompletion
 	switch p := payload.(type) {
-	case *ChatCompletion:
+	case *wire.ChatCompletion:
 		cc = *p
 	default:
 		b, err := json.Marshal(p)
@@ -471,7 +472,7 @@ type streamChunk struct {
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
-	Usage *Usage `json:"usage"`
+	Usage *wire.Usage `json:"usage"`
 }
 
 // chunk translates one OpenAI chunk payload into zero or more events. A

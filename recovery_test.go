@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"gateway42/internal/wire"
 	"io"
 	"net"
 	"net/http"
@@ -42,7 +43,7 @@ func TestPanicOnAPIPathReturnsJSONEnvelope(t *testing.T) {
 
 	// The envelope must be the same shape as every other /v1 error, or a client
 	// that reads err.error.message on a 429 crashes on a 500.
-	var got ErrorResponse
+	var got wire.ErrorResponse
 	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
 		t.Fatalf("body is not the OpenAI error envelope: %v (body=%q)", err, rr.Body.String())
 	}
@@ -114,7 +115,7 @@ func TestPanicMidStreamEmitsSSEFrameNotJSONBody(t *testing.T) {
 		if !ok || payload == "[DONE]" {
 			continue
 		}
-		var env ErrorResponse
+		var env wire.ErrorResponse
 		if json.Unmarshal([]byte(payload), &env) == nil && env.Error.Type != "" {
 			sawError = true
 		}

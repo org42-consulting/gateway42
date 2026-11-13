@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"gateway42/internal/wire"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -101,8 +102,8 @@ func TestOpenAIToAnthropicNonStreaming(t *testing.T) {
 }
 
 func TestOpenAIToAnthropicLengthAndBadArguments(t *testing.T) {
-	msg, err := openAIToAnthropic(&ChatCompletion{Choices: []Choice{{
-		Message: Message{ToolCalls: []ToolCall{{Function: FunctionCall{Name: "f", Arguments: "{broken"}}}},
+	msg, err := openAIToAnthropic(&wire.ChatCompletion{Choices: []wire.Choice{{
+		Message: wire.Message{ToolCalls: []wire.ToolCall{{Function: wire.FunctionCall{Name: "f", Arguments: "{broken"}}}},
 	}, {}}}, "m")
 	if err != nil {
 		t.Fatal(err)
@@ -111,8 +112,8 @@ func TestOpenAIToAnthropicLengthAndBadArguments(t *testing.T) {
 		t.Errorf("bad arguments should become {} with a generated id: %+v", msg.Content[0])
 	}
 
-	msg, _ = openAIToAnthropic(&ChatCompletion{Choices: []Choice{{
-		Message: Message{Content: "cut"}, FinishReason: &finishLength,
+	msg, _ = openAIToAnthropic(&wire.ChatCompletion{Choices: []wire.Choice{{
+		Message: wire.Message{Content: "cut"}, FinishReason: &wire.FinishLength,
 	}}}, "m")
 	if *msg.StopReason != "max_tokens" {
 		t.Errorf("stop_reason = %s, want max_tokens", *msg.StopReason)

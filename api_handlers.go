@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"gateway42/internal/wire"
 	"io"
 	"log/slog"
 	"net/http"
@@ -79,7 +80,7 @@ func handleListModels(w http.ResponseWriter, r *http.Request) {
 		go warmProbeCache(context.Background())
 	}
 
-	modelList := make([]Model, 0, 16)
+	modelList := make([]wire.Model, 0, 16)
 	seen := make(map[string]bool)
 	reachable := 0
 
@@ -106,7 +107,7 @@ func handleListModels(w http.ResponseWriter, r *http.Request) {
 				ts, _ := m["modified_at"].(string)
 				created = float64(parseOllamaTS(ts))
 			}
-			modelList = append(modelList, Model{
+			modelList = append(modelList, wire.Model{
 				ID:      name,
 				Object:  "model",
 				Created: int64(created),
@@ -127,7 +128,7 @@ func handleListModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	list := ModelList{Object: "list", Data: modelList}
+	list := wire.ModelList{Object: "list", Data: modelList}
 	if len(modelList) > 0 {
 		list.FirstID = &modelList[0].ID
 		list.LastID = &modelList[len(modelList)-1].ID

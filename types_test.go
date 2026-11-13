@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"gateway42/internal/wire"
 	"strings"
 	"testing"
 )
@@ -101,10 +102,10 @@ func TestModelOmitsSizeWhenUnknown(t *testing.T) {
 	// size is a Gateway42 extension. OpenAI-compatible engines do not report
 	// it, and emitting size:0 would have clients render "0 B" as if it were a
 	// measurement.
-	if keys(t, Model{ID: "m", Object: "model", OwnedBy: "openai_compat"})["size"] {
+	if keys(t, wire.Model{ID: "m", Object: "model", OwnedBy: "openai_compat"})["size"] {
 		t.Error("size should be omitted when zero")
 	}
-	if !keys(t, Model{ID: "m", Object: "model", OwnedBy: "ollama", Size: 42})["size"] {
+	if !keys(t, wire.Model{ID: "m", Object: "model", OwnedBy: "ollama", Size: 42})["size"] {
 		t.Error("size should be emitted when known")
 	}
 }

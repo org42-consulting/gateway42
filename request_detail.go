@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"gateway42/internal/wire"
 	"net/http"
 	"time"
 	"unicode/utf8"
@@ -153,7 +154,7 @@ func (d *requestDetail) setOutcome(o string) {
 func newRequestID() string { return "req_" + randomHex(8) }
 
 // recordCompletionDetail fills the collector from a non-streaming completion.
-// The payload is either a *ChatCompletion (Ollama, after ollamaToOpenAI) or
+// The payload is either a *wire.ChatCompletion (Ollama, after ollamaToOpenAI) or
 // the engine's raw JSON map (OpenAI-compat, relayed unmodified), so both
 // shapes are read here rather than forcing a marshal round-trip.
 func recordCompletionDetail(r *http.Request, payload interface{}) {
@@ -162,7 +163,7 @@ func recordCompletionDetail(r *http.Request, payload interface{}) {
 		return
 	}
 	switch p := payload.(type) {
-	case *ChatCompletion:
+	case *wire.ChatCompletion:
 		if p.Model != "" {
 			d.modelServed = p.Model
 		}

@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"gateway42/internal/wire"
 	"strconv"
 	"strings"
 	"time"
@@ -231,12 +232,12 @@ func decodeArguments(args interface{}) interface{} {
 // Ollama does not assign call IDs (some builds do; those are kept), but an
 // OpenAI client must echo one back as tool_call_id on the result, so one is
 // minted per call.
-func openAIToolCalls(msg map[string]interface{}) []ToolCall {
+func openAIToolCalls(msg map[string]interface{}) []wire.ToolCall {
 	raw, _ := msg["tool_calls"].([]interface{})
 	if len(raw) == 0 {
 		return nil
 	}
-	calls := make([]ToolCall, 0, len(raw))
+	calls := make([]wire.ToolCall, 0, len(raw))
 	for _, c := range raw {
 		call, _ := c.(map[string]interface{})
 		fn, _ := call["function"].(map[string]interface{})
@@ -256,10 +257,10 @@ func openAIToolCalls(msg map[string]interface{}) []ToolCall {
 		if id == "" {
 			id = newToolCallID()
 		}
-		calls = append(calls, ToolCall{
+		calls = append(calls, wire.ToolCall{
 			ID:       id,
 			Type:     "function",
-			Function: FunctionCall{Name: name, Arguments: args},
+			Function: wire.FunctionCall{Name: name, Arguments: args},
 		})
 	}
 	return calls
@@ -299,10 +300,10 @@ func newToolCallID() string {
 // "stop" is what Gateway42 answered unconditionally before, so the fallback
 // is never worse than the old behaviour.
 func ollamaFinishReason(chunk map[string]interface{}) *string {
-	if reason, _ := chunk["done_reason"].(string); reason == finishLength {
-		return &finishLength
+	if reason, _ := chunk["done_reason"].(string); reason == wire.FinishLength {
+		return &wire.FinishLength
 	}
-	return &finishStop
+	return &wire.FinishStop
 }
 
 // ─────────────────────────────── Non-streaming response ───────────────────────
@@ -310,7 +311,7 @@ func ollamaFinishReason(chunk map[string]interface{}) *string {
 // ollamaToOpenAI translates a complete Ollama /api/chat response to OpenAI format.
 // The input stays a map because it is upstream-shaped; the output is typed
 // because this is where Gateway42 authors the client-facing body.
-func ollamaToOpenAI(ollama map[string]interface{}) *ChatCompletion {
+func ollamaToOpenAI(ollama map[string]interface{}) *wire.ChatCompletion {
 	msg, _ := ollama["message"].(map[string]interface{})
 	role, _ := msg["role"].(string)
 	if role == "" {
@@ -327,20 +328,20 @@ func ollamaToOpenAI(ollama map[string]interface{}) *ChatCompletion {
 	toolCalls := openAIToolCalls(msg)
 	finishReason := ollamaFinishReason(ollama)
 	if len(toolCalls) > 0 {
-		finishReason = &finishToolCalls
+		finishReason = &wire.FinishToolCalls
 	}
 
-	return &ChatCompletion{
+	return &wire.ChatCompletion{
 		ID:      newCompletionID(),
 		Object:  "chat.completion",
 		Created: time.Now().Unix(),
 		Model:   modelName,
-		Choices: []Choice{{
+		Choices: []wire.Choice{{
 			Index:        0,
-			Message:      Message{Role: role, Content: content, ToolCalls: toolCalls},
+			Message:      wire.Message{Role: role, Content: content, ToolCalls: toolCalls},
 			FinishReason: finishReason,
 		}},
-		Usage: Usage{
+		Usage: wire.Usage{
 			PromptTokens:     promptTokens,
 			CompletionTokens: completionTokens,
 			TotalTokens:      promptTokens + completionTokens,
@@ -356,20 +357,20 @@ func ollamaToOpenAI(ollama map[string]interface{}) *ChatCompletion {
 // clients accumulate from there, so repeating it would have some of them
 // restart the message. The Delta struct's omitempty tags are what make the
 // three shapes — opening, middle, terminating — fall out of one type.
-func formatStreamChunk(chunk map[string]interface{}, completionID string, isFirst bool) *ChatCompletionChunk {
+func formatStreamChunk(chunk map[string]interface{}, completionID string, isFirst bool) *wire.ChatCompletionChunk {
 	done, _ := chunk["done"].(bool)
 	msg, _ := chunk["message"].(map[string]interface{})
 	content, _ := msg["content"].(string)
 
-	var delta Delta
+	var delta wire.Delta
 	switch {
 	case isFirst:
-		delta = Delta{Role: "assistant", Content: content}
+		delta = wire.Delta{Role: "assistant", Content: content}
 	case done:
 		// Terminating chunk: finish_reason carries the signal, not the delta.
-		delta = Delta{}
+		delta = wire.Delta{}
 	default:
-		delta = Delta{Content: content}
+		delta = wire.Delta{Content: content}
 	}
 
 	// Ollama emits each tool call whole, in one line, so each becomes one
@@ -377,7 +378,7 @@ func formatStreamChunk(chunk map[string]interface{}, completionID string, isFirs
 	// stream's calls are numbered across chunks, which only the stream itself
 	// can do — ollamaStream renumbers them.
 	for i, tc := range openAIToolCalls(msg) {
-		delta.ToolCalls = append(delta.ToolCalls, StreamToolCall{Index: i, ToolCall: tc})
+		delta.ToolCalls = append(delta.ToolCalls, wire.StreamToolCall{Index: i, ToolCall: tc})
 	}
 
 	// Only the terminal chunk carries a reason; mid-stream it stays null.
@@ -388,12 +389,12 @@ func formatStreamChunk(chunk map[string]interface{}, completionID string, isFirs
 
 	modelName, _ := chunk["model"].(string)
 
-	out := &ChatCompletionChunk{
+	out := &wire.ChatCompletionChunk{
 		ID:      completionID,
 		Object:  "chat.completion.chunk",
 		Created: time.Now().Unix(),
 		Model:   modelName,
-		Choices: []ChunkChoice{{
+		Choices: []wire.ChunkChoice{{
 			Index:        0,
 			Delta:        delta,
 			FinishReason: finishReason,
@@ -405,7 +406,7 @@ func formatStreamChunk(chunk map[string]interface{}, completionID string, isFirs
 	if done {
 		promptTokens := toInt(chunk["prompt_eval_count"])
 		completionTokens := toInt(chunk["eval_count"])
-		out.Usage = &Usage{
+		out.Usage = &wire.Usage{
 			PromptTokens:     promptTokens,
 			CompletionTokens: completionTokens,
 			TotalTokens:      promptTokens + completionTokens,
@@ -435,8 +436,8 @@ func parseOllamaTS(ts string) int64 {
 // ─────────────────────────────── Error helpers ────────────────────────────────
 
 // openaiError creates an OpenAI-compatible error response
-func openaiError(message, errorType string) *ErrorResponse {
-	return &ErrorResponse{Error: APIError{Message: message, Type: errorType}}
+func openaiError(message, errorType string) *wire.ErrorResponse {
+	return &wire.ErrorResponse{Error: wire.APIError{Message: message, Type: errorType}}
 }
 
 // ─────────────────────────────── Helpers ──────────────────────────────────────

@@ -1,4 +1,9 @@
-package main
+// Package wire holds the OpenAI wire structures Gateway42 authors.
+//
+// It is a leaf package: it imports nothing from the rest of the gateway, so
+// the adapters, translators and handlers can all depend on the same
+// contract without depending on each other.
+package wire
 
 // Typed OpenAI wire structs.
 //
@@ -107,13 +112,13 @@ type ChatCompletionChunk struct {
 	Usage   *Usage        `json:"usage,omitempty"`
 }
 
-// finishStop and finishLength are the address-of-able values FinishReason
-// points at. Sharing them is safe because nothing ever writes through these
-// pointers.
+// FinishStop, FinishLength and FinishToolCalls are the address-of-able values
+// FinishReason points at. Sharing them is safe because nothing ever writes
+// through these pointers.
 var (
-	finishStop      = "stop"
-	finishLength    = "length"
-	finishToolCalls = "tool_calls"
+	FinishStop      = "stop"
+	FinishLength    = "length"
+	FinishToolCalls = "tool_calls"
 )
 
 // ── Models ────────────────────────────────────────────────────────────────────
