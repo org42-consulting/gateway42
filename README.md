@@ -13,7 +13,7 @@ Gateway42. sits between your users and your AI inference backends, exposing an *
 - [Quick start](#quick-start-not-for-production) · [Install as a service](#installing-gateway42-as-a-service-launchd)
 - [Multi-engine support](#multi-engine-support) · [Engine selection](#engine-selection)
 - [API reference](#api-reference) · [Claude Code / Anthropic API](#claude-code--anthropic-messages-api) · [Parameters](#parameters) · [Streaming](#streaming) · [Error codes](#error-codes)
-- [Rate limiting](#rate-limiting) · [Concurrency and load shedding](#concurrency-and-load-shedding)
+- [Rate limiting](#rate-limiting) · [Token quotas](#token-quotas) · [Concurrency and load shedding](#concurrency-and-load-shedding)
 - [Observability](#observability) · [Security model](#security-model) · [Storage and data handling](#storage-and-data-handling)
 - [Admin dashboard](#admin-dashboard) · [Audit logs](#audit-logs)
 - [Configuration](#configuration) · [Timeouts and limits](#timeouts-and-limits)
@@ -54,11 +54,13 @@ Every request passes through the same middleware chain, outermost first. The ord
 | 2 | `recoveryMiddleware` | Converts a panic in any handler below it into a response instead of a dropped connection, picking the response format from the path and from whether the response was already committed. |
 | 3 | `corsMiddleware` | Applies CORS headers so browser-based OpenAI clients work. |
 | 4 | `apiAuthMiddleware` | Resolves the Bearer token to a user once, for `/v1/*`, and puts it in the request context. |
-| 5 | `csrfMiddleware` | Rejects state-changing admin requests without a valid token — before any handler mutates state. |
-| 6 | `requestLoggingMiddleware` | Writes the HTTP request log. Runs innermost so it can read the user resolved in step 4. |
+| 5 | `rateLimitMiddleware` | Draws one token from the caller's per-minute bucket for every `/v1/*` request, rejecting an empty bucket before any handler runs. It reads the user step 4 put in the context — there is no bucket to draw from until a user is resolved — and answers in the path's own error envelope. No `Retry-After`: the bucket refills gradually across the minute, so any fixed "wait until" would be a guess. |
+| 6 | `csrfMiddleware` | Rejects state-changing admin requests without a valid token — before any handler mutates state. |
+| 7 | `requestLoggingMiddleware` | Writes the HTTP request log. Runs innermost so it can read the user resolved in step 4. |
 
-Auth before CSRF, and both before logging, is what lets the request log name the user who made the
-call and record the status a rejection actually produced.
+Auth before rate limiting, and both before CSRF and before logging: the limiter needs the user
+step 4 resolved to know whose bucket to draw from, and the request log needs that same context to
+name the user who made the call and record the status a rejection actually produced.
 
 The first two are the pair that is easy to get backwards. Middleware defers unwind inside-out, so
 the layer that *writes* the panic response has to sit inside the layer that *measures* it. With
@@ -90,6 +92,7 @@ which stacked three recorders per request and left only the innermost seeing the
 | API key auth            | No      | Yes       |
 | Per-user isolation      | No      | Yes       |
 | Rate limiting           | No      | Yes       |
+| Token quotas            | No      | Yes       |
 | Upstream load shedding  | No      | Yes       |
 | AI interaction logging  | No      | Yes       |
 | HTTP request logging    | No      | Yes       |
@@ -128,7 +131,8 @@ go build -o gateway42 .
 open http://localhost:7000
 ```
 
-> Default admin password is `admin123`. Change it after first login via the admin UI.
+> Default admin password is `admin123`. Change it after first login via the admin UI — logging in
+> with the default locks the rest of the dashboard to the change-password form until you do.
 
 After logging in, go to **Settings** to add your first engine (Ollama or OpenAI-compatible) before making API calls.
 
@@ -191,9 +195,9 @@ The base URL works with or without its `/v1` — `http://127.0.0.1:8000/v1` (how
 
 ### Engine selection
 
-When a request arrives at `/v1/chat/completions`, Gateway42. routes it to an engine that actually holds the requested model. The routing table is built from the same health probes that feed the dashboard, so adding a model to an engine makes it routable without configuring anything — and without a restart. When two engines report the same model, the one added first wins.
+When a request arrives at `/v1/chat/completions`, Gateway42. routes it to an engine that actually holds the requested model. The routing table is built from the same health probes that feed the dashboard, so adding a model to an engine makes it routable without configuring anything — and without a restart. When several engines report the same model, the table stores them in insertion order — the engine added first is the primary, the rest are its failover targets — and the handler walks the list, taking a concurrency slot from the first engine that has one. If the primary is down or at its concurrency cap, the request falls through to the next engine holding the model instead of failing.
 
-A request for a model that no reachable engine reports gets `404` rather than being forwarded somewhere it will fail. A request with no `model` at all falls back to the first configured Ollama engine, or the first engine of any type if none is Ollama.
+A request for a model that no reachable engine reports gets `404` rather than being forwarded somewhere it will fail, and a request gets `503` only when every engine holding the model is at its concurrency cap. The Anthropic routes (`/v1/messages`) still use the single-engine path: one engine serves, with no per-request failover, and a request to them without a `model` is rejected with `400` rather than guessed at.
 
 You can add, edit, and remove engines from the Settings page — no restart required.
 
@@ -228,6 +232,7 @@ Requests with a missing, invalid, or deactivated key are rejected with `401 Unau
 | `/v1/messages` | POST | Anthropic Messages API, translated onto the same engines — see [Claude Code](#claude-code--anthropic-messages-api). |
 | `/v1/messages/count_tokens` | POST | Estimated input token count (≈ 4 bytes per token) in Anthropic format. |
 | `/v1/models` | GET | Returns the combined catalogue of every reachable engine. Each entry carries both OpenAI (`object`, `owned_by`) and Anthropic (`type`, `display_name`, `created_at`) fields. Duplicates are collapsed; an engine that is down is skipped rather than failing the listing. |
+| `/v1/whoami` | GET | Reports the identity the caller authenticated as: `name`, `status`, `rate_limit_rpm`, and `key_created_at`. A no-side-effect way for a key holder to verify credentials without reaching the admin UI. It is a `/v1/` route, so it goes through the same rate limiting as the other `/v1` endpoints. |
 | `/health` | GET | Returns `{"status": "ok"}`. No auth required. Use for uptime monitoring. |
 | `/metrics` | GET | Prometheus exposition. Requires an admin session cookie, or `Authorization: Bearer <GW42_METRICS_TOKEN>` when that variable is set — see [Observability](#prometheus-metrics). |
 
@@ -267,8 +272,9 @@ print(response.choices[0].message.content)
 
 `POST /v1/messages` accepts Anthropic-format requests — system prompt, content blocks, images,
 `tools`/`tool_choice`, `tool_use`/`tool_result` turns, streaming — and translates them onto the
-OpenAI-shaped pipeline every engine already speaks. Routing, rate limits, concurrency slots,
-metrics and the audit log are shared with `/v1/chat/completions`. Errors on these paths use
+OpenAI-shaped pipeline every engine already speaks. Rate limits, token quotas, concurrency slots,
+metrics and the audit log are shared with `/v1/chat/completions`; routing stays on the
+single-engine path (see [Engine selection](#engine-selection)). Errors on these paths use
 Anthropic's envelope (`{"type":"error","error":{…}}`), with `not_found_error` for an unknown
 model and `overloaded_error` when the engine is busy.
 
@@ -404,10 +410,10 @@ Errors use the OpenAI error envelope, so SDK error handling works unchanged:
 | ------ | ------ | ------- |
 | `400` | `invalid_request_error` | Body is not valid JSON, or `messages` is missing |
 | `401` | `authentication_error` | Missing, invalid, or deactivated API key |
-| `404` | `invalid_request_error` | The requested model is not available on any configured engine |
+| `404` | `invalid_request_error` | The requested model is not available on any reachable engine — including, on `/v1/chat/completions`, when no engine is reachable at all |
 | `413` | `invalid_request_error` | Request body too large (over 8 × `MAX_MESSAGE_LENGTH`) |
-| `429` | `rate_limit_error` | Rate limit exceeded — wait before retrying |
-| `502` | `api_error` | No engines configured, or Gateway42. could not reach the engine |
+| `429` | `rate_limit_error` | Per-minute rate limit exceeded, or daily token quota exhausted — wait before retrying |
+| `502` | `api_error` | Gateway42. could not reach the engine; also "no engines configured" on `/v1/models` and `/v1/messages` |
 | `503` | `api_error` | Engine is at its concurrency cap — retry after the `Retry-After` interval |
 | `500` | `api_error` | Internal server error, including a recovered panic. |
 
@@ -423,9 +429,11 @@ reported depends on how far the response had already got:
 
 Two of these are worth distinguishing. A `404` is a **routing verdict** authored by Gateway42., not
 a response relayed from an engine: it means the model appears on none of the engines the gateway
-could reach. A `502` means the gateway tried and the engine did not answer. If every engine is
-unreachable, you get `502` rather than `404` — a total outage is not evidence that a model does not
-exist.
+could reach. On `/v1/chat/completions` the verdict is about reachable engines, so with every engine
+down — or none configured — the answer is a `404`: no reachable engine holds the model. A `502`
+means the gateway picked an engine and it did not answer. The Anthropic routes, which still use the
+single-engine path, keep the older rule: with every engine unreachable they fall back to the
+default engine, so a total outage surfaces as `502` there rather than `404`.
 
 Full error semantics, including how failures mid-stream are reported, are in
 [OPENAI_COMPATIBILITY.md](OPENAI_COMPATIBILITY.md#errors).
@@ -444,6 +452,10 @@ token; a request arriving at an empty bucket is rejected.
 In practice: an idle user can burst up to *N* requests back to back, then sustains *N* per minute.
 There is no window boundary to wait out — capacity returns gradually.
 
+The limit is enforced in middleware rather than inside the completion handlers, so it covers every
+`/v1/*` route — `/v1/models` and the Anthropic routes included, not just chat completions. A client
+over its limit is turned away before it reaches a handler, whatever it is calling.
+
 - Default: **10 requests per minute** per user
 - Configurable per-user from the Admin Dashboard
 - Returns `429 Too Many Requests` when exceeded
@@ -453,6 +465,26 @@ There is no window boundary to wait out — capacity returns gradually.
 - Because buckets are per-process, running several instances behind a load balancer multiplies the
   effective limit by the instance count
 - Default for new users is set by the `DEFAULT_RATE_LIMIT` environment variable
+
+
+## Token quotas
+
+Rate limiting bounds speed; a quota bounds total consumption. A user with a daily token budget can
+burst at their rate limit all day, but stops when the budget is spent, regardless of how slowly
+they use it — which is what protects the operator from a user, or a buggy agent loop, burning
+through all inference capacity over a long period. The two complement each other: the rate limit
+protects the hardware from bursts, the quota protects the operator from sustained burn.
+
+- Per-user, per-day: the budget resets at UTC midnight
+- Input + output tokens combined, summed over the two completion paths — `/v1/chat/completions`
+  and `/v1/messages` — so a client that only calls the Anthropic routes is gated too
+- `0` means unlimited, the default for every user; quotas are opt-in
+- Enforced on both completion paths before the body is read, so an over-quota client costs no
+  parsing — the rejection is a `429` with `rate_limit_error`, "Daily token quota exceeded"
+- **Fail-open on database errors**: a quota check that blocked all traffic on a DB hiccup would be
+  worse than a slightly over-budget user
+- The check reads the same `request_logs` table the [Token Usage panel](#token-usage) aggregates —
+  one indexed `SUM` on the read pool, no separate counter, and no new write on the request path
 
 
 ## Concurrency and load shedding
@@ -474,7 +506,9 @@ Retry-After: 2
 
 This sheds load rather than queueing it. A queue would turn a capacity problem into a latency
 problem, and clients would see timeouts with no explanation instead of an explicit signal they can
-back off on.
+back off on. On `/v1/chat/completions` a request that finds its primary at the cap does not give up
+there: it walks the failover list (see [Engine selection](#engine-selection)), waiting up to
+250 ms at each engine holding the model, and answers `503` only when every one of them is busy.
 
 The slot is held for the whole upstream call — including the full duration of a stream — and
 released when the response completes, when the client disconnects, or when the stream's bound fires:
@@ -584,8 +618,10 @@ exported from that page.
 | ------- | ----------------- |
 | Admin password | PBKDF2-SHA256, 260,000 iterations, per-password random salt, stored in the Werkzeug `pbkdf2:sha256:…$salt$hash` format. Verified with a constant-time compare. |
 | Admin login attempts | Five failed attempts **since the last successful login** open a lockout that doubles per subsequent breach (1 min up to 15 min), answered `429` with `Retry-After`. Counted rather than time-decayed: the guard's job is to bound the derive function's cost, which needs no clock. It is checked **before** the password is verified, so a brute-force run stops costing 260,000 derive rounds per guess — the CPU is the thing being protected, not just the guess rate. Deliberately global rather than per-client-address, because the address an attempt appears to come from is client-supplied (below); one correct password clears the guard entirely. |
+| Default admin password | Logging in with the well-known default sets a must-change flag. While it is set, every dashboard page redirects to the Change Admin Password form — hosted on the Settings page — until the password is changed; login and logout stay reachable. The Settings page is deliberately unguarded because it hosts the form: guarding it would loop the redirect onto itself, and the flag clears only in the form's handler. |
 | API keys | Generated from 20 bytes of `crypto/rand`, URL-safe base64 (~27 chars). Stored as a **SHA-256 hash** — the plaintext key exists only in the response that creates it. Existing plaintext keys are rehashed automatically on startup. |
-| Key display | Shown exactly once, at creation or reset, in the body of that response — never in a flash or cookie. There is no way to recover a key afterwards; issue a new one, which invalidates the old immediately. |
+| API key rotation | A new key can be issued with an optional grace period for the old one: 0 (the default — immediate invalidation, the previous behavior), 1, 6, or 24 hours. During the window the old key's hash lives in the `api_key_rotations` table with its expiry, and key lookups fall back to it, so a client mid-deployment keeps working until the expiry; the old key can also be revoked early, which expires it at once. The new plaintext key is shown exactly once, as with every issued key. |
+| Key display | Shown exactly once, at creation or rotation, in the body of that response — never in a flash or cookie. There is no way to recover a key afterwards; issue a new one, which invalidates the old immediately or after the grace period you choose (see API key rotation). |
 | New users | Created **DISABLED**. A key cannot be used until an admin activates the account, so a key leaked in transit is not live by default. |
 | Admin forms | CSRF token required on every state-changing POST; session cookie is `SameSite=Lax` and AES-encrypted as well as signed, so its contents (CSRF token, flash messages) are not readable client-side. |
 | Engine credentials | Upstream API keys are stored in the database and never rendered back into the settings form. Editing an engine with the key field left blank keeps the stored key. |
@@ -597,11 +633,13 @@ exported from that page.
 Two things to be aware of:
 
 - **`X-Forwarded-For` is trusted for logging only.** When present it is logged in preference to the
-  socket address, so a reverse-proxied deployment records the real client. That header is
-  client-supplied and therefore spoofable when Gateway42. is exposed directly. It is never used for
-  authentication, authorization, or rate-limit identity — those key off the API key — and the admin
-  login lockout is global for exactly this reason: an IP-keyed budget would be renewable at will by
-  changing the header, and could be aimed at a real admin.
+  socket address: the first entry when `TRUSTED_PROXIES` is unset, or — with the variable set — the
+  first entry, walking from the closest hop toward the client, that is not a trusted proxy. That is
+  what lets a reverse-proxied deployment record the real client without trusting the whole chain.
+  That header is client-supplied and therefore spoofable when Gateway42. is exposed directly. It is
+  never used for authentication, authorization, or rate-limit identity — those key off the API key
+  — and the admin login lockout is global for exactly this reason: an IP-keyed budget would be
+  renewable at will by changing the header, and could be aimed at a real admin.
 - **The `/v1` surface carries no CSRF protection and needs none.** It is token-authenticated and
   stateless, so there is no ambient browser credential to abuse. The admin UI is cookie-authenticated
   and is protected. Do not put a `/v1` route behind the session cookie, or the two models collide.
@@ -647,6 +685,19 @@ flag is detected at startup and search falls back to `LIKE` — slower on large 
 block every log insert and admin write; batching interleaves the sweep with live traffic. Leftovers
 carry to the next hourly run.
 
+**The database file is kept compact under churn.** A maintenance sweep runs shortly after startup
+and then daily. It always runs `PRAGMA optimize` — cheap, it only refreshes the query planner's
+statistics — and runs `VACUUM` only when the freelist has grown past about 1,000 freed pages
+(~4 MB): below that the freed pages will be reused by the next inserts anyway, and `VACUUM` is a
+full file rewrite that is not worth it; above it, a file left bloated by churn is returned to the
+OS. Separately, an FTS consistency check runs once at startup: the contentless indexes are kept in
+step only by their triggers, and a trigger that failed mid-transaction — a disk full, a constraint
+violation — leaves the index drifted, so search would return stale or missing results with no
+error. The check counts each index against its source table, and when they disagree it repairs
+the index in one transaction: a `delete-all` clear followed by the same backfill the schema
+migration runs — the `rebuild` command SQLite normally offers is rejected on contentless tables,
+so the repair takes the clear-and-refill path instead. A consistent index is left alone.
+
 ### Files on disk
 
 | Path | Contents |
@@ -670,7 +721,8 @@ Access at `http://<host>:7000`. Admin-only — not intended for end users.
 
 - No username
 - Password: `admin123` (or the value of `ADMIN_PASSWORD` if set)
-- **Change your password after first login**
+- **Change your password after first login** — logging in with the default locks the rest of the
+  dashboard to the Change Admin Password form (on the Settings page) until you do
 
 ### User Management
 
@@ -680,7 +732,8 @@ New users are registered with a unique API key and start in **DISABLED** status.
 | ------ | ----------- |
 | Toggle status | Switch between **ACTIVE** and **DISABLED**. Only active users can make API requests. |
 | Set rate limit | Adjust requests-per-minute (1–1000) per user. |
-| New API key | Generates a fresh key and immediately invalidates the old one. Displayed once — copy it before leaving the page. |
+| Set token quota | Adjust the daily token budget (tokens per day, input + output combined, reset at UTC midnight) per user. Blank or `0` means unlimited — the default. |
+| New API key | Generates a fresh key. A grace-period selector chooses what happens to the old one: **immediate** (the default) invalidates it at once; 1, 6, or 24 hours keeps it valid for that window so clients have time to pick up the new key, and the old key can be revoked early. The new key is displayed once — copy it before leaving the page. |
 | Export CSV | Downloads the AI interaction log (prompt, response, timestamp) for this user. Required before deletion. |
 | Delete | Permanently removes the user and their log entries. CSV export must be done first. |
 
@@ -713,6 +766,18 @@ What the panel is careful to say:
 
 If the aggregate query fails, the card says so and the rest of the dashboard still renders — engine
 health is the operational signal here, and it should not be lost to a failed report.
+
+### Token Quotas
+
+Below the usage panel, the dashboard shows each client's daily token budget: the limit, what has
+been used of it, what remains, and a bar for the consumed fraction. Only clients with a positive
+budget are listed — unlimited clients have no row, so a fleet with no budgets renders no panel at
+all.
+
+The budget is set from the **Token quota** column of the client table: type a number and click
+*Set*; leaving the field blank or entering `0` clears it back to unlimited. The used figure is the
+same request-log total the Token Usage panel reads, summed over the current UTC day — one
+aggregate, no second counter.
 
 ### Engine Management (Settings page)
 
@@ -750,9 +815,10 @@ request it describes. If the queue saturates under a sustained burst, entries ar
 than buffered without limit, and `gw42_logs_dropped_total` records how many. If completeness of the
 audit trail matters for your deployment, alert on that counter being non-zero.
 
-Client IP comes from `X-Forwarded-For` when present, falling back to the socket address. That header
-is client-supplied, so treat the IP as informational metadata — it is never used for authentication
-or rate-limit identity.
+Client IP comes from `X-Forwarded-For` when present — the first entry by default, or the first
+untrusted entry walking from the right when `TRUSTED_PROXIES` is set — falling back to the socket
+address. That header is client-supplied, so treat the IP as informational metadata — it is never
+used for authentication or rate-limit identity.
 
 Request logs:  
 <img width="1554" height="535" alt="Image" src="https://github.com/user-attachments/assets/f25e6fc7-ca3c-42b2-b5ae-bc370a4652c5" />
@@ -790,6 +856,7 @@ All configuration is via environment variables. No variables are strictly requir
 | `GW42_UPSTREAM_CONCURRENCY` | `8` | Maximum simultaneous in-flight requests per engine. Requests beyond this are rejected with `503` and a `Retry-After` header rather than queued. |
 | `GW42_METRICS_TOKEN` | _(empty)_ | Bearer token a Prometheus scraper can use for `/metrics`. Unset means only an admin session can read it. |
 | `GW42_LOG_RETENTION_DAYS` | `30` | Age after which interaction and request-log rows are deleted. A sweep runs at startup and hourly thereafter. Set to `0` to keep everything — note that interaction logs hold full prompts and responses, so an unbounded table grows with traffic and retains user content indefinitely. |
+| `TRUSTED_PROXIES` | _(empty)_ | Comma-separated list of IPs or CIDRs that may assert a caller's identity through `X-Forwarded-For`. When set, the header is walked from the closest hop toward the client (right to left) and the first entry not in the set is logged as the client — entries appended by a trusted proxy are believed, and a middle hop cannot launder a spoofed entry by appending itself. When empty, the first XFF entry is used as before. Log accuracy only — the result is never an authorization or rate-limit input. |
 
 Gateway42 reads these from the process environment only — it does not parse a `.env` file. Export them
 in the shell, or let `./install.sh` bake them into the LaunchAgent plist:
@@ -863,6 +930,15 @@ The race detector works without a C toolchain because the SQLite driver is pure 
 | `request_detail_test.go` | The per-request detail collector: routing, timing and token facts reaching the log row, a request that never reaches a handler still producing one, `X-Request-ID` matching the stored id, and the migration that gives an existing database the detail columns and rebuilds its contentless FTS table. |
 | `login_guard_test.go` | The admin login throttle: the lockout engaging on the fifth failure since the last success, its length doubling to the ceiling, a successful password clearing both the counter and an active lockout, and — through the real handler — a 429 with `Retry-After` that refuses even the correct password until the lockout passes, which is what keeps the PBKDF2 derive function from running at all. |
 | `usage_test.go` | The token-usage panel, both halves: against a real SQLite file that the window and path filters hold, that an unresolved model falls back to the requested name, that a deleted client's history survives unregistered, and that zero-token requests are tallied as unreported rather than as free; then the grouping into per-client rows with ranked bars, and the dashboard rendering with a panel, without one, and with the aggregate unavailable. |
+| `ratelimit_middleware_test.go` | The rate limit as middleware: a client over its per-minute limit gets `429` in the path's own error envelope — OpenAI's on the OpenAI routes, Anthropic's on the Anthropic routes — `/v1/models` is bounded like the completion routes rather than free to hammer, and `OPTIONS` preflights pass through. |
+| `failover_test.go` | Engine failover: with two engines holding the same model, a primary at its concurrency cap falls through to the next holder — the audit row records which engine served — every holder at its cap is a `503` with `Retry-After`, and a model no probed engine has is a `404`. |
+| `quota_test.go` | Daily token quotas: `0` is unlimited, a spent budget rejects with `429` before the body is read, the Anthropic route carries the same gate as the OpenAI one, and a failed quota query fails open rather than blocking traffic. |
+| `whoami_test.go` | `GET /v1/whoami`: the identity fields — name, status, rate limit, key creation time — reported with exactly the field names the contract declares, and a `401` in the OpenAI envelope for a missing or invalid key. |
+| `trusted_proxy_test.go` | `clientIP` with `TRUSTED_PROXIES` set: the XFF chain is walked right to left so a trusted hop cannot launder a spoofed left-side entry, a trusted CIDR covers every contained IP, a fully trusted chain falls back to the socket address, and an unset variable keeps the first-entry behavior. |
+| `key_rotation_test.go` | API key rotation: a rotation with a grace window keeps the old key resolvable until the window's expiry, `0` grace revokes it immediately as before, `RevokeOldKey` cuts the window short — the current key is rejected until a new rotation, whose key works on first use — and an expired or unparseable expiry fails closed. |
+| `password_change_test.go` | The forced password change: the well-known default is recognised, the flag redirects the dashboard to the change-password form while the Settings page — which hosts the form — stays reachable, and the panel serves normally once the flag is cleared. |
+| `fts_consistency_test.go` | The startup FTS check: a drifted index is detected by comparing row counts against the source table and repaired in one transaction — `delete-all` plus the migration's backfill, since SQLite rejects the `rebuild` command on contentless tables — with searches serving the restored content afterwards; a consistent index is left alone. |
+| `sqlite_maintenance_test.go` | The maintenance sweep: `PRAGMA optimize` runs on every pass, and `VACUUM` runs only when the freelist has grown past the 1,000-page threshold. |
 
 The template test matters more than it sounds: `html/template` resolves field names at render time,
 so a mistyped `{{.FieldName}}` is invisible until someone loads the page.
@@ -883,21 +959,22 @@ Single `package main`, one file per concern:
 
 | File | Lines | Responsibility |
 | ---- | ----- | -------------- |
-| `main.go` | 1141 | Config, routing table, middleware chain, panic recovery, server lifecycle, graceful shutdown. |
-| `handlers.go` | 1289 | Admin web UI handlers only. |
-| `api_handlers.go` | 772 | The `/v1/*` OpenAI-compatible surface. Separate from the admin UI so a change to one cannot alter the other's contract. |
+| `main.go` | 1323 | Config, routing table, middleware chain, panic recovery, rate limiting, trusted-proxy client-IP resolution, server lifecycle, graceful shutdown. |
+| `handlers.go` | 1472 | Admin web UI handlers only. |
+| `api_handlers.go` | 857 | The `/v1/*` OpenAI-compatible surface, including `/v1/whoami` and the completion-path quota checks. Separate from the admin UI so a change to one cannot alter the other's contract. |
 | `engine.go` | 1289 | The `Engine` interface and its two adapters, plus the probe cache, stream implementations and the streaming deadline. |
-| `routing.go` | 256 | Model-name → engine resolution and the cached routing index. |
+| `routing.go` | 370 | Model-name → ordered engine lists (primary plus failover targets) and the cached routing index. |
 | `openai.go` | 466 | Request and response translation between OpenAI and Ollama shapes. |
 | `anthropic.go` | 579 | The Anthropic Messages API front-end: both translation directions and the streaming block sequencer. |
 | `types.go` | 168 | Typed structs for responses Gateway42. authors. |
-| `db.go` | 994 | Schema, migrations, both connection pools, queries, FTS5 setup, retention pruning. |
+| `db.go` | 1203 | Schema, migrations, both connection pools, queries, FTS5 setup and its startup consistency check, retention pruning, and the daily SQLite maintenance sweep. |
 | `request_detail.go` | 220 | The per-request detail collector handlers fill and the request log reads. |
 | `logwriter.go` | 334 | Asynchronous batched log writers. |
 | `usage.go` | 204 | The dashboard's token-usage panel: window allow-list, per-client grouping, quantized bar widths, count abbreviation. Reads the request log rather than capturing anything new. |
-| `auth.go` | 188 | Password hashing, API-key generation, and the admin login throttle. |
+| `quota.go` | 233 | Daily token quota enforcement (the fail-open check on both completion paths) and the dashboard quota panel's rows. |
+| `auth.go` | 332 | Password hashing, API-key generation and rotation (grace periods, early revocation), the default-password flag, and the admin login throttle. |
 | `csrf.go` | 116 | CSRF token issue and verification. |
-| `ratelimit.go` | 94 | Per-user token buckets. |
+| `ratelimit.go` | 149 | Per-user token buckets. |
 | `metrics.go` | 210 | Prometheus collectors and the path bucketer. |
 
 Templates, static images and the stylesheet are compiled into the binary with `embed.FS`, so
@@ -933,6 +1010,6 @@ This gateway intentionally does not handle:
 | Hundreds of concurrent users | Inference starvation |
 | Public internet traffic | Rate-limited / denied |
 | Large file uploads | GPU contention |
-| Unbounded token use | Latency spikes |
+| Unbounded token use (the default — quotas are opt-in) | Latency spikes, unless a daily token quota is set for the user |
 
 These are deliberate design boundaries, not bugs.
