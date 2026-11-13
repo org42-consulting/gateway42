@@ -145,6 +145,11 @@ func initDB() error {
 	if err := dbRead.Ping(); err != nil {
 		return fmt.Errorf("reader pool ping: %w", err)
 	}
+
+	// FTS tables can drift if a trigger ever failed mid-transaction; verify
+	// their row counts against the source tables now that the reader is up,
+	// rebuilding any drifted index in place.
+	checkFTSConsistency()
 	return nil
 }
 
@@ -157,18 +162,20 @@ func createSchema() error {
 
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS users(
-			id         INTEGER PRIMARY KEY AUTOINCREMENT,
-			name       TEXT UNIQUE NOT NULL,
-			api_key    TEXT UNIQUE NOT NULL,
-			status     TEXT NOT NULL DEFAULT 'pending',
-			rate_limit INTEGER NOT NULL DEFAULT 10,
-			created_at TEXT NOT NULL
+			id             INTEGER PRIMARY KEY AUTOINCREMENT,
+			name           TEXT UNIQUE NOT NULL,
+			api_key        TEXT UNIQUE NOT NULL,
+			status         TEXT NOT NULL DEFAULT 'pending',
+			rate_limit     INTEGER NOT NULL DEFAULT 10,
+			created_at     TEXT NOT NULL,
+			key_expires_at TEXT NOT NULL DEFAULT ''
 		)`,
 		`CREATE TABLE IF NOT EXISTS admin_user(
-			id            INTEGER PRIMARY KEY AUTOINCREMENT,
-			email         TEXT UNIQUE NOT NULL,
-			password_hash TEXT NOT NULL,
-			created_at    TEXT NOT NULL
+			id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+			email                TEXT UNIQUE NOT NULL,
+			password_hash        TEXT NOT NULL,
+			created_at           TEXT NOT NULL,
+			must_change_password INTEGER NOT NULL DEFAULT 0
 		)`,
 		`CREATE TABLE IF NOT EXISTS logs(
 			id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -210,11 +217,27 @@ func createSchema() error {
 			upstream_error  TEXT NOT NULL DEFAULT '',
 			user_agent      TEXT NOT NULL DEFAULT ''
 		)`,
+		// Old API keys being rotated out. A rotation replaces users.api_key
+		// immediately, so the old key would stop working at once; this table
+		// keeps its hash alive until expires_at so a client mid-deployment
+		// has a grace period to switch to the new key. See RotateAPIKey in
+		// auth.go.
+		`CREATE TABLE IF NOT EXISTS api_key_rotations(
+			id         INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id    INTEGER NOT NULL,
+			key_hash   TEXT NOT NULL,
+			expires_at TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		)`,
 		`CREATE INDEX IF NOT EXISTS idx_logs_user_id ON logs(user_id)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_api_key ON users(api_key)`,
 		`CREATE INDEX IF NOT EXISTS idx_rate_limit_user_timestamp ON rate_limit_entries(user_id, timestamp)`,
 		`CREATE INDEX IF NOT EXISTS idx_request_logs_ts ON request_logs(ts)`,
 		`CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts)`,
+		// getUserByAPIKey point-queries this by hash on every current-key
+		// miss (i.e. for every unknown key), so the fallback must be an index
+		// seek, not a scan of every rotation ever recorded.
+		`CREATE INDEX IF NOT EXISTS idx_api_key_rotations_hash ON api_key_rotations(key_hash)`,
 		// getUserLogs filters by user and orders by ts. idx_logs_user_id
 		// satisfies the filter but leaves SQLite to sort every matching row;
 		// this composite serves the whole query in index order, which is the
@@ -247,6 +270,48 @@ func createSchema() error {
 	}
 	if !hasModel {
 		if _, err := tx.Exec("ALTER TABLE logs ADD COLUMN model TEXT"); err != nil {
+			return err
+		}
+	}
+
+	// Migration: add key_expires_at to users (API key rotation / revocation).
+	// Empty string means "no expiry"; a non-empty RFC3339 UTC timestamp is
+	// checked on every key lookup (keyIsExpired in auth.go) and rejects the
+	// key once now is past it.
+	hasKeyExpiry, err := tableHasColumn(tx, "users", "key_expires_at")
+	if err != nil {
+		return err
+	}
+	if !hasKeyExpiry {
+		if _, err := tx.Exec("ALTER TABLE users ADD COLUMN key_expires_at TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
+	}
+
+	// Migration: add quota_daily_tokens to users (daily token quotas, 0 =
+	// unlimited). The request path reads it (checkQuota in quota.go) and the
+	// admin UI writes it (handleSetQuota in handlers.go); without the column
+	// both would error on every call, so the quota feature fails open and
+	// the dashboard panel renders nothing.
+	hasQuotaCol, err := tableHasColumn(tx, "users", "quota_daily_tokens")
+	if err != nil {
+		return err
+	}
+	if !hasQuotaCol {
+		if _, err := tx.Exec("ALTER TABLE users ADD COLUMN quota_daily_tokens INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+	}
+
+	// Migration: add must_change_password to admin_user. Set to 1 when the
+	// admin authenticates with the well-known default password; the admin UI
+	// (requirePasswordChanged in handlers.go) forces a change while it is set.
+	hasMustChange, err := tableHasColumn(tx, "admin_user", "must_change_password")
+	if err != nil {
+		return err
+	}
+	if !hasMustChange {
+		if _, err := tx.Exec("ALTER TABLE admin_user ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0"); err != nil {
 			return err
 		}
 	}
@@ -536,23 +601,66 @@ func invalidateUserCache(userID int) {
 // ── User queries ──────────────────────────────────────────────────────────────
 
 // getUserByAPIKey looks up a user by raw API key, hashing it before querying.
+// A miss on the current key falls back to api_key_rotations: during a
+// rotation's grace period the old key's hash lives there, so it keeps working
+// until that row's expiry.
 func getUserByAPIKey(rawKey string) (*User, error) {
 	hash := sha256Hex(rawKey)
 	cacheKey := "api:" + hash
 	if u := userCacheGet(cacheKey); u != nil {
 		return u, nil
 	}
+
+	// Fast path: the user's current key.
 	row := dbRead.QueryRow(
-		"SELECT id, name, api_key, status, rate_limit, created_at FROM users WHERE api_key=?", hash,
+		"SELECT id, name, api_key, status, rate_limit, created_at, key_expires_at FROM users WHERE api_key=?", hash,
 	)
 	u, err := scanUser(row)
+	if err == nil {
+		// If the key is past its rotation grace period, reject it.
+		if keyIsExpired(u.KeyExpiresAt) {
+			return nil, errors.New("api key expired")
+		}
+		userCacheSet(cacheKey, u)
+		return u, nil
+	}
+	if err != sql.ErrNoRows {
+		return nil, err
+	}
+
+	// Not the current key: check whether it is an old key still inside its
+	// rotation grace period. This path also hits for every unknown key, so
+	// the lookup is an indexed point query on key_hash; RFC3339 UTC is
+	// fixed-width, so expires_at > now compared as text is chronological.
+	var rotatingID int
+	now := time.Now().UTC().Format(time.RFC3339)
+	err = dbRead.QueryRow(
+		"SELECT user_id FROM api_key_rotations WHERE key_hash = ? AND expires_at > ? LIMIT 1",
+		hash, now,
+	).Scan(&rotatingID)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	userCacheSet(cacheKey, u)
+
+	u, err = getUserByID(rotatingID)
+	if err != nil {
+		return nil, err
+	}
+	if u == nil {
+		return nil, nil
+	}
+	// Same expiry rule as the fast path: an explicit expiry on the user row
+	// (e.g. RevokeOldKey cutting short the grace period) beats the rotation
+	// row.
+	if keyIsExpired(u.KeyExpiresAt) {
+		return nil, errors.New("api key expired")
+	}
+	// Deliberately not cached: the user cache TTL (5 minutes) could outlive
+	// the grace window, keeping a revoked old key valid. The cost is one
+	// indexed query per request during the short rotation window.
 	return u, nil
 }
 
@@ -562,7 +670,7 @@ func getUserByID(id int) (*User, error) {
 		return u, nil
 	}
 	row := dbRead.QueryRow(
-		"SELECT id, name, api_key, status, rate_limit, created_at FROM users WHERE id=?", id,
+		"SELECT id, name, api_key, status, rate_limit, created_at, key_expires_at FROM users WHERE id=?", id,
 	)
 	u, err := scanUser(row)
 	if err == sql.ErrNoRows {
@@ -577,7 +685,7 @@ func getUserByID(id int) (*User, error) {
 
 func scanUser(row *sql.Row) (*User, error) {
 	var u User
-	err := row.Scan(&u.ID, &u.Name, &u.APIKey, &u.Status, &u.RateLimit, &u.CreatedAt)
+	err := row.Scan(&u.ID, &u.Name, &u.APIKey, &u.Status, &u.RateLimit, &u.CreatedAt, &u.KeyExpiresAt)
 	if err != nil {
 		return nil, err
 	}
@@ -586,7 +694,7 @@ func scanUser(row *sql.Row) (*User, error) {
 
 func getAllUsers() ([]User, error) {
 	rows, err := dbRead.Query(
-		"SELECT id, name, api_key, status, rate_limit, created_at FROM users ORDER BY created_at DESC",
+		"SELECT id, name, api_key, status, rate_limit, created_at, key_expires_at FROM users ORDER BY created_at DESC",
 	)
 	if err != nil {
 		return nil, err
@@ -595,7 +703,7 @@ func getAllUsers() ([]User, error) {
 	var users []User
 	for rows.Next() {
 		var u User
-		if err := rows.Scan(&u.ID, &u.Name, &u.APIKey, &u.Status, &u.RateLimit, &u.CreatedAt); err != nil {
+		if err := rows.Scan(&u.ID, &u.Name, &u.APIKey, &u.Status, &u.RateLimit, &u.CreatedAt, &u.KeyExpiresAt); err != nil {
 			return nil, err
 		}
 		users = append(users, u)
@@ -621,15 +729,6 @@ func createUser(name, rawKey string, rateLimit int) error {
 
 func updateUserStatus(userID int, status string) error {
 	_, err := db.Exec("UPDATE users SET status=? WHERE id=?", status, userID)
-	if err == nil {
-		invalidateUserCache(userID)
-	}
-	return err
-}
-
-// resetUserAPIKey updates a user's API key, hashing the raw key before writing.
-func resetUserAPIKey(userID int, rawKey string) error {
-	_, err := db.Exec("UPDATE users SET api_key=? WHERE id=?", sha256Hex(rawKey), userID)
 	if err == nil {
 		invalidateUserCache(userID)
 	}
@@ -990,5 +1089,115 @@ func pruneLogs() (logsDeleted, requestsDeleted int64, err error) {
 func truncateLegacyRateLimitTable() {
 	if _, err := db.Exec("DELETE FROM rate_limit_entries"); err != nil {
 		slog.Warn("truncate legacy rate_limit_entries", "err", err)
+	}
+}
+
+// ── SQLite maintenance ────────────────────────────────────────────────────────
+
+// runSQLiteMaintenance keeps the database file healthy under sustained
+// insert/delete churn. PRAGMA optimize rebuilds internal statistics so the
+// query planner picks good indexes; VACUUM rewrites the file and returns
+// freed pages to the OS, but is expensive (full rewrite), so it runs only
+// when the freelist has grown past a threshold.
+//
+// Called on a 24h ticker from startBackgroundTasks.
+func runSQLiteMaintenance() {
+	// PRAGMA optimize is cheap and always beneficial after bulk deletes.
+	if _, err := db.Exec("PRAGMA optimize"); err != nil {
+		slog.Warn("sqlite maintenance: optimize", "err", err)
+		return
+	}
+
+	// Check freelist: pages freed by DELETE but not yet returned to the OS.
+	var freePages int64
+	if err := db.QueryRow("PRAGMA freelist_count").Scan(&freePages); err != nil {
+		slog.Warn("sqlite maintenance: freelist_count", "err", err)
+		return
+	}
+
+	// VACUUM threshold: 1000 free pages ≈ 4 MB at default 4 KB page size.
+	// Below this, the pages will be reused by upcoming inserts anyway.
+	const vacuumThreshold = 1000
+	if freePages > vacuumThreshold {
+		slog.Info("sqlite maintenance: running VACUUM", "free_pages", freePages)
+		if _, err := db.Exec("VACUUM"); err != nil {
+			slog.Error("sqlite maintenance: vacuum", "err", err)
+			return
+		}
+		slog.Info("sqlite maintenance: VACUUM complete")
+	}
+}
+
+// checkFTSConsistency verifies that the contentless FTS5 tables match their
+// source tables row-for-row. If a trigger ever failed mid-transaction (disk
+// full, constraint violation), the FTS index can drift silently — search
+// would return stale or missing results with no error. This runs once at
+// startup; if drift is detected, the index is cleared and repopulated from
+// the source table.
+//
+// The repair cannot use the 'rebuild' command: SQLite rejects it on
+// contentless FTS5 tables ("'rebuild' may not be used with a contentless
+// fts5 table"). 'delete-all' is the contentless-safe clear, and the backfill
+// is the exact statement createSchema uses for its one-shot backfill, so the
+// repaired index is indistinguishable from one the triggers built. Both
+// statements run in one transaction: a crash between them leaves an empty
+// index, which the next startup's count check sees and repairs again.
+//
+// Called from initDB after migrations complete.
+func checkFTSConsistency() {
+	pairs := []struct {
+		source   string
+		fts      string
+		backfill string
+	}{
+		{
+			source: "logs",
+			fts:    "logs_fts",
+			backfill: `
+			INSERT INTO logs_fts(rowid, prompt, response, user_name)
+			SELECT l.id, COALESCE(l.prompt,''), COALESCE(l.response,''),
+				COALESCE(u.name, '')
+			FROM logs l LEFT JOIN users u ON u.id=l.user_id`,
+		},
+		{
+			source: "request_logs",
+			fts:    "request_logs_fts",
+			backfill: "INSERT INTO request_logs_fts(rowid, path, client_ip, user_name, model_served, engine_name)\n" +
+				"			SELECT id, path, client_ip, user_name, model_served, engine_name FROM request_logs",
+		},
+	}
+	for _, p := range pairs {
+		var mainCount, ftsCount int64
+		if err := dbRead.QueryRow("SELECT COUNT(*) FROM " + p.source).Scan(&mainCount); err != nil {
+			continue // table might not exist yet on a fresh DB
+		}
+		if err := dbRead.QueryRow("SELECT COUNT(*) FROM " + p.fts).Scan(&ftsCount); err != nil {
+			continue
+		}
+		if mainCount == ftsCount {
+			continue
+		}
+		slog.Warn("FTS index out of sync, repairing",
+			"table", p.source, "main_rows", mainCount, "fts_rows", ftsCount)
+		tx, err := db.Begin()
+		if err != nil {
+			slog.Error("FTS repair: begin transaction", "table", p.source, "err", err)
+			continue
+		}
+		if _, err := tx.Exec("INSERT INTO " + p.fts + "(" + p.fts + ") VALUES('delete-all')"); err != nil {
+			_ = tx.Rollback()
+			slog.Error("FTS repair: delete-all", "table", p.source, "err", err)
+			continue
+		}
+		if _, err := tx.Exec(p.backfill); err != nil {
+			_ = tx.Rollback()
+			slog.Error("FTS repair: backfill", "table", p.source, "err", err)
+			continue
+		}
+		if err := tx.Commit(); err != nil {
+			slog.Error("FTS repair: commit", "table", p.source, "err", err)
+			continue
+		}
+		slog.Info("FTS index repaired", "table", p.source, "main_rows", mainCount)
 	}
 }

@@ -140,6 +140,42 @@
 </div>
 {{end}}
 
+<!-- Token Quotas -->
+{{if .QuotaRows}}
+<div class="card card-mt">
+    <h2>Token Quotas</h2>
+    <p class="section-desc flush">Daily token budget per client, reset at UTC midnight. Clients without a budget are unlimited and not listed.</p>
+    <div class="table-wrap">
+        <div class="scroll-x">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Client</th>
+                        <th class="col-110">Limit</th>
+                        <th class="col-110">Used</th>
+                        <th class="col-110">Remaining</th>
+                        <th class="col-180">Budget</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {{range .QuotaRows}}
+                    <tr>
+                        <td><span class="usage-client">{{.Name}}</span></td>
+                        <td class="usage-num">{{humanNum .Limit}}</td>
+                        <td class="usage-num">{{humanNum .Used}}</td>
+                        <td class="usage-num is-lead">{{humanNum .Remaining}}</td>
+                        <td>
+                            <span class="quota-bar"><span class="quota-bar-fill {{.Bar}}"></span></span>
+                        </td>
+                    </tr>
+                    {{end}}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{{end}}
+
 <!-- Registered Clients -->
 <div class="card card-mt">
     <h2>Registered Clients</h2>
@@ -151,6 +187,7 @@
                     <th>Client Name</th>
                     <th class="col-badge">Status</th>
                     <th>Rate / min</th>
+                    <th>Token quota</th>
                     <th>Actions</th>
                 </tr>
             </thead>
@@ -174,9 +211,26 @@
                     </form>
                 </td>
                 <td>
+                    <!-- Blank = unlimited (0); the current quota is not prefilled
+                         because the user list carries no quota value. -->
+                    <form action="/admin/set-quota/{{.ID}}" method="post" class="form-inline">
+                        <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
+                        <input type="number" name="quota_tokens" min="0" class="rate-input">
+                        <button type="submit" class="btn-small btn-ghost">Set</button>
+                    </form>
+                </td>
+                <td>
                     <div class="flex-row row-actions">
                         <form action="/admin/reset/{{.ID}}" method="post" class="form-inline">
                             <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
+                            <!-- How long the old key stays valid after the rotation. 0 (the
+                                 default) revokes it immediately — the pre-grace behavior. -->
+                            <select name="grace_hours" class="select-sm" title="Keep the old key valid for">
+                                <option value="0" selected>immediate</option>
+                                <option value="1">1 hour</option>
+                                <option value="6">6 hours</option>
+                                <option value="24">24 hours</option>
+                            </select>
                             <button type="submit" class="btn-small btn-warning">New API Key</button>
                         </form>
                         <a href="/export/{{.ID}}" class="btn-small btn-primary">Export CSV</a>

@@ -15,6 +15,7 @@
         <li><strong>Multiple engine backends</strong> — connect Ollama instances and OpenAI-compatible endpoints; manage them from the Settings page without restarting.</li>
         <li><strong>API key authentication</strong> — every user receives a unique key; only active users can send requests.</li>
         <li><strong>Per-user rate limiting</strong> — configurable maximum requests per minute per user.</li>
+        <li><strong>Daily token quotas</strong> — optional per-user budget of tokens per day (input + output combined), enforced alongside rate limiting.</li>
         <li><strong>HTTP request logging</strong> — every API request is recorded with timestamp, client, IP, method, path, and status code.</li>
         <li><strong>AI interaction logging</strong> — prompt and response for each chat completion, stored per user and exportable as CSV.</li>
         <li><strong>Admin dashboard</strong> — manage users, configure engines, search for and download models, and review logs.</li>
@@ -49,6 +50,14 @@
         generated. Deleted clients keep their history and are marked <strong>DELETED</strong>.
     </p>
 
+    <h3>Token Quotas</h3>
+    <p>
+        The daily token budget per client, reset at UTC midnight, with used and remaining figures
+        and a bar showing how much of the budget is consumed. Only clients with a positive budget
+        are listed; unlimited clients have no row, so a fleet with no budgets renders no panel.
+        Set or clear a budget from the <em>Token quota</em> column of the client table below.
+    </p>
+
     <h3>Registered Users</h3>
     <p>A table of every user account, with the following columns and actions:</p>
     <table class="help-table">
@@ -63,9 +72,17 @@
                 The maximum number of API requests this user can make per minute. Edit the number inline and
                 click <em>Update</em> to save. Valid range: 1–1000.
             </td></tr>
+            <tr><td>Token quota</td><td>
+                The maximum number of tokens this user may spend per day (input + output combined), reset at
+                UTC midnight. Type a number and click <em>Set</em> to save it; leaving the field blank or
+                entering <em>0</em> means unlimited. A user at their budget is rejected until the next UTC day,
+                whatever their rate limit would otherwise allow.
+            </td></tr>
             <tr><td>New API Key</td><td>
-                Generates a fresh API key for the user and immediately invalidates the old one. The new key
-                is displayed once — copy it before closing the page.
+                Generates a fresh API key for the user. The grace-period selector next to the button decides
+                what happens to the old one: <em>immediate</em> (the default) invalidates it at once, while
+                1, 6, or 24 hours keeps it valid for that window so clients have time to pick up the new key.
+                The new key is displayed once — copy it before closing the page.
             </td></tr>
             <tr><td>Export CSV</td><td>
                 Downloads all AI interaction log entries for this user as a CSV file. This export is also

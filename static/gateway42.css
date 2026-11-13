@@ -663,6 +663,29 @@ label.login-tagline  { margin-bottom: 26px; }
 .usage-foot-note { font-size: .75rem; color: rgba(255,255,255,.4); margin: 14px 0 0; }
 .usage-foot-note code { font-size: .6875rem; color: rgba(180,200,255,.8); }
 
+/* Token quotas. The bar reuses the quantized-width trick from the usage panel
+   above: a data-driven width would have to be a style attribute, which
+   static_css_test forbids, so Go computes the class instead (quotaBarClass).
+   Own prefix and container rather than .usage-bar: the two panels would then
+   share styling silently, and a change to one would move the other.
+   Scoped to .quota-bar: a bare .qb-10 would not outrank `.data-table td`. */
+.quota-bar {
+    display: block; height: 6px; border-radius: 3px; overflow: hidden;
+    background: rgba(255,255,255,.07); min-width: 120px;
+}
+.quota-bar-fill { display: block; height: 100%; border-radius: 3px; background: var(--ai-electric); }
+.quota-bar .qb-0   { width: 0; }
+.quota-bar .qb-10  { width: 10%; }
+.quota-bar .qb-20  { width: 20%; }
+.quota-bar .qb-30  { width: 30%; }
+.quota-bar .qb-40  { width: 40%; }
+.quota-bar .qb-50  { width: 50%; }
+.quota-bar .qb-60  { width: 60%; }
+.quota-bar .qb-70  { width: 70%; }
+.quota-bar .qb-80  { width: 80%; }
+.quota-bar .qb-90  { width: 90%; }
+.quota-bar .qb-100 { width: 100%; }
+
 /* ── Settings ── */
 .flex-row.form-actions { padding-top: 4px; }
 .flex-row.tag-list     { gap: 4px; }

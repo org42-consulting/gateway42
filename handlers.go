@@ -102,6 +102,19 @@ func handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slog.Info("Admin logged in")
+	// A login that just verified is the one moment the gateway knows the
+	// account is still at factory settings: the submitted password matched
+	// the stored hash, so if it is the well-known default, the hash is the
+	// default's. Flip the flag here rather than at startup — an operator who
+	// pre-set a different password is never nagged, and one who left the
+	// default is nagged from their very first login.
+	if isDefaultPassword(password) {
+		SetMustChangePassword(true)
+		addFlash(w, r, "error",
+			"You logged in with the default admin password. Change it in Change Admin Password on the Settings page — until you do, the rest of the dashboard stays locked.")
+		http.Redirect(w, r, changePasswordPage, http.StatusFound)
+		return
+	}
 	http.Redirect(w, r, "/admin/panel", http.StatusFound)
 }
 
@@ -111,6 +124,9 @@ func handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 func handleAdminPanel(w http.ResponseWriter, r *http.Request) {
 	if !isAdminSession(r) {
 		http.Redirect(w, r, "/", http.StatusFound)
+		return
+	}
+	if !requirePasswordChanged(w, r) {
 		return
 	}
 	users, err := getAllUsers()
@@ -173,6 +189,13 @@ func handleAdminPanel(w http.ResponseWriter, r *http.Request) {
 		EngineStatus: enginesStatus,
 		EngineModels: enginesModels,
 		Usage:        panel,
+		// Nil — not an empty slice — when no user has a budget: the template
+		// tests {{if .QuotaRows}}, and a fully unlimited fleet renders no
+		// panel at all. buildQuotaRows also returns nil on a pre-migration
+		// database (the db.go migration adds users.quota_daily_tokens at
+		// startup), so the panel stays empty instead of the dashboard
+		// erroring.
+		QuotaRows: buildQuotaRows(users),
 	})
 }
 
@@ -183,6 +206,10 @@ func handleAdminSettingsPage(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
+	// No requirePasswordChanged here, on purpose: this page hosts the
+	// Change Admin Password form and is changePasswordPage itself. Guarding
+	// it would turn the lockout into a redirect loop with no exit — the flag
+	// clears only in handleChangePassword, reachable only from this form.
 	engines := cachedEngines()
 	engineURLs := getEngineURLs(engines)
 	engineStatus := make(map[string]bool)
@@ -720,6 +747,37 @@ func handleOllamaSearch(w http.ResponseWriter, r *http.Request) {
 
 // ─────────────────────────────── Password change ──────────────────────────────
 
+// changePasswordPage is the page the Change Admin Password form lives on. The
+// form posts to /admin/change-password, but that route is the form's POST
+// endpoint, not a page — no GET is registered for it, so a browser redirect
+// there would land on a 405. Every redirect that must land the admin on the
+// form therefore targets the settings page instead.
+const changePasswordPage = "/admin/settings-page"
+
+// requirePasswordChanged reports whether this request may serve content while
+// the admin account still has the default password. While mustChangePassword()
+// holds, the only thing the admin is allowed to do is change the password, so
+// the caller redirects to changePasswordPage and stops.
+//
+// Deliberately exempt, and why:
+//   - login and logout never call it (they must stay reachable — logout is the
+//     escape hatch while locked);
+//   - the settings page does not call it: it hosts the form, and it is the
+//     redirect target above. Guarding it would loop the redirect onto itself
+//     and leave the flag set forever, since only handleChangePassword clears
+//     it, and that is only reachable from the form.
+//
+// The isAdminSession check is redundant with the callers' own check, which
+// runs first — it exists so a future caller cannot drop that check and start
+// bouncing anonymous visitors at the settings page.
+func requirePasswordChanged(w http.ResponseWriter, r *http.Request) bool {
+	if !isAdminSession(r) || !mustChangePassword() {
+		return true
+	}
+	http.Redirect(w, r, changePasswordPage, http.StatusFound)
+	return false
+}
+
 func handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	if !isAdminSession(r) {
 		http.Redirect(w, r, "/", http.StatusFound)
@@ -754,6 +812,12 @@ func handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Internal server error", 500)
 		return
 	}
+	// Clear the default-password flag the login handler may have set: the new
+	// hash is stored, and validatePassword above rejects the weak shape
+	// ("admin123" has no uppercase or digit), so no future login can verify
+	// against the default and re-set it. Without this, the requirePasswordChanged
+	// guard would keep bouncing the admin to this page after they already won.
+	SetMustChangePassword(false)
 	slog.Info("Admin password changed")
 	// Invalidate session so the admin must re-authenticate with the new password.
 	sess := getSession(r)
@@ -846,6 +910,12 @@ func handleToggle(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin/panel", http.StatusFound)
 }
 
+// handleAdminResetKey rotates a user's API key. The form's grace_hours field
+// chooses how long the old key stays valid: 0 (the default) revokes it at
+// once — exactly the pre-grace behavior — while 1, 6, or 24 gives a client
+// mid-deployment time to pick up the new key. RotateAPIKey handles the grace
+// window internally (the old hash lands in api_key_rotations with an expiry);
+// this handler only picks the window and tells the admin about it.
 func handleAdminResetKey(w http.ResponseWriter, r *http.Request) {
 	if !isAdminSession(r) {
 		http.Redirect(w, r, "/", http.StatusFound)
@@ -857,14 +927,61 @@ func handleAdminResetKey(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "User not found", 404)
 		return
 	}
-	newKey := generateAPIKey()
-	if err := resetUserAPIKey(uid, newKey); err != nil {
-		slog.Error("reset api key", "err", err)
+	if !parseAdminForm(w, r, "/admin/panel") {
+		return
+	}
+	// Blank means "not sent" (an old tab, or the field stripped), and is
+	// treated as 0 rather than an error: immediate revocation is the legacy
+	// behavior, so a request that predates the selector keeps doing it.
+	// Values off the form's list are rejected, not clamped — silently
+	// shrinking a 48h request to 24h would leave the admin believing a
+	// retired key lives longer than it does, and rounding a negative up to
+	// 0 would turn a typo into an immediate revocation.
+	graceHours, ok := parseGraceHours(r.FormValue("grace_hours"))
+	if !ok {
+		addFlash(w, r, "error", "Grace period must be 0 (immediate), 1, 6, or 24 hours")
+		http.Redirect(w, r, "/admin/panel", http.StatusFound)
+		return
+	}
+	newKey, err := RotateAPIKey(uid, graceHours)
+	if err != nil {
+		slog.Error("rotate api key", "uid", uid, "grace_hours", graceHours, "err", err)
 		http.Error(w, "Internal server error", 500)
 		return
 	}
-	slog.Info("API key reset", "uid", uid)
+	slog.Info("API key rotated", "uid", uid, "grace_hours", graceHours)
+	if graceHours > 0 {
+		// The key page itself cannot carry this: it is the key's one-time
+		// plaintext and renders no flashes, so the note goes into the flash
+		// queue instead and surfaces on the panel the admin returns to. The
+		// key never does — a flash rides the session cookie until rendered,
+		// and the database holds only hashes.
+		expiresAt := time.Now().UTC().Add(time.Duration(graceHours) * time.Hour)
+		addFlash(w, r, "success", fmt.Sprintf(
+			"Key rotated for %s. The old key stays valid until %s UTC and can be revoked early.",
+			user.Name, expiresAt.Format("2006-01-02 15:04")))
+	}
 	writeAPIKeyPage(w, "API Key Reset", user.Name, newKey)
+}
+
+// parseGraceHours validates the rotation form's grace_hours field against the
+// fixed set the selector offers. 0 is a first-class value (immediate
+// revocation), not just the empty-field default: either way it means the old
+// key is dead the moment this handler returns.
+func parseGraceHours(raw string) (graceHours int, ok bool) {
+	if raw == "" {
+		return 0, true
+	}
+	graceHours, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, false
+	}
+	switch graceHours {
+	case 0, 1, 6, 24:
+		return graceHours, true
+	default:
+		return 0, false
+	}
 }
 
 func handleUpdateRateLimit(w http.ResponseWriter, r *http.Request) {
@@ -893,11 +1010,71 @@ func handleUpdateRateLimit(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin/panel", http.StatusFound)
 }
 
+// handleSetQuota sets a user's daily token quota (0 = unlimited). It mirrors
+// handleUpdateRateLimit: the same per-user POST shape, the same
+// flash-and-redirect on failure. Where rate limiting bounds speed
+// (requests/minute), quota bounds total consumption (tokens/day) — see the
+// header comment in quota.go for the split between the two.
+//
+// SetQuota keys the column by user *name* because that is what the request
+// path and the usage aggregates key by; the uid in the route exists only so
+// the form target matches the other per-user actions.
+//
+// Registered in setupRouter (main.go) as /admin/set-quota/{uid:[0-9]+} (POST).
+func handleSetQuota(w http.ResponseWriter, r *http.Request) {
+	if !isAdminSession(r) {
+		http.Redirect(w, r, "/", http.StatusFound)
+		return
+	}
+	uid := uidFromVars(r)
+	if !parseAdminForm(w, r, "/admin/panel") {
+		return
+	}
+	user, err := getUserByID(uid)
+	if err != nil || user == nil {
+		http.Error(w, "User not found", 404)
+		return
+	}
+	// The input on the page is deliberately blank rather than prefilled with
+	// the current quota: DashboardData carries no per-user quota (the User
+	// struct does not have one, and main.go owns the struct), and blank is
+	// the honest "unlimited" state. An explicit 0 means the same thing.
+	raw := strings.TrimSpace(r.FormValue("quota_tokens"))
+	if raw == "" {
+		raw = "0"
+	}
+	quota, err := strconv.Atoi(raw)
+	if err != nil || quota < 0 {
+		// A negative budget is nonsense (SetQuota rejects it too), and a
+		// non-integer one is a typo that clamping would launder into a real
+		// budget the admin never meant.
+		addFlash(w, r, "error", "Token quota must be a whole number of tokens; 0 means unlimited")
+		http.Redirect(w, r, "/admin/panel", http.StatusFound)
+		return
+	}
+	if err := SetQuota(user.Name, quota); err != nil {
+		slog.Error("set quota", "uid", uid, "user", user.Name, "err", err)
+		addFlash(w, r, "error", "Could not save the token quota — nothing was changed")
+		http.Redirect(w, r, "/admin/panel", http.StatusFound)
+		return
+	}
+	slog.Info("Token quota set", "uid", uid, "user", user.Name, "quota", quota)
+	if quota == 0 {
+		addFlash(w, r, "success", fmt.Sprintf("Token quota for %s cleared: unlimited.", user.Name))
+	} else {
+		addFlash(w, r, "success", fmt.Sprintf("Token quota for %s set to %d tokens/day.", user.Name, quota))
+	}
+	http.Redirect(w, r, "/admin/panel", http.StatusFound)
+}
+
 // ─────────────────────────────── Help ─────────────────────────────────────────
 
 func handleAdminHelp(w http.ResponseWriter, r *http.Request) {
 	if !isAdminSession(r) {
 		http.Redirect(w, r, "/", http.StatusFound)
+		return
+	}
+	if !requirePasswordChanged(w, r) {
 		return
 	}
 	renderPage(w, "help", HelpData{BaseData: newBaseData(w, r)})
@@ -908,6 +1085,9 @@ func handleAdminHelp(w http.ResponseWriter, r *http.Request) {
 func handleAdminLogs(w http.ResponseWriter, r *http.Request) {
 	if !isAdminSession(r) {
 		http.Redirect(w, r, "/", http.StatusFound)
+		return
+	}
+	if !requirePasswordChanged(w, r) {
 		return
 	}
 	search := strings.TrimSpace(r.URL.Query().Get("q"))
@@ -1287,3 +1467,6 @@ func jsonResponse(w http.ResponseWriter, status int, v interface{}) {
 		slog.Warn("json response encode", "status", status, "err", err)
 	}
 }
+
+// handleSetQuota is registered in setupRouter (main.go) as
+// /admin/set-quota/{uid:[0-9]+} (POST), alongside the other per-user actions.

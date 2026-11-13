@@ -135,6 +135,38 @@ func handleListModels(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, 200, list)
 }
 
+// ─────────────────────────────── API: whoami ─────────────────────────────────
+
+// whoamiResponse is the body of GET /v1/whoami. A typed struct rather than a
+// map so the wire shape is declared next to the handler that emits it.
+type whoamiResponse struct {
+	Name         string `json:"name"`
+	Status       string `json:"status"`
+	RateLimitRPM int    `json:"rate_limit_rpm"`
+	KeyCreatedAt string `json:"key_created_at"`
+}
+
+// handleWhoami reports the identity the caller authenticated as. It is the
+// programmatic counterpart of the admin panel's user list: a client that
+// wants to confirm which key it is presenting — and that its key is active —
+// can ask without reaching the admin UI. The auth middleware has already
+// validated the key; a nil user here means the middleware was bypassed (a
+// programming error), like the other /v1 handlers. It is a /v1/ route, so
+// rateLimitMiddleware covers it like the rest.
+func handleWhoami(w http.ResponseWriter, r *http.Request) {
+	user := userFromContext(r)
+	if user == nil {
+		jsonResponse(w, 401, openaiError("Invalid API key", "authentication_error"))
+		return
+	}
+	jsonResponse(w, 200, whoamiResponse{
+		Name:         user.Name,
+		Status:       user.Status,
+		RateLimitRPM: user.RateLimit,
+		KeyCreatedAt: user.CreatedAt,
+	})
+}
+
 // ─────────────────────────────── API: chat completions ────────────────────────
 
 func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -144,7 +176,17 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !checkRateLimit(w, user, writeOpenAIError) {
+	// The per-minute rate limit is enforced by rateLimitMiddleware upstream
+	// of this handler, so there is no inline check left here — one token is
+	// consumed per request, not one per layer.
+
+	// The daily token quota gates total consumption rather than speed, and
+	// checkQuota fails open on any error (a DB hiccup must not block all
+	// traffic), so it is safe on the request path. It sits with the other
+	// admission checks, before the body is read: an over-quota client costs
+	// no parsing.
+	if q := checkQuota(user.Name); q.quotaExceeded() {
+		jsonResponse(w, 429, openaiError("Daily token quota exceeded", "rate_limit_error"))
 		return
 	}
 	data, ok := decodeAPIBody(w, r, writeOpenAIError)
@@ -160,23 +202,71 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	messages := sanitizeMessages(rawMsgs)
 	model, _ := data["model"].(string)
 
-	adapter, release, ok := acquireEngine(w, r, model, writeOpenAIError)
-	if !ok {
+	// Failover routing: routeModelOrdered returns every engine that holds the
+	// model, primary first, and each engine's TryAcquire takes a concurrency
+	// slot — so a busy or down primary falls through to its failover targets
+	// instead of the client seeing a 503.
+	engines := routeModelOrdered(model)
+	if len(engines) == 0 {
+		// nil: nothing is configured, or no engine could be probed at all;
+		// empty: engines were probed and none holds the model. Either way no
+		// reachable engine serves it, so the client gets the same 404 it
+		// always got for a model the fleet does not have.
+		jsonResponse(w, 404, openaiError(
+			fmt.Sprintf("Model '%s' is not available on any configured engine", model),
+			"invalid_request_error"))
 		return
 	}
-	defer release()
 
-	engineReq := buildEngineRequest(adapter, data, messages)
+	var (
+		selected Engine
+		found    bool
+	)
+	for _, eng := range engines {
+		// Same backpressure bound as before failover: wait up to 250ms for a
+		// slot — long enough to absorb a momentary spike, short enough that
+		// clients see a clear backpressure signal. TryAcquire blocks until
+		// the context fires, so the timeout is what bounds the wait. With N
+		// fallback engines the worst-case wait accumulates to about N×250ms;
+		// acceptable for the small engine counts in practice.
+		acqCtx, acqCancel := context.WithTimeout(r.Context(), 250*time.Millisecond)
+		gotSlot := eng.TryAcquire(acqCtx)
+		acqCancel()
+		if gotSlot {
+			selected, found = eng, true
+			break
+		}
+		// Saturation per engine type, where the busy counter only shows that
+		// *some* engine of a type refused. Cardinality is bounded by the
+		// engine count.
+		metricUpstreamBusy.WithLabelValues(eng.Type()).Inc()
+	}
+	if !found {
+		// Every engine that holds the model is at its concurrency cap.
+		w.Header().Set("Retry-After", "2")
+		jsonResponse(w, 503, openaiError("Engine busy, please retry", "api_error"))
+		return
+	}
+	detailFromContext(r).setRouted(selected.Name(), selected.Type(), model)
+	// In-flight gauge per engine name; the deferred pair returns the slot and
+	// the gauge on every exit from this handler.
+	metricEngineInflight.WithLabelValues(selected.Name()).Inc()
+	defer func() {
+		metricEngineInflight.WithLabelValues(selected.Name()).Dec()
+		selected.Release()
+	}()
+
+	engineReq := buildEngineRequest(selected, data, messages)
 
 	if streaming, _ := data["stream"].(bool); streaming {
-		streamCompletion(w, r, adapter, engineReq, user.ID, model, messages)
+		streamCompletion(w, r, selected, engineReq, user.ID, model, messages)
 		return
 	}
 
 	// Non-streaming. Passing the request context means a client that hangs up
 	// cancels the upstream call, which releases the concurrency slot now
 	// instead of up to upstreamChatTimeout later.
-	result, err := adapter.Chat(r.Context(), engineReq)
+	result, err := selected.Chat(r.Context(), engineReq)
 	if err != nil {
 		// Client gone: nothing to write, and this is not an upstream fault —
 		// reporting it as a 502 would misattribute the failure in the metrics.
@@ -200,7 +290,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// that silently truncates the upstream response is worse than an untyped
 	// one.
 	var payload interface{} = result
-	if adapter.Type() == EngineOllama {
+	if selected.Type() == EngineOllama {
 		payload = ollamaToOpenAI(result)
 	}
 	recordCompletionDetail(r, payload)
@@ -223,7 +313,15 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, 401, "Invalid API key", "authentication_error")
 		return
 	}
-	if !checkRateLimit(w, user, writeAnthropicError) {
+	// The per-minute rate limit is enforced by rateLimitMiddleware, like for
+	// every other /v1/ route; one token per request, no inline check here.
+
+	// The daily token quota is enforced here too, not just in
+	// handleChatCompletions: checkQuota sums consumption from both the OpenAI
+	// and Anthropic completion paths, so a client that only calls /v1/messages
+	// would otherwise burn quota with no gate. Same fail-open semantics.
+	if q := checkQuota(user.Name); q.quotaExceeded() {
+		writeAnthropicError(w, 429, "Daily token quota exceeded", "rate_limit_error")
 		return
 	}
 	body, ok := decodeAPIBody(w, r, writeAnthropicError)
@@ -397,11 +495,9 @@ func handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, 401, "Invalid API key", "authentication_error")
 		return
 	}
-	// Rate limited like the completion endpoints: no engine is involved, but
-	// each call still decodes and re-encodes a body of up to 8× MaxMsgLen.
-	if !checkRateLimit(w, user, writeAnthropicError) {
-		return
-	}
+	// Rate limited like the completion endpoints by rateLimitMiddleware: no
+	// engine is involved, but each call still decodes and re-encodes a body
+	// of up to 8× MaxMsgLen.
 	body, ok := decodeAPIBody(w, r, writeAnthropicError)
 	if !ok {
 		return
@@ -424,17 +520,6 @@ func writeOpenAIError(w http.ResponseWriter, status int, message, errType string
 
 func writeAnthropicError(w http.ResponseWriter, status int, message, errType string) {
 	jsonResponse(w, status, anthropicError(status, message, errType))
-}
-
-// checkRateLimit applies the user's per-minute limit. It runs before the body
-// is read, so a client over its limit costs no parsing.
-func checkRateLimit(w http.ResponseWriter, user *User, writeErr apiErrorWriter) bool {
-	if !isAllowed(user.ID, user.RateLimit) {
-		metricRateLimited.Inc()
-		writeErr(w, 429, "Rate limit exceeded", "rate_limit_error")
-		return false
-	}
-	return true
 }
 
 // decodeAPIBody reads a bounded JSON object body.

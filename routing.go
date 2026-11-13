@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"log/slog"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,9 +18,14 @@ import (
 //
 // Routing is probe-derived: the index is built from what each engine reports
 // via ListModels, so no extra configuration is needed and a model pulled onto
-// any engine becomes routable as soon as the index refreshes. When two engines
-// serve the same model name the lowest engine ID wins, which keeps the choice
-// deterministic rather than dependent on map iteration order.
+// any engine becomes routable as soon as the index refreshes. When several
+// engines serve the same model name, the index stores an ordered list of them
+// — one entry per engine, in the order the engines were added to the settings
+// list. That order is the priority: the engine added first is the primary,
+// the rest are failover targets, and the handler walks the list trying each
+// engine until one succeeds (see routeModelOrdered). List order rather than
+// engine ID keeps the choice deterministic and lets the settings list alone
+// decide who serves a model first.
 
 // routeIndexTTL is deliberately longer than probeCacheTTL: the set of models an
 // engine holds changes only on an explicit pull or delete, both of which call
@@ -32,7 +36,10 @@ import (
 const routeIndexTTL = 60 * time.Second
 
 type routeIndex struct {
-	byModel map[string][]int // model name → engine IDs serving it, ascending
+	// byModel maps a model name to the IDs of the engines serving it, in
+	// engine insertion order (the settings-list order): the first ID is the
+	// primary, the rest are failover targets for it.
+	byModel map[string][]int
 	built   time.Time
 	// probed is true when at least one engine answered. An index that is
 	// empty because every engine is unreachable must not be read as "that
@@ -73,19 +80,32 @@ func storeRouteIndex(idx *routeIndex, gen uint64) {
 
 // buildRouteIndex probes every configured engine and assembles the index.
 // Callers must not hold probeCacheMu.
+//
+// The probes run in parallel, but the index is assembled in engine-list
+// order: each engine's model list is recorded by position, and the position
+// — not the completion time of its probe — decides where those models land.
+// The settings list is ordered by when the engines were added, so this makes
+// "added first" the priority: the first engine in the list is first in every
+// model's list and therefore primary, the rest are its failover targets.
 func buildRouteIndex(ctx context.Context) *routeIndex {
 	engines := cachedEngines()
 	idx := &routeIndex{byModel: make(map[string][]int), built: time.Now()}
 
+	// modelsByPos[i] holds the models engines[i] reported, or nil when that
+	// engine has no adapter or answered down. A positional slice rather than
+	// a map keyed by ID: the slice carries the ordering in the probe results
+	// themselves, so the assembly pass below is a plain ordered walk.
+	modelsByPos := make([][]string, len(engines))
+
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	for _, e := range engines {
+	for pos, e := range engines {
 		adapter := cachedAdapter(e.ID)
 		if adapter == nil {
 			continue
 		}
 		wg.Add(1)
-		go func(id int, ad Engine) {
+		go func(pos, id int, ad Engine) {
 			defer wg.Done()
 			pd := probeEngineCached(id, ad)
 			if !pd.status {
@@ -93,11 +113,9 @@ func buildRouteIndex(ctx context.Context) *routeIndex {
 			}
 			mu.Lock()
 			idx.probed = true
-			for _, name := range pd.models {
-				idx.byModel[name] = append(idx.byModel[name], id)
-			}
+			modelsByPos[pos] = pd.models
 			mu.Unlock()
-		}(e.ID, adapter)
+		}(pos, e.ID, adapter)
 	}
 
 	done := make(chan struct{})
@@ -109,12 +127,39 @@ func buildRouteIndex(ctx context.Context) *routeIndex {
 		// and be picked up by the next rebuild.
 	}
 
+	// One lock at the end: the walk sees a consistent snapshot even if a
+	// probe cut off by ctx is still landing its result.
 	mu.Lock()
 	defer mu.Unlock()
-	for name := range idx.byModel {
-		sort.Ints(idx.byModel[name])
+	for pos, models := range modelsByPos {
+		if models == nil {
+			continue
+		}
+		id := engines[pos].ID
+		for _, name := range models {
+			if hasEngine(idx.byModel[name], id) {
+				// The same engine twice for one model — a duplicated entry in
+				// an upstream ListModels response. Keep only the first
+				// occurrence: a failover list offering the same engine twice
+				// would re-try an engine that already refused the request.
+				continue
+			}
+			idx.byModel[name] = append(idx.byModel[name], id)
+		}
 	}
 	return idx
+}
+
+// hasEngine reports whether id already appears in ids, so a model's engine
+// list never holds the same engine twice. Engine lists are short, so a
+// linear scan is plenty.
+func hasEngine(ids []int, id int) bool {
+	for _, existing := range ids {
+		if existing == id {
+			return true
+		}
+	}
+	return false
 }
 
 // rebuildRouteIndex builds a fresh index and publishes it, unless the index
@@ -199,12 +244,81 @@ const (
 	routeModelNotFound
 )
 
+// routeModelOrdered returns all engines that hold the requested model, in
+// priority order (insertion order). The handler iterates this list, trying
+// each engine until one succeeds. This enables failover: if the primary
+// engine is down or at its concurrency cap, the next engine with the same
+// model serves the request.
+//
+// Returns nil if no reachable engine reports the model (handler responds 404).
+// Returns an empty slice (not nil) if engines are configured but none
+// currently reports this model.
+func routeModelOrdered(modelName string) []Engine {
+	if len(cachedEngines()) == 0 {
+		// Nothing is configured, so there is no reachable engine that could
+		// report the model.
+		return nil
+	}
+	idx := currentRouteIndex()
+	engines := enginesForModel(idx, modelName)
+	if len(engines) > 0 {
+		return engines
+	}
+
+	// A miss against a stale index is not an answer yet: the model may have
+	// been pulled a moment ago, and invalidation marked rather than erased
+	// the index precisely so this path could re-check (same reasoning as
+	// selectEngine). A miss against a fresh index skips this entirely, so
+	// the common unknown-model request still costs nothing.
+	if time.Since(idx.built) > routeIndexTTL {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		idx = rebuildRouteIndex(ctx)
+		cancel()
+		if engines := enginesForModel(idx, modelName); len(engines) > 0 {
+			return engines
+		}
+	}
+
+	if !idx.probed {
+		// Every engine is unreachable: the index is empty for reasons that
+		// have nothing to do with the model name, so no reachable engine
+		// reports it — we cannot even confirm it is absent.
+		return nil
+	}
+	// At least one engine answered its probe and none of them holds the
+	// model: a definitive miss, which the handler maps to a 404.
+	return []Engine{}
+}
+
+// enginesForModel resolves a model's ordered engine-ID list from the index to
+// live adapters, preserving priority order and dropping IDs whose adapter no
+// longer exists (an engine deleted after the index was built). Returns nil
+// when the index has no list for the model.
+func enginesForModel(idx *routeIndex, modelName string) []Engine {
+	ids := idx.byModel[modelName]
+	if len(ids) == 0 {
+		return nil
+	}
+	engines := make([]Engine, 0, len(ids))
+	for _, id := range ids {
+		if a := cachedAdapter(id); a != nil {
+			engines = append(engines, a)
+		}
+	}
+	return engines
+}
+
 // selectEngine resolves the engine that should serve a completion for model.
 //
 // An unknown model is a 404 only when at least one engine answered its probe;
 // if every engine is unreachable the index is empty for reasons that have
 // nothing to do with the model name, so we fall back to the default engine and
 // let the upstream failure surface as a 502.
+//
+// This is the single-engine path, still used by the Anthropic routes
+// (handleMessages / handleCountTokens via acquireEngine). The OpenAI chat
+// route (handleChatCompletions) uses routeModelOrdered instead, so a busy or
+// down primary can fall through to the next engine holding the model.
 func selectEngine(model string) (Engine, routeErr) {
 	if len(cachedEngines()) == 0 {
 		return nil, routeNoEngines

@@ -80,6 +80,13 @@ type Config struct {
 	// behaviour: random keys, every session invalidated on restart — which
 	// is the safer default, since a forgotten key is also an unrotated one.
 	SessionKey string
+
+	// TrustedProxies, when non-empty, bounds which hops may assert a caller's
+	// identity through X-Forwarded-For: clientIP then walks the chain from
+	// the closest hop outward and returns the first entry not in this set.
+	// Empty keeps the legacy behaviour (first XFF entry wins). Log accuracy
+	// only — clientIP is never an authorization input.
+	TrustedProxies []string
 }
 
 var cfg Config
@@ -104,6 +111,18 @@ func getEnvInt(key string, fallback int) int {
 
 // loadConfig loads the application configuration from environment variables
 func loadConfig() Config {
+	// TRUSTED_PROXIES is a comma-separated list of CIDRs or IPs. Split and
+	// trim here, once, at load: the point of use (clientIP) is on the
+	// request path, and a raw env value is exactly what should be normalised
+	// before it is consulted.
+	var trustedProxies []string
+	if raw := getEnv("TRUSTED_PROXIES", ""); raw != "" {
+		for _, p := range strings.Split(raw, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				trustedProxies = append(trustedProxies, p)
+			}
+		}
+	}
 	c := Config{
 		DBPath:              getEnv("GW42_DB_PATH", "./db/gateway.db"),
 		AdminPassword:       getEnv("ADMIN_PASSWORD", ""),
@@ -119,6 +138,7 @@ func loadConfig() Config {
 		LogRetentionDays:    getEnvInt("GW42_LOG_RETENTION_DAYS", 30),
 		MetricsToken:        getEnv("GW42_METRICS_TOKEN", ""),
 		SessionKey:          getEnv("GW42_SESSION_KEY", ""),
+		TrustedProxies:      trustedProxies,
 	}
 	return c
 }
@@ -133,6 +153,11 @@ type User struct {
 	Status    string
 	RateLimit int
 	CreatedAt string
+	// KeyExpiresAt is the rotation grace-period deadline for the current key
+	// (RFC3339 UTC, "" = no expiry). auth.go/db.go check it on every lookup
+	// via keyIsExpired, so it has to reach the handlers in the struct, not
+	// just be scanned into a throwaway row.
+	KeyExpiresAt string
 }
 
 // LogRow represents a log entry for system logs
@@ -224,6 +249,11 @@ type DashboardData struct {
 	EngineURLs   map[string]string   // engineID → "host:port"
 	EngineStatus map[string]bool     // engineID → reachable
 	EngineModels map[string][]string // engineID → model names
+	// QuotaRows feeds the token-quota panel: one row per user with a positive
+	// daily token quota. It is nil — not an empty slice — for a fleet with no
+	// quotas set, which is what the template's {{if .QuotaRows}} tests to hide
+	// the whole panel. Populated by buildQuotaRows in the admin handler.
+	QuotaRows []QuotaRow
 	// Usage is nil when the aggregate could not be read. The rest of the page
 	// still renders: a usage query failing should not blank a dashboard whose
 	// only other job is telling the operator whether engines are up.
@@ -356,6 +386,44 @@ func (m *multiSlogHandler) WithAttrs(a []slog.Attr) slog.Handler {
 }
 func (m *multiSlogHandler) WithGroup(name string) slog.Handler {
 	return &multiSlogHandler{m.a.WithGroup(name), m.b.WithGroup(name)}
+}
+
+// slogRequestIDKey is the context key requestLoggingMiddleware stores the
+// request id under, so every log line emitted with that context — engine
+// calls, stream failures, quota warnings — carries the same id the client
+// sees in X-Request-ID and the request_logs row stores.
+type slogRequestIDKey struct{}
+
+// requestIDHandler appends request_id to every record whose context carries
+// one, then delegates to the wrapped handler.
+//
+// A context-driven wrapper rather than threading the id into each slog call:
+// the log sites in the request path are open (any handler or helper can log
+// mid-request), so naming them one by one would miss the next one added,
+// while the handler sees the context either way. The record is only touched
+// when the context actually carries an id, so log lines outside the request
+// path — startup, background tasks — are byte-identical to before.
+type requestIDHandler struct {
+	inner slog.Handler
+}
+
+func (h *requestIDHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.inner.Enabled(ctx, level)
+}
+
+func (h *requestIDHandler) Handle(ctx context.Context, r slog.Record) error {
+	if id, ok := ctx.Value(slogRequestIDKey{}).(string); ok && id != "" {
+		r.AddAttrs(slog.String("request_id", id))
+	}
+	return h.inner.Handle(ctx, r)
+}
+
+func (h *requestIDHandler) WithAttrs(a []slog.Attr) slog.Handler {
+	return &requestIDHandler{inner: h.inner.WithAttrs(a)}
+}
+
+func (h *requestIDHandler) WithGroup(name string) slog.Handler {
+	return &requestIDHandler{inner: h.inner.WithGroup(name)}
 }
 
 // parseLogLevel maps LOG_LEVEL onto a slog level. WARNING is accepted
@@ -568,6 +636,19 @@ func startBackgroundTasks() {
 			}
 		}()
 	}
+
+	// SQLite maintenance: PRAGMA optimize on every run, VACUUM only when the
+	// freelist has grown past its threshold. Once shortly after startup —
+	// cheap, since VACUUM is conditional and a file left bloated by churn
+	// should shrink without waiting a day — then on the 24h ticker.
+	go func() {
+		runSQLiteMaintenance()
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			runSQLiteMaintenance()
+		}
+	}()
 }
 
 // runLogPrune executes one retention sweep and logs the outcome. Failure is
@@ -741,6 +822,50 @@ func apiAuthMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// rateLimitMiddleware enforces the caller's per-minute limit for every /v1/*
+// route, so a client over its limit is turned away before it reaches a
+// handler — including /v1/models, which previously had no inline check and
+// was the one /v1 endpoint a client could hammer for free.
+//
+// It sits after apiAuthMiddleware in the chain and reads the user from the
+// context that middleware installed: there is nothing to rate-limit when the
+// user is absent, because auth has already answered (a /v1/ request without
+// a valid key never passes apiAuthMiddleware). The error envelope follows
+// the path exactly as apiAuthMiddleware picks its writer: Anthropic clients
+// read error.type to decide how to react.
+//
+// No Retry-After header: the token bucket refills gradually across the
+// minute rather than resetting at a known instant, so any single value
+// would be a guess. A client that backs off briefly will find room; telling
+// it a specific time it cannot be true would be worse.
+func rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/v1/") || r.Method == http.MethodOptions {
+			next.ServeHTTP(w, r)
+			return
+		}
+		user := userFromContext(r)
+		if user == nil {
+			// Auth already rejected this request (or the path is not one it
+			// guards); there is no identity to limit.
+			next.ServeHTTP(w, r)
+			return
+		}
+		writeErr := apiErrorWriter(writeOpenAIError)
+		if strings.HasPrefix(r.URL.Path, "/v1/messages") {
+			writeErr = writeAnthropicError
+		}
+		if !defaultLimiter.Allow(user.ID, user.RateLimit) {
+			// Same counter the inline checks fed before the middleware took
+			// over, so /metrics does not show a gap in the move.
+			metricRateLimited.Inc()
+			writeErr(w, http.StatusTooManyRequests, "Rate limit exceeded", "rate_limit_error")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // apiKeyFromRequest extracts the caller's Gateway42 API key, or "" if none.
 //
 // OpenAI SDKs send "Authorization: Bearer <key>". Anthropic SDKs — and so
@@ -773,6 +898,10 @@ func requestLoggingMiddleware(next http.Handler) http.Handler {
 		// The client sees the same id the audit row stores, so an error it
 		// displays traces to exactly one row: search the id on the Logs page.
 		w.Header().Set("X-Request-ID", detail.id)
+		// Same id into the log context: app-log lines emitted with this
+		// request's context pick it up via requestIDHandler, so a line and
+		// the audit row it belongs to share one join key.
+		r = r.WithContext(context.WithValue(r.Context(), slogRequestIDKey{}, detail.id))
 
 		rec := ensureRecorder(w)
 
@@ -803,18 +932,64 @@ func requestLoggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// clientIP extracts the caller's address for logging. X-Forwarded-For wins when
-// present, so a reverse-proxied deployment logs the real client rather than the
-// proxy — which also means it is spoofable when Gateway42 is exposed directly.
-// Treat the value as log metadata only, never as an authorization input.
+// clientIP extracts the caller's address for logging. It is log metadata
+// only, never an authorization input.
+//
+// With no trusted proxies configured the first X-Forwarded-For entry wins,
+// which is the client's own claim and spoofable when Gateway42 is exposed
+// directly. With a trusted set (TRUSTED_PROXIES) the chain is walked from
+// the closest hop toward the client — the rightmost entry is what the
+// connection's peer recorded, so it is the first to be believed — and the
+// first entry not covered by the set is the real client. Entries appended by
+// a trusted proxy are believed; entries from anything outside the set are
+// not, and a middle hop cannot launder a spoofed left-side entry by
+// appending itself on the right.
 func clientIP(r *http.Request) string {
 	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
-		return strings.TrimSpace(strings.SplitN(forwarded, ",", 2)[0])
+		entries := strings.Split(forwarded, ",")
+		if len(cfg.TrustedProxies) == 0 {
+			// Legacy behaviour: trust the first entry as-is.
+			return strings.TrimSpace(entries[0])
+		}
+		// Right to left as the chain was built. An entry that does not parse
+		// cannot be shown to be a trusted proxy, so it stands as the client
+		// (garbage in the header shows up as garbage in the log, which is
+		// how a tampering attempt becomes visible).
+		for i := len(entries) - 1; i >= 0; i-- {
+			entry := strings.TrimSpace(entries[i])
+			if entry == "" {
+				continue
+			}
+			if ip := net.ParseIP(entry); ip == nil || !ipInTrustedProxies(ip, cfg.TrustedProxies) {
+				return entry
+			}
+		}
+		// Every entry is a trusted proxy, so the chain adds nothing beyond
+		// what the socket knows.
 	}
 	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
 		return host
 	}
 	return r.RemoteAddr
+}
+
+// ipInTrustedProxies reports whether ip is covered by the trusted set: an
+// entry matches when it is the same IP or a CIDR whose network contains ip.
+// Entries that are neither a parseable IP nor a CIDR match nothing — a typo
+// in TRUSTED_PROXIES must not widen the trusted set.
+func ipInTrustedProxies(ip net.IP, proxies []string) bool {
+	for _, p := range proxies {
+		if e := net.ParseIP(p); e != nil {
+			if ip.Equal(e) {
+				return true
+			}
+			continue
+		}
+		if _, network, err := net.ParseCIDR(p); err == nil && network.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // ─────────────────────────────── Router ───────────────────────────────────────
@@ -867,6 +1042,7 @@ func setupRouter() *mux.Router {
 	r.HandleFunc("/admin/reset-system", handleResetSystem).Methods("POST")
 	r.HandleFunc("/admin/reset/{uid:[0-9]+}", handleAdminResetKey).Methods("POST")
 	r.HandleFunc("/admin/update-rate-limit/{uid:[0-9]+}", handleUpdateRateLimit).Methods("POST")
+	r.HandleFunc("/admin/set-quota/{uid:[0-9]+}", handleSetQuota).Methods("POST")
 
 	r.HandleFunc("/register", handleRegister).Methods("POST")
 	r.HandleFunc("/toggle/{uid:[0-9]+}", handleToggle).Methods("POST")
@@ -877,6 +1053,7 @@ func setupRouter() *mux.Router {
 
 	// OpenAI-compatible API
 	r.HandleFunc("/v1/models", handleListModels).Methods("GET")
+	r.HandleFunc("/v1/whoami", handleWhoami).Methods("GET")
 	r.HandleFunc("/v1/chat/completions", handleChatCompletions).Methods("POST")
 
 	// Anthropic Messages API (Claude Code, Anthropic SDKs)
@@ -922,14 +1099,17 @@ func corsMiddleware(next http.Handler) http.Handler {
 // label counts fixed at compile time, so the exposure is small and the process
 // still survives; keep it that way.
 //
-// Below those: cors, then auth (so logging can read the user from context), then
-// CSRF (which must reject before any handler mutates state), then logging.
+// Below those: cors, then auth (so logging can read the user from context),
+// then rate limiting (which needs the same user from context to know whose
+// bucket to draw from), then CSRF (which must reject before any handler
+// mutates state), then logging.
 func middlewareChain() []mux.MiddlewareFunc {
 	return []mux.MiddlewareFunc{
 		metricsMiddleware,
 		recoveryMiddleware,
 		corsMiddleware,
 		apiAuthMiddleware,
+		rateLimitMiddleware,
 		csrfMiddleware,
 		requestLoggingMiddleware,
 	}
@@ -1007,7 +1187,9 @@ func main() {
 
 	textH := slog.NewTextHandler(logOut, &slog.HandlerOptions{Level: logLevel})
 	bufH := &bufSlogHandler{buf: syslogBuf, level: logLevel}
-	slog.SetDefault(slog.New(&multiSlogHandler{a: textH, b: bufH}))
+	// The request-id wrapper is outermost so every log line — text and
+	// buffer alike — joins to its audit row by the same key.
+	slog.SetDefault(slog.New(&requestIDHandler{inner: &multiSlogHandler{a: textH, b: bufH}}))
 
 	// Reported only now, once there is a logger to report through.
 	if !levelOK {

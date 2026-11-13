@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"sync"
@@ -52,6 +53,112 @@ func generateAPIKey() string {
 	b := make([]byte, 20)
 	rand.Read(b)
 	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// ── API key rotation ──────────────────────────────────────────────────────────
+
+// keyIsExpired checks whether a user's API key is past its grace-period
+// expiry. An empty key_expires_at means the key has no expiry (normal case).
+// A non-empty value is an RFC 3339 timestamp; if now is past it, the key
+// is dead even if the row still exists.
+func keyIsExpired(expiresAt string) bool {
+	if expiresAt == "" {
+		return false
+	}
+	t, err := time.Parse(time.RFC3339, expiresAt)
+	if err != nil {
+		// Unparseable timestamp: treat as expired (fail closed).
+		return true
+	}
+	return time.Now().After(t)
+}
+
+// RotateAPIKey generates a new key for the user and keeps the old one alive
+// for a grace period, so a client mid-deployment has time to pick up the new
+// key. The old key's hash is stored in api_key_rotations (db.go) with an
+// expiry; getUserByAPIKey falls back to that table on a current-key miss,
+// which is what makes the old key work during the window.
+//
+// With graceHours == 0 the old key is revoked immediately: the rotation row
+// is written already expired, so it never matches.
+//
+// The returned key is the new plaintext key — shown to the admin once and
+// never stored (only its SHA-256 hash is, via sha256Hex, the same hashing
+// used when keys are first created).
+func RotateAPIKey(userID int, graceHours int) (newKey string, err error) {
+	// Get the current key hash to store in the rotations table.
+	var oldHash string
+	if err = dbRead.QueryRow("SELECT api_key FROM users WHERE id = ?", userID).Scan(&oldHash); err != nil {
+		return "", err
+	}
+
+	newPlain := generateAPIKey()
+	newHash := sha256Hex(newPlain)
+	now := time.Now().UTC()
+
+	// Atomic: the rotation row and the key swap must stand or fall together.
+	// A crash between the two would leave either the old key valid with no
+	// grace record (harmless) or the new key live while the old hash had no
+	// row to explain it (also harmless, but messier to reason about).
+	tx, err := db.Begin()
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+
+	// Store the old key with its expiry. An already-past timestamp means
+	// "no grace": the row is inert from the moment it is written.
+	var expiresAt string
+	if graceHours > 0 {
+		expiresAt = now.Add(time.Duration(graceHours) * time.Hour).Format(time.RFC3339)
+	} else {
+		expiresAt = now.Format(time.RFC3339)
+	}
+	if _, err = tx.Exec(
+		"INSERT INTO api_key_rotations (user_id, key_hash, expires_at, created_at) VALUES (?, ?, ?, ?)",
+		userID, oldHash, expiresAt, now.Format(time.RFC3339),
+	); err != nil {
+		return "", err
+	}
+
+	// Update the user's current key. key_expires_at is reset to '' as well:
+	// a fresh key must not inherit a stale expiry (e.g. one left behind by
+	// RevokeOldKey), which would reject the brand-new key on first use.
+	if _, err = tx.Exec(
+		"UPDATE users SET api_key = ?, key_expires_at = '' WHERE id = ?",
+		newHash, userID,
+	); err != nil {
+		return "", err
+	}
+
+	// Clean up expired rotations (housekeeping).
+	_, _ = tx.Exec("DELETE FROM api_key_rotations WHERE expires_at < ?", now.Format(time.RFC3339))
+
+	if err = tx.Commit(); err != nil {
+		return "", err
+	}
+
+	// Drop cached lookups for this user: an entry cached under the old hash
+	// would otherwise outlive the grace window and keep a revoked key valid.
+	invalidateUserCache(userID)
+
+	return newPlain, nil
+}
+
+// RevokeOldKey immediately expires the user's key (sets key_expires_at to
+// now), cutting short any rotation grace period. Because keyIsExpired is
+// checked on both the current-key path and the rotation path in
+// getUserByAPIKey, this stops old in-grace keys at once; it also rejects the
+// current key until a rotation installs a fresh one (RotateAPIKey resets
+// key_expires_at).
+func RevokeOldKey(userID int) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := db.Exec("UPDATE users SET key_expires_at = ? WHERE id = ?", now, userID)
+	if err == nil {
+		// Take effect on the next request, not after the cache TTL.
+		invalidateUserCache(userID)
+	}
+	return err
 }
 
 // ── Admin login throttle ──────────────────────────────────────────────────────
@@ -148,6 +255,43 @@ func (g *loginGuard) succeeded() {
 	g.failures = 0
 	g.lockout = 0
 	g.blockedUntil = time.Time{}
+}
+
+// ── Admin default-password flag ───────────────────────────────────────────────
+
+const defaultAdminPassword = "admin123"
+
+// isDefaultPassword reports whether the stored admin hash corresponds to the
+// well-known default. Used at login to decide whether to set the
+// must_change_password flag.
+func isDefaultPassword(password string) bool {
+	return password == defaultAdminPassword
+}
+
+// MustChangePassword returns true if the admin account still has the default
+// password and hasn't changed it yet. The flag is set to 1 when the admin
+// logs in with the default password ("admin123") or when ADMIN_PASSWORD is
+// unset and the stored hash matches the default.
+func mustChangePassword() bool {
+	var flag int
+	row := dbRead.QueryRow("SELECT must_change_password FROM admin_user WHERE id = 1")
+	if err := row.Scan(&flag); err != nil {
+		return false
+	}
+	return flag == 1
+}
+
+// SetMustChangePassword updates the flag. Called on login (set to 1 if default
+// password was used) and on successful password change (set to 0).
+func SetMustChangePassword(mustChange bool) {
+	val := 0
+	if mustChange {
+		val = 1
+	}
+	_, err := db.Exec("UPDATE admin_user SET must_change_password = ? WHERE id = 1", val)
+	if err != nil {
+		slog.Error("set must_change_password", "err", err)
+	}
 }
 
 func validateName(name string) bool {
