@@ -372,6 +372,7 @@ func adminPanel(t *testing.T, target string) *httptest.ResponseRecorder {
 }
 
 func TestAdminPanelShowsTokenUsage(t *testing.T) {
+	initTemplates()
 	withTestDB(t)
 	withSessionStore(t)
 
@@ -414,6 +415,7 @@ func TestAdminPanelShowsTokenUsage(t *testing.T) {
 }
 
 func TestAdminPanelUsageWindowFallsBackToTheDefault(t *testing.T) {
+	initTemplates()
 	withTestDB(t)
 	withSessionStore(t)
 
@@ -433,6 +435,7 @@ func TestAdminPanelUsageWindowFallsBackToTheDefault(t *testing.T) {
 }
 
 func TestAdminPanelUsageEmptyWindow(t *testing.T) {
+	initTemplates()
 	withTestDB(t)
 	withSessionStore(t)
 
