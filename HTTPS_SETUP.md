@@ -8,7 +8,7 @@ This guide configures trusted HTTPS for gateway42 using two components:
 Gateway42 itself keeps running on HTTP port 7000 (localhost only, unchanged). Caddy sits in front and handles all TLS.
 
 ```
-Client → HTTPS :8443 → Caddy (TLS termination) → HTTP :7000 → gateway42 → Ollama :11434
+Client → HTTPS :8443 → Caddy (TLS termination) → HTTP :7000 → gateway42 → oMLX :8000
 ```
 
 > **Why port 8443 and not 443?** macOS does not allow non-root processes to bind to ports below 1024. Port 8443 is the standard HTTPS alternative and requires no special permissions. If you need the standard port 443, see [Using Port 443](#using-port-443-optional) at the end of this guide.

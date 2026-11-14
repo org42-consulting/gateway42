@@ -10,8 +10,8 @@ import (
 
 // Model-aware engine routing.
 //
-// Before this, every completion went to the first Ollama engine (or the first
-// engine of any type), and the request's "model" field was read only for the
+// Before this, every completion went to the first engine of the preferred
+// type (or the first engine of any type), and the request's "model" field was read only for the
 // audit log. Multiple engines could be registered and listed but only one was
 // ever reachable, so asking for a model held by the second engine produced a
 // confusing "model not found" from the *first* one.
@@ -225,8 +225,8 @@ func invalidateRouteIndex() {
 // defaultEngine is the pre-routing behaviour, kept for requests that name no
 // model and as the fallback when nothing has been successfully probed.
 func defaultEngine() Engine {
-	if ollamas := cachedAdaptersByType(EngineOllama); len(ollamas) > 0 {
-		return ollamas[0]
+	if omlx := cachedAdaptersByType(EngineOMLX); len(omlx) > 0 {
+		return omlx[0]
 	}
 	if engines := cachedEngines(); len(engines) > 0 {
 		return cachedAdapter(engines[0].ID)

@@ -1,10 +1,9 @@
 package main
 
-// Remote images for Ollama. Ollama's /api/chat takes images only as base64,
-// so an image given by URL — OpenAI's image_url with an http(s) address, or an
-// Anthropic image with a "url" source — used to be dropped on the way to it.
-// The gateway now fetches such an image and inlines it, the way the OpenAI and
-// Anthropic APIs fetch it themselves.
+// Remote images for oMLX. oMLX takes images only as data: URIs and rejects an
+// image given by URL — OpenAI's image_url with an http(s) address, or an
+// Anthropic image with a "url" source. The gateway fetches such an image and
+// inlines it, the way the OpenAI and Anthropic APIs fetch it themselves.
 //
 // Fetching a URL a client chose is a server-side request forgery risk: without
 // care, a caller could make the gateway read an address only it can reach (a
@@ -13,8 +12,8 @@ package main
 // loopback, private, link-local, CGNAT, multicast, unspecified — so a hostname
 // that resolves (or re-resolves, mid-redirect) to one is refused too. It also
 // bounds time and size, and accepts only image content types.
-// GW42_FETCH_IMAGE_URLS=false turns fetching off; URL images are then dropped
-// for Ollama as before.
+// GW42_FETCH_IMAGE_URLS=false turns fetching off; URL images then reach oMLX
+// as they are, and it rejects them.
 
 import (
 	"context"

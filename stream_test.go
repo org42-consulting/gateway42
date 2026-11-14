@@ -17,16 +17,6 @@ type nopCloser struct{ io.Reader }
 
 func (nopCloser) Close() error { return nil }
 
-func newOllamaTestStream(body string) *ollamaStream {
-	r := nopCloser{strings.NewReader(body)}
-	return &ollamaStream{
-		body:         r,
-		scanner:      newStreamScanner(r),
-		completionID: "chatcmpl-test",
-		isFirst:      true,
-	}
-}
-
 // drain collects every payload a stream yields, plus the terminating error.
 // The audit text each Recv carries alongside is checked separately, in
 // TestRecvCarriesAuditText.
@@ -46,86 +36,6 @@ func drain(t *testing.T, s ChatStream) []map[string]interface{} {
 			t.Fatalf("payload is not JSON: %v (%q)", err, payload)
 		}
 		out = append(out, m)
-	}
-}
-
-// delta pulls choices[0].delta out of a chunk.
-func delta(t *testing.T, chunk map[string]interface{}) map[string]interface{} {
-	t.Helper()
-	choices, ok := chunk["choices"].([]interface{})
-	if !ok || len(choices) == 0 {
-		t.Fatalf("chunk has no choices: %v", chunk)
-	}
-	c, _ := choices[0].(map[string]interface{})
-	d, _ := c["delta"].(map[string]interface{})
-	return d
-}
-
-func TestOllamaStreamTranslatesToOpenAIChunks(t *testing.T) {
-	s := newOllamaTestStream(`{"model":"llama3","message":{"role":"assistant","content":"Hel"},"done":false}
-{"model":"llama3","message":{"role":"assistant","content":"lo"},"done":false}
-{"model":"llama3","message":{"role":"assistant","content":""},"done":true,"prompt_eval_count":7,"eval_count":2}
-`)
-	chunks := drain(t, s)
-
-	if len(chunks) != 3 {
-		t.Fatalf("got %d chunks, want 3", len(chunks))
-	}
-
-	// Only the first delta carries the role: OpenAI clients accumulate content
-	// and would otherwise see the role repeated on every token.
-	if role, _ := delta(t, chunks[0])["role"].(string); role != "assistant" {
-		t.Errorf("first chunk role = %q, want \"assistant\"", role)
-	}
-	if _, present := delta(t, chunks[1])["role"]; present {
-		t.Error("second chunk should not repeat the role")
-	}
-
-	var text strings.Builder
-	for _, c := range chunks {
-		if s, _ := delta(t, c)["content"].(string); s != "" {
-			text.WriteString(s)
-		}
-	}
-	if text.String() != "Hello" {
-		t.Errorf("reassembled content = %q, want \"Hello\"", text.String())
-	}
-
-	// The final Ollama object carries done:true *and* the token counts, so the
-	// translator must emit it rather than treating done as end-of-stream.
-	last := chunks[2]
-	usage, ok := last["usage"].(map[string]interface{})
-	if !ok {
-		t.Fatalf("final chunk has no usage: %v", last)
-	}
-	if total, _ := usage["total_tokens"].(float64); total != 9 {
-		t.Errorf("total_tokens = %v, want 9", total)
-	}
-	choices, _ := last["choices"].([]interface{})
-	c0, _ := choices[0].(map[string]interface{})
-	if fr, _ := c0["finish_reason"].(string); fr != "stop" {
-		t.Errorf("finish_reason = %q, want \"stop\"", fr)
-	}
-}
-
-func TestOllamaStreamStopsAfterDone(t *testing.T) {
-	// Anything after done:true is upstream noise and must not reach the client.
-	s := newOllamaTestStream(`{"model":"llama3","message":{"content":"hi"},"done":true}
-{"model":"llama3","message":{"content":"LEAKED"},"done":false}
-`)
-	if n := len(drain(t, s)); n != 1 {
-		t.Errorf("got %d chunks, want 1 — content after done: leaked through", n)
-	}
-}
-
-func TestOllamaStreamSkipsMalformedLines(t *testing.T) {
-	// A single bad line should not truncate an otherwise healthy completion.
-	s := newOllamaTestStream(`{"model":"llama3","message":{"content":"a"},"done":false}
-not json at all
-{"model":"llama3","message":{"content":"b"},"done":true}
-`)
-	if n := len(drain(t, s)); n != 2 {
-		t.Errorf("got %d chunks, want 2", n)
 	}
 }
 
@@ -174,41 +84,8 @@ func TestPassthroughStreamStopsAtDone(t *testing.T) {
 }
 
 // Recv hands the handler the frame metadata alongside the payload, extracted
-// in the same pass that shaped it. These pin both extraction paths:
-// ollamaStream reads its typed chunk, passthroughStream parses the frame once.
+// in the same pass that read it: passthroughStream parses each frame once.
 func TestRecvCarriesAuditText(t *testing.T) {
-	ollama := newOllamaTestStream(`{"model":"llama3","message":{"role":"assistant","content":"Hel"},"done":false}
-{"model":"llama3","message":{"content":"lo"},"done":false}
-{"model":"llama3","message":{"content":""},"eval_count":7,"prompt_eval_count":3,"done":true}
-`)
-	var text strings.Builder
-	var last chunkMeta
-	for {
-		_, meta, err := ollama.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatalf("Recv: %v", err)
-		}
-		text.WriteString(meta.auditText)
-		last = meta
-	}
-	if text.String() != "Hello" {
-		t.Errorf("ollama audit text = %q, want \"Hello\"", text.String())
-	}
-	// The terminal chunk carries the finish reason and Ollama's eval counts,
-	// which the request log stores as stop_reason and token usage.
-	if last.finish != "stop" {
-		t.Errorf("ollama finish = %q, want \"stop\"", last.finish)
-	}
-	if last.model != "llama3" {
-		t.Errorf("ollama model = %q, want \"llama3\"", last.model)
-	}
-	if last.inTokens != 3 || last.outTokens != 7 {
-		t.Errorf("ollama usage = %d/%d, want 3/7", last.inTokens, last.outTokens)
-	}
-
 	passthrough := newPassthroughTestStream(`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Tokyo\"}"}}]}}]}
 
 data: [DONE]

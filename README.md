@@ -2,7 +2,7 @@
 
 **Authenticated, audited, rate-limited API gateway for local and remote LLMs. On-prem. Privacy-first.**
 
-Gateway42. sits between your users and your AI inference backends, exposing an **OpenAI-compatible API** while adding authentication, per-user rate limiting, and full request logging. It supports both local [Ollama](https://ollama.com) instances and any remote **OpenAI-compatible endpoint** — LM Studio, oMLX, or the real OpenAI API. Any client or library built for the OpenAI API works with Gateway42. without code changes — just swap the base URL and API key.
+Gateway42. sits between your users and your AI inference backends, exposing an **OpenAI-compatible API** while adding authentication, per-user rate limiting, and full request logging. Its first-class engine is [oMLX](https://github.com/jundot/omlx) on Apple silicon — inference, plus model management and backend MCP tools from the admin UI — and it also serves any **OpenAI-compatible endpoint**: vLLM, LM Studio, llama.cpp, or the real OpenAI API. Any client or library built for the OpenAI API works with Gateway42. without code changes — just swap the base URL and API key.
 
 <img width="1555" height="906" alt="Image" src="https://github.com/user-attachments/assets/370260c3-4222-4f07-a983-c4e7bdf73713" />
 
@@ -24,8 +24,8 @@ Gateway42. sits between your users and your AI inference backends, exposing an *
 ```mermaid
 flowchart LR
     subgraph Backends["Inference Backends"]
-        OLLAMA["Ollama\n127.0.0.1:11434"]
-        OPENAI["OpenAI-compatible\ne.g. oMLX, LM Studio"]
+        OMLX["oMLX\n127.0.0.1:8000"]
+        OPENAI["OpenAI-compatible\ne.g. vLLM, LM Studio"]
     end
 
     GATEWAY["Gateway42\nPort 7000\nAuth · Logs · Rate Limit"]
@@ -38,11 +38,11 @@ flowchart LR
     end
 
     USERS & SCRIPTS & AGENTS & CHAT -->|HTTP| GATEWAY
-    GATEWAY -->|OllamaAdapter| OLLAMA
-    GATEWAY -->|OpenAICompatAdapter| OPENAI
+    GATEWAY -->|OpenAI API + oMLX admin API| OMLX
+    GATEWAY -->|OpenAI API| OPENAI
 ```
 
-You can run Gateway42. on the same machine as Ollama, with Ollama listening only on `127.0.0.1:11434` and never exposed over the LAN. Or point it at a remote OpenAI-compatible endpoint. Either way, all external access goes through the gateway.
+You can run Gateway42. on the same machine as oMLX, with oMLX listening only on `127.0.0.1:8000` and never exposed over the LAN. Or point it at a remote OpenAI-compatible endpoint. Either way, all external access goes through the gateway.
 
 ### Request pipeline
 
@@ -83,11 +83,11 @@ which stacked three recorders per request and left only the innermost seeing the
 
 ## What Gateway42. adds
 
-| Capability              | Ollama  | Gateway42 |
-| ----------------------- | ------- | --------- |
-| LAN API                 | No      | Yes       |
-| OpenAI-compatible API   | No      | Yes       |
-| Multiple engine backends| No      | Yes       |
+| Capability              | A bare local engine | Gateway42 |
+| ----------------------- | ------------------- | --------- |
+| Per-user LAN API        | No                  | Yes       |
+| Anthropic Messages API  | Varies              | Yes       |
+| Multiple engine backends| No                  | Yes       |
 | Model-aware routing     | No      | Yes       |
 | API key auth            | No      | Yes       |
 | Per-user isolation      | No      | Yes       |
@@ -117,7 +117,7 @@ which stacked three recorders per request and left only the innermost seeing the
 **Prerequisites:**
 
 - Go 1.25 or newer (see `go.mod`)
-- At least one inference backend: [Ollama](https://ollama.com/download) running locally, or an OpenAI-compatible endpoint
+- At least one inference backend: [oMLX](https://github.com/jundot/omlx) running locally (`brew install omlx`), or an OpenAI-compatible endpoint
 
 No C toolchain is needed. Gateway42. uses a pure-Go SQLite driver (`modernc.org/sqlite`), so it
 builds and runs without cgo — which also means `go test -race` works out of the box.
@@ -134,7 +134,7 @@ open http://localhost:7000
 > Default admin password is `admin123`. Change it after first login via the admin UI — logging in
 > with the default locks the rest of the dashboard to the change-password form until you do.
 
-After logging in, go to **Settings** to add your first engine (Ollama or OpenAI-compatible) before making API calls.
+After logging in, go to **Settings** to add your first engine (oMLX or OpenAI-compatible) before making API calls.
 
 
 ## Installing Gateway42. as a service (launchd)
@@ -183,13 +183,33 @@ The service restarts automatically on crash. It stops cleanly on `stop`.
 
 Gateway42. manages multiple inference engines from the admin **Settings** page. Two engine types are supported:
 
-### Ollama
+### oMLX
 
-Point the gateway at a local (or LAN-accessible) Ollama instance. You need the host address and port (default: `11434`). The gateway talks to Ollama's native API and translates OpenAI-format requests automatically.
+Point the gateway at a local (or LAN-accessible) oMLX server, e.g. `http://127.0.0.1:8000`, and give
+it oMLX's **main** API key. Inference uses oMLX's OpenAI-compatible API, relayed without
+translation. On top of that the gateway uses oMLX's own API for:
+
+- **Model management** from the Settings page — search MLX models on Hugging Face and download them
+  with live progress, see which models are loaded, load and unload them, and delete their weights.
+  oMLX's admin routes accept only the main key, so a sub-key leaves management unavailable.
+- **Backend MCP tools** — see [Backend MCP tools](#backend-mcp-tools).
+- **Exact token counts** for `/v1/messages/count_tokens`, and the context window of each model in
+  `/v1/models` (`max_model_len`).
+- **Image URLs**, which oMLX does not fetch itself, inlined by the gateway (see `GW42_FETCH_IMAGE_URLS`).
 
 ### OpenAI-compatible
 
-Any endpoint that speaks the OpenAI API format — oMLX, LM Studio, vLLM, or the real OpenAI API. Provide the base URL and an API key if the endpoint requires one. Requests pass through directly without translation.
+Any other endpoint that speaks the OpenAI API format — vLLM, LM Studio, llama.cpp, or the real
+OpenAI API. Provide the base URL and an API key if the endpoint requires one. Requests pass through
+directly without translation.
+
+### Migrating from Ollama
+
+Earlier versions had a third engine type, Ollama, with its own adapter and translation to Ollama's
+native API. It was replaced by oMLX. An engine saved as Ollama is migrated at startup to an
+OpenAI-compatible engine on Ollama's own OpenAI-compatible endpoint (`<host>:<port>/v1`), with a
+warning in the log, so it keeps serving chat completions, embeddings and models. What goes away is
+what only the native API had: ollama.com search, pull and delete in the admin UI, and `num_ctx`.
 
 The base URL works with or without its `/v1` — `http://127.0.0.1:8000/v1` (how oMLX, LM Studio and the OpenAI SDKs write it) and `http://127.0.0.1:8000` reach the same endpoints. A path prefix in front of `/v1`, such as a proxy mount at `/openai/v1`, is kept.
 
@@ -197,7 +217,7 @@ The base URL works with or without its `/v1` — `http://127.0.0.1:8000/v1` (how
 
 When a request arrives at `/v1/chat/completions`, Gateway42. routes it to an engine that actually holds the requested model. The routing table is built from the same health probes that feed the dashboard, so adding a model to an engine makes it routable without configuring anything — and without a restart. When several engines report the same model, the table stores them in insertion order — the engine added first is the primary, the rest are its failover targets — and the handler walks the list, taking a concurrency slot from the first engine that has one. If the primary is down or at its concurrency cap, the request falls through to the next engine holding the model instead of failing.
 
-A request for a model that no reachable engine reports gets `404` rather than being forwarded somewhere it will fail, and a request gets `503` only when every engine holding the model is at its concurrency cap. The Anthropic routes (`/v1/messages`) still use the single-engine path: one engine serves, with no per-request failover, and a request to them without a `model` is rejected with `400` rather than guessed at.
+A request for a model that no reachable engine reports gets `404` rather than being forwarded somewhere it will fail, and a request gets `503` only when every engine holding the model is at its concurrency cap. The Anthropic routes (`/v1/messages`) fail over the same way; a request to them without a `model` is rejected with `400` rather than guessed at. A request to `/v1/chat/completions` without a `model` goes to the first oMLX engine, or the first engine of any type when there is none.
 
 You can add, edit, and remove engines from the Settings page — no restart required.
 
@@ -229,10 +249,10 @@ Requests with a missing, invalid, or deactivated key are rejected with `401 Unau
 | Endpoint | Method | Description |
 | -------- | ------ | ----------- |
 | `/v1/chat/completions` | POST | Chat completion. Accepts OpenAI-format bodies. Set `"stream": true` for SSE streaming. |
-| `/v1/embeddings` | POST | Embeddings. OpenAI-format body (`model`, `input`, `dimensions`, `encoding_format`). OpenAI-compatible engines get it as-is; Ollama gets `/api/embed`, with `base64` encoded by the gateway. Ollama takes text input only, not token arrays. |
+| `/v1/embeddings` | POST | Embeddings. OpenAI-format body (`model`, `input`, `dimensions`, `encoding_format`, `user`), relayed to the engine as-is. |
 | `/v1/messages` | POST | Anthropic Messages API, translated onto the same engines — see [Claude Code](#claude-code--anthropic-messages-api). |
 | `/v1/messages/count_tokens` | POST | Input token count in Anthropic format: exact from engines that implement it (oMLX), otherwise estimated (≈ 4 bytes per token). |
-| `/v1/responses`, `/v1/completions` | POST | Passed through to the engine's own implementation, streaming or not (Ollama: its OpenAI-compatible `/v1` routes). Usage is read from the response for the request log and quota. |
+| `/v1/responses`, `/v1/completions` | POST | Passed through to the engine's own implementation, streaming or not. Usage is read from the response for the request log and quota. |
 | `/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/audio/translations`, `/v1/images/generations`, `/v1/moderations` | POST | Passed through as well (JSON or multipart; audio comes back as bytes). An engine without the endpoint answers `404`, which reaches the client. |
 | `/v1/mcp/tools`, `/v1/mcp/servers` | GET | The backend MCP tools and servers of every engine that has them (oMLX), each tagged with its `engine`. See [Backend MCP tools](#backend-mcp-tools). |
 | `/v1/mcp/execute` | POST | Runs a backend MCP tool (`{"tool_name", "arguments"}`) on the engine that exposes it. |
@@ -251,7 +271,7 @@ curl http://<host>:7000/v1/chat/completions \
   -H "Authorization: Bearer <api_key>" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "llama3.2:latest",
+    "model": "Qwen3-8B-4bit",
     "messages": [{"role": "user", "content": "Hello!"}]
   }'
 ```
@@ -267,7 +287,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="llama3.2:latest",
+    model="Qwen3-8B-4bit",
     messages=[{"role": "user", "content": "Hello!"}],
 )
 print(response.choices[0].message.content)
@@ -308,19 +328,18 @@ Translated with care:
   carry text only.
 - **Documents**: plain-text and content documents are inlined with their title and context. Inline
   (base64) PDFs, in a message or a tool result, are sent as an OpenAI `file` part, which oMLX turns into
-  text with its MarkItDown integration (enabled by default) and the OpenAI API reads natively. Ollama
-  reads no files, so there a PDF becomes a one-line note; a PDF given by URL or file ID does too.
+  text with its MarkItDown integration (enabled by default) and the OpenAI API reads natively. A PDF
+  given by URL or file ID becomes a one-line note.
 - **Thinking**: when the request enables `thinking`, the engine's reasoning (`reasoning_content`,
-  `reasoning`, or Ollama's `thinking`) is returned as `thinking` blocks, streamed as
+  or `reasoning`) is returned as `thinking` blocks, streamed as
   `thinking_delta`, with an empty signature. Without it, reasoning is dropped as before.
   Thinking blocks sent back in history are not forwarded. The setting also reaches the engine:
   `chat_template_kwargs.enable_thinking` is `true` for `enabled`/`adaptive` and `false` otherwise,
-  since Anthropic's default is no thinking. Ollama gets `think: false` when thinking is off and
-  nothing when it is on, because it rejects `think: true` for models that cannot think.
+  since Anthropic's default is no thinking.
   `output_config.effort` (the app's Effort control) becomes `reasoning_effort`, with `max` sent as
   `high`, and `thinking.budget_tokens` becomes `thinking_budget` (oMLX). `chat_template_kwargs` and
   `thinking_budget` are never sent to `api.openai.com`.
-- **Sampling**: `top_k` is forwarded (as an option for Ollama).
+- **Sampling**: `top_k` is forwarded.
 - **Streaming events**: a `ping` follows `message_start` and repeats every 10 s while the engine is
   silent, so clients and proxies keep a long prefill's connection open. `message_start` carries an
   estimate of `input_tokens`, which `message_delta` replaces with the engine's count.
@@ -377,7 +396,7 @@ different feature and is not supported: `mcp_servers` is dropped.
 
 #### Prompt caching (Claude Desktop, Cowork, Claude Code)
 
-Local engines (oMLX, vLLM, llama.cpp, LM Studio, Ollama) have no `cache_control` markers; they reuse
+Local engines (oMLX, vLLM, llama.cpp, LM Studio) have no `cache_control` markers; they reuse
 the KV cache for the longest prompt prefix they have already seen. Gateway42 keeps that working:
 
 - **Stable prefix.** The `x-anthropic-billing-header: …; cch=…;` line that Claude clients put at
@@ -388,9 +407,8 @@ the KV cache for the longest prompt prefix they have already seen. Gateway42 kee
 - **Cache usage reported.** An engine's `usage.prompt_tokens_details.cached_tokens` becomes
   `cache_read_input_tokens`, with `input_tokens` holding only the tokens the engine had to process,
   and every response carries the `cache_creation` object Claude Desktop reads. To check caching,
-  look for `cache_read_input_tokens` well above zero after a session's first request. Ollama does
-  not report cache hits, so with Ollama it stays 0 even when the cache is used. The request log and
-  the quota still count the whole prompt.
+  look for `cache_read_input_tokens` well above zero after a session's first request. The request
+  log and the quota still count the whole prompt.
 
 To use Gateway42 with Claude Desktop / Cowork, set `inferenceProvider` to `gateway`,
 `inferenceGatewayBaseUrl` to the gateway's URL, `inferenceGatewayApiKey` to a Gateway42 key (either
@@ -400,34 +418,7 @@ choose the context window the app assumes.
 
 ### Parameters
 
-**When routing to an Ollama engine**, Gateway42. translates standard OpenAI parameters to their Ollama equivalents:
-
-| OpenAI parameter | Ollama parameter | Notes |
-| ---------------- | ---------------- | ----- |
-| `model` | `model` | Must match an installed Ollama model name |
-| `messages` | `messages` | Full conversation history |
-| `stream` | `stream` | SSE streaming when `true` |
-| `temperature` | `temperature` | |
-| `top_p` | `top_p` | |
-| `max_tokens` | `num_predict` | |
-| `max_completion_tokens` | `num_predict` | Wins over `max_tokens` when both are sent — OpenAI treats `max_tokens` as this field's deprecated alias |
-| `seed` | `seed` | |
-| `stop` | `stop` | String or list of strings; a bare string is wrapped into a list |
-| `presence_penalty` | `presence_penalty` | Direct — Ollama takes this parameter under its own name |
-| `frequency_penalty` | `frequency_penalty` | Direct |
-| `tools` | `tools` | Same schema, forwarded as-is. `tool_choice: "none"` withholds them; other `tool_choice` values are ignored (Ollama has no equivalent). |
-| `response_format` | `format` | `json_object` → `"json"`; `json_schema` → the schema object. |
-
-Tool calls come back in OpenAI shape: arguments as a JSON string, an `id` per call (Ollama does not
-assign one, so Gateway42 does), an `index` per call when streaming, and `finish_reason: "tool_calls"`.
-On the way in, the message history is converted to Ollama's shape — a tool result's `tool_call_id`
-becomes the `tool_name` of the call it answers, and array content is split into text and `images`.
-Only inline `data:` image URLs can be passed on; a remote image URL is dropped, since the gateway
-does not fetch it. Whether a model actually calls tools depends on the model.
-
-Anything else not in that table is **dropped rather than rejected**.
-
-**When routing to an OpenAI-compatible engine**, the body is forwarded through an allow-list that
+Every engine speaks the OpenAI API, so the body is forwarded through an allow-list that
 covers the standard fields plus the tool-calling and structured-output ones: `temperature`, `top_p`,
 `seed`, `max_tokens`, `max_completion_tokens`, `frequency_penalty`, `presence_penalty`, `stop`, `n`,
 `user`, `response_format`, `tools`, `tool_choice`, `parallel_tool_calls`, `logit_bias`, `logprobs`,
@@ -443,9 +434,8 @@ LM Studio and vLLM support different subsets.
 
 ### Streaming
 
-Set `"stream": true` to receive the completion as Server-Sent Events. Gateway42. normalises both
-engine types to the OpenAI chunk format, so the same client code works against Ollama and against an
-OpenAI-compatible upstream.
+Set `"stream": true` to receive the completion as Server-Sent Events, in the OpenAI chunk format
+the engine produces.
 
 ```
 data: {"id":"chatcmpl-…","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"Hel"},"finish_reason":null}]}
@@ -465,9 +455,8 @@ What that guarantees:
   exists rather than a key that is missing — some SDKs fault on absence. On the last chunk it is
   `"length"` if the reply was cut off by `max_tokens`, otherwise `"stop"`.
 - **`usage` appears only on the final chunk.** A client that sums usage across chunks gets the right
-  total instead of over-counting. Which final chunk depends on the upstream: an Ollama engine's counts
-  are folded into the terminating chunk above, while an OpenAI-compatible upstream is forwarded
-  verbatim, so its usage arrives in OpenAI's own extra chunk — the one whose `choices` array is empty.
+  total instead of over-counting. The engine's stream is forwarded verbatim, so usage arrives in
+  OpenAI's own extra chunk — the one whose `choices` array is empty.
   The gateway asks compat engines for that figure with `include_usage`, so it arrives even when the
   client did not request it. Index `choices` defensively rather than assuming every chunk has one.
 - **The stream always ends `data: [DONE]`**, even if the upstream closes without sending its own
@@ -705,9 +694,8 @@ GROUP BY user_name, model_served
 ORDER BY tokens DESC;
 ```
 
-Streaming completions carry usage too: the gateway asks OpenAI-compatible engines for it with
+Streaming completions carry usage too: the gateway asks the engine for it with
 `stream_options.include_usage`, so a streamed request is measured rather than logged as free.
-Ollama reports counts on its final line without being asked.
 
 ### Application logs
 
@@ -887,11 +875,11 @@ aggregate, no second counter.
 
 The Settings page is where you configure your inference backends. For each engine you can:
 
-- **Add** a new Ollama or OpenAI-compatible engine — name it, provide the URL and (for Ollama) the port
+- **Add** a new oMLX or OpenAI-compatible engine — name it, provide the base URL (with its port) and the API key
 - **Edit** an existing engine's connection details or API key — leave the key blank to keep the current one
 - **Remove** an engine you no longer need
 - **Test Saved Engines** — probes every engine already added. It does not test values typed into the form; add the engine first. A refusal is reported with the engine's status and reason (e.g. `401 Unauthorized: Invalid API key`), so a wrong key and a wrong URL are told apart
-- **Manage Ollama models** — search ollama.com, download with live progress, and delete models to free disk space. With several Ollama engines, a selector next to *Search* picks which one a pull lands on; a pulled model is routable as soon as the pull ends
+- **Manage oMLX models** — search MLX models on Hugging Face and download them with live progress, see which models are loaded, load or unload them, and delete their weights to free disk space. With several oMLX engines, a selector next to *Search* picks which one a download lands on; a downloaded model is routable as soon as it finishes. The download runs on the engine, so closing the page stops only the progress display. Needs the engine's main oMLX API key
 
 <img width="1554" height="806" alt="Image" src="https://github.com/user-attachments/assets/d99401c0-f270-4da4-837f-9a7568643520" />
 
@@ -955,10 +943,9 @@ All configuration is via environment variables. No variables are strictly requir
 | `MAX_MESSAGE_LENGTH` | `262144` | Maximum bytes stored per prompt or response in the AI interaction log (~256 KB). It does not limit what reaches the model. |
 | `GW42_MAX_INPUT_LENGTH` | `0` | Maximum bytes of text per message sent to an engine; longer text is truncated. `0` sends every message whole, so model input is bounded only by `GW42_MAX_REQUEST_BYTES`. |
 | `GW42_UPSTREAM_TIMEOUT` | `600` | Seconds a single non-streaming engine call may take. Streams are bounded by silence instead (60 s without a byte), up to 30 minutes. |
-| `GW42_OLLAMA_NUM_CTX` | `0` | Context window (`num_ctx`) sent with every Ollama request, clamped to the model's maximum from `/api/show`. `0` leaves it to Ollama (`OLLAMA_CONTEXT_LENGTH` or the Modelfile), which trims longer prompts from the front. Keep it one fixed value: Ollama reloads a model whenever `num_ctx` changes. |
 | `GW42_MCP` | `on` | Backend MCP tools: executing their calls on the chat and messages routes, and the `/v1/mcp/*` endpoints. `off` turns both off; calls for backend tools then reach the client unrun. |
 | `GW42_MCP_MAX_ROUNDS` | `8` | Most rounds of backend MCP calls one request may execute before the answer is returned as it stands. |
-| `GW42_FETCH_IMAGE_URLS` | `true` | Download `http(s)` images for Ollama, which only takes inline images. Only public addresses are fetched (loopback, private, link-local and CGNAT ranges are refused, also after DNS and redirects), within 15 s and 20 MB, and only image content types. `false` drops URL images for Ollama. |
+| `GW42_FETCH_IMAGE_URLS` | `true` | Download `http(s)` images for oMLX, which only takes images as `data:` URIs. Only public addresses are fetched (loopback, private, link-local and CGNAT ranges are refused, also after DNS and redirects), within 15 s and 20 MB, and only image content types. `false` sends URL images to oMLX as they are, and it rejects them. |
 | `GW42_MAX_REQUEST_BYTES` | `33554432` | Maximum API request body (32 MiB, the Anthropic API's own limit). Claude Desktop, Cowork and Claude Code resend the whole session, screenshots included, on every turn, so this bounds the usable conversation, not a single message. Larger bodies get `413`. |
 | `LOG_LEVEL` | `INFO` | Log verbosity: `DEBUG`, `INFO`, `WARN` (or `WARNING`), `ERROR`. An unrecognised value falls back to `INFO` with a warning. |
 | `LOG_FILE` | `./logs/gateway.log` | Application log file, written in addition to stderr; the directory is created if needed. Set it empty to log to stderr only. When stderr is already redirected to this same file (as `install.sh` does under launchd) it is written once, not twice. |
@@ -1017,22 +1004,22 @@ The race detector works without a C toolchain because the SQLite driver is pure 
 
 | File | Covers |
 | ---- | ------ |
-| `types_test.go` | The wire contract of authored responses — that `finish_reason` is present-and-null rather than absent, that `usage` fields serialise when zero, that `usage` appears only on the final chunk, and that `finish_reason` reports `"length"` for a truncated Ollama reply. |
-| `stream_test.go` | Stream translation: Ollama NDJSON → OpenAI chunks, SSE passthrough unwrapping, terminal-chunk handling. |
+| `types_test.go` | The wire contract of bodies the gateway authors — the error envelope keeping a null `code`, `size` omitted when unknown. |
+| `stream_test.go` | SSE passthrough unwrapping, terminal-chunk handling, audit text extraction. |
 | `prompt_cache_test.go` | Prompt caching for Claude clients: the billing header stripped, upstream prefixes byte-identical across turns, engine cache hits reported as `cache_read_input_tokens`. |
 | `limits_test.go` | `max_tokens` passed through unchanged, nothing invented when absent, the request-body bound, keep-alives holding the stream idle deadline. |
 | `compat_gaps_test.go` | Engine errors passed on with their status (end to end, both APIs), `/v1/messages` failover, tool-result images, reasoning as thinking blocks, documents. |
-| `thinking_context_embeddings_test.go` | The thinking switch sent to engines, effort, context windows in `/v1/models`, and `/v1/embeddings` against fake oMLX- and Ollama-style engines. |
+| `thinking_context_embeddings_test.go` | The thinking switch sent to engines, effort, context windows in `/v1/models`, and `/v1/embeddings` against a fake engine. |
 | `mcp_test.go` | Backend MCP tools against a fake oMLX: execution and round loop on both APIs, streaming and not (no call reaches the client; one id, finish and message; usage summed), client tools winning a clash, mixed rounds, the round limit, `GW42_MCP=off`, Anthropic MCP blocks and their history form, failing tools, and the relayed `/v1/mcp/*` endpoints. |
-| `remaining_gaps_test.go` | Ollama option, tool-choice, legacy-function and logprobs mapping; `num_ctx` and context windows from `/api/show`; the image fetcher's address guard and cache; pings, stop sequences and engine-backed `count_tokens`; every pass-through endpoint end to end; the header-limit split for non-streaming calls. |
+| `remaining_gaps_test.go` | Parameter forwarding (local-only ones withheld from the OpenAI API); the image fetcher's address guard and cache; pings, stop sequences and engine-backed `count_tokens`; every pass-through endpoint end to end; the header-limit split for non-streaming calls. |
 | `recovery_test.go` | Panic recovery: the JSON envelope on `/v1/`, plain text on the admin UI, an SSE error frame when the response is already committed mid-stream, and that a committed body is never appended to. Also that the `statusRecorder` wrapper stays transparent about the writer's other interfaces — `Flusher`, `Hijacker` and `io.ReaderFrom` are not promoted through an embedded interface, so each is asserted and delegated to, including that a hijacked response gets no panic body appended to its raw protocol bytes. |
 | `metrics_test.go` | That a recovered panic is counted, with the status the client actually saw; that a mid-stream panic counts as `200` and raises `gw42_panics_total`; that the in-flight gauge unwinds; that one `statusRecorder` is shared; and that a panicked request still produces an audit row. |
 | `tmpl_render_check_test.go` | Every template renders against its real data shape, so a typo in an admin page is caught at test time rather than in the browser. Also checks that an engine's API key never reaches the settings page, that the header bar carries the brand and the logout exactly once with the sidebar keeping navigation and engine status, and that the stylesheet still defines the classes that markup uses. |
-| `engine_config_test.go` | Ollama URL assembly (no doubled port, default scheme and port), engine-edit merging (a blank key keeps the stored one), and Ollama engine selection for pull/delete. |
-| `engine_delete_test.go` | Model deletion reports upstream refusals, with the reason bounded so it fits a session-cookie flash. |
+| `engine_config_test.go` | The migration of saved Ollama engines (URL assembly as the old adapter did it), the oMLX engine type, engine-edit merging (a blank key keeps the stored one), and oMLX engine selection for downloads and model actions. |
+| `omlx_test.go` | oMLX model management against a fake oMLX admin API: load state on the settings page, Hugging Face search, download progress streamed from oMLX's task list (and its failures), load, unload and delete, and invalid actions never reaching the engine. |
 | `logging_test.go` | `LOG_LEVEL` parsing and `LOG_FILE` output, including not double-writing when stderr is already that file. |
-| `tools_test.go` | The tool-use loop in both directions: message fields kept through sanitising, OpenAI → Ollama history translation (argument objects, `tool_name` from `tool_call_id`, image parts), `response_format` → `format`, the sampling-parameter mappings (both penalties under their native names, `max_completion_tokens` winning over `max_tokens`), and Ollama tool calls returned in OpenAI shape with cross-chunk indexes and `finish_reason: "tool_calls"`. |
-| `pull_csrf_test.go` | A model pull — a GET, so outside the CSRF middleware — is refused without the session's token. |
+| `tools_test.go` | Message fields kept through sanitising (tool calls, tool results, truncation only when `GW42_MAX_INPUT_LENGTH` is set). |
+| `download_csrf_test.go` | A model download — a GET, so outside the CSRF middleware — is refused without the session's token; the old Ollama admin routes no longer route. |
 | `metrics_auth_test.go` | `/metrics` access by admin session and by `GW42_METRICS_TOKEN`, and that an unset token is not an open door. |
 | `engine_save_test.go` | Against a real SQLite file: a failed read of the engine list aborts an add or remove instead of saving a list that drops every other engine. |
 | `compat_request_test.go` | The OpenAI-compatible request body: an explicit `stream` boolean, sanitised messages, the parameter allow-list, and that a stream asks the engine for usage via `stream_options.include_usage` — with the client's own sub-fields carried through and the caller's decoded request left unmutated. |
@@ -1043,7 +1030,7 @@ The race detector works without a C toolchain because the SQLite driver is pure 
 | `static_css_test.go` | No template contains a `<style>` block or `style` attribute, both layouts link the stylesheet, and the router serves it as `text/css`. |
 | `compat_baseurl_test.go` | OpenAI-compatible base URLs work with or without `/v1` (a proxy prefix is kept), and Test Saved Engines names the upstream status and guides an admin with nothing saved. |
 | `engine_test_draft_test.go` | Test Connection builds the config the way saving would, so an edit with the API key left blank is tested with the stored key rather than an empty one. |
-| `anthropic_test.go` | The Anthropic front-end: tool loops both ways, a tool-only turn keeping null content, `max_tokens`/bad-arguments handling, content-block sequencing across a stream, an Ollama tool reply arriving as one `tool_use` delta, and error `type` names following the Anthropic vocabulary Claude Code switches on. |
+| `anthropic_test.go` | The Anthropic front-end: tool loops both ways, a tool-only turn keeping null content, `max_tokens`/bad-arguments handling, content-block sequencing across a stream, and error `type` names following the Anthropic vocabulary Claude Code switches on. |
 | `request_detail_test.go` | The per-request detail collector: routing, timing and token facts reaching the log row, a request that never reaches a handler still producing one, `X-Request-ID` matching the stored id, and the migration that gives an existing database the detail columns and rebuilds its contentless FTS table. |
 | `login_guard_test.go` | The admin login throttle: the lockout engaging on the fifth failure since the last success, its length doubling to the ceiling, a successful password clearing both the counter and an active lockout, and — through the real handler — a 429 with `Retry-After` that refuses even the correct password until the lockout passes, which is what keeps the PBKDF2 derive function from running at all. |
 | `usage_test.go` | The token-usage panel, both halves: against a real SQLite file that the window and path filters hold, that an unresolved model falls back to the requested name, that a deleted client's history survives unregistered, and that zero-token requests are tallied as unreported rather than as free; then the grouping into per-client rows with ranked bars, and the dashboard rendering with a panel, without one, and with the aggregate unavailable. |
@@ -1076,18 +1063,19 @@ Single `package main`, one file per concern:
 
 | File | Lines | Responsibility |
 | ---- | ----- | -------------- |
-| `main.go` | 1323 | Config, routing table, middleware chain, panic recovery, rate limiting, trusted-proxy client-IP resolution, server lifecycle, graceful shutdown. |
-| `handlers.go` | 1472 | Admin web UI handlers only. |
-| `api_handlers.go` | 1297 | The `/v1/*` OpenAI-compatible surface, including `/v1/whoami` and the completion-path quota checks. Separate from the admin UI so a change to one cannot alter the other's contract. |
-| `engine.go` | 1389 | The `Engine` interface and its two adapters, plus the probe cache, stream implementations and the streaming deadline. |
+| `main.go` | 1369 | Config, routing table, middleware chain, panic recovery, rate limiting, trusted-proxy client-IP resolution, server lifecycle, graceful shutdown. |
+| `handlers.go` | 1275 | Admin web UI handlers only. |
+| `api_handlers.go` | 1259 | The `/v1/*` OpenAI-compatible surface, including `/v1/whoami` and the completion-path quota checks. Separate from the admin UI so a change to one cannot alter the other's contract. |
+| `engine.go` | 1143 | The `Engine` interface and its two adapters, plus the probe cache, stream implementations and the streaming deadline. |
 | `routing.go` | 370 | Model-name → ordered engine lists (primary plus failover targets) and the cached routing index. |
-| `openai.go` | 571 | Request and response translation between OpenAI and Ollama shapes. |
-| `anthropic.go` | 1088 | The Anthropic Messages API front-end: both translation directions and the streaming block sequencer. |
-| `embeddings.go` | 204 | `/v1/embeddings`: the engines' embedding calls, Ollama's `/api/embed` translation (base64 included) and the handler. |
+| `openai.go` | 44 | Small OpenAI-side helpers shared by the handlers. |
+| `anthropic.go` | 1085 | The Anthropic Messages API front-end: both translation directions and the streaming block sequencer. |
+| `embeddings.go` | 126 | `/v1/embeddings`: the engine's embedding call and the handler. |
 | `passthrough.go` | 296 | `/v1/responses`, `/v1/completions`, audio, images and moderations relayed to the engine, with SSE relay and usage capture. |
-| `remote_images.go` | 226 | Fetching `http(s)` images for Ollama behind a public-address-only dialer, with a small cache. |
+| `remote_images.go` | 225 | Fetching `http(s)` images for oMLX behind a public-address-only dialer, with a small cache. |
 | `mcp.go` | 789 | Backend MCP tools: the per-engine tool catalogue, execution through `/v1/mcp/execute`, the non-streaming round loop, the OpenAI stream filter, Anthropic MCP blocks and the relayed `/v1/mcp/*` endpoints. |
-| `ollama_context.go` | 157 | Ollama context windows from `/api/show`: `max_input_tokens` in `/v1/models` and `GW42_OLLAMA_NUM_CTX`. |
+| `omlx.go` | 389 | oMLX model management through its own API: status, Hugging Face search, download with SSE progress, load, unload, delete. |
+| `engine_migration.go` | 70 | Startup migration of engines saved with the removed Ollama type. |
 | `types.go` | 168 | Typed structs for responses Gateway42. authors. |
 | `db.go` | 1203 | Schema, migrations, both connection pools, queries, FTS5 setup and its startup consistency check, retention pruning, and the daily SQLite maintenance sweep. |
 | `request_detail.go` | 220 | The per-request detail collector handlers fill and the request log reads. |

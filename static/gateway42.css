@@ -446,6 +446,24 @@ label.inline { display: inline; margin: 0; white-space: nowrap; }
     cursor: pointer;
 }
 .tag-del:hover, .tag-del:focus-visible { color: #ff6b6b; }
+/* oMLX models: a dot for the load state, and a Load / Unload action. */
+.model-tag.is-loaded { border-color: rgba(120,220,150,.45); }
+.model-state { color: rgba(255,255,255,.45); }
+.model-tag.is-loaded .model-state { color: #78dc96; }
+.tag-act {
+    appearance: none;
+    background: none;
+    border: 0;
+    padding: 0 0 0 8px;
+    margin: 0;
+    font: inherit;
+    font-weight: 600;
+    line-height: 1;
+    color: rgba(255,255,255,.55);
+    cursor: pointer;
+    text-decoration: underline dotted;
+}
+.tag-act:hover, .tag-act:focus-visible { color: #fff; }
 
 /* ── Dialog card ── */
 .dialog-card { width: 100%; max-width: 480px; }

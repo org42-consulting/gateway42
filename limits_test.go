@@ -23,11 +23,7 @@ func TestMaxTokensPassesThroughUnchanged(t *testing.T) {
 
 	compat, _ := json.Marshal(openAICompatRequest(data, msgs))
 	if !strings.Contains(string(compat), `"max_tokens":64000`) {
-		t.Errorf("OpenAI-compatible request lost max_tokens: %s", compat)
-	}
-	ollama, _ := json.Marshal(openAIToOllama(data, msgs))
-	if !strings.Contains(string(ollama), `"num_predict":64000`) {
-		t.Errorf("Ollama request lost max_tokens: %s", ollama)
+		t.Errorf("engine request lost max_tokens: %s", compat)
 	}
 }
 
@@ -36,14 +32,9 @@ func TestNoMaxTokensInventedWhenAbsent(t *testing.T) {
 	body := decodeJSON(t, `{"model":"m","messages":[{"role":"user","content":"hi"}]}`).(map[string]interface{})
 	data, raw := anthropicToOpenAI(body)
 	msgs := sanitizeMessages(raw)
-	for _, b := range [][]byte{
-		mustJSON(t, openAICompatRequest(data, msgs)),
-		mustJSON(t, openAIToOllama(data, msgs)),
-	} {
-		if strings.Contains(string(b), "max_tokens") || strings.Contains(string(b), "num_predict") ||
-			strings.Contains(string(b), "num_ctx") {
-			t.Errorf("gateway invented a length limit: %s", b)
-		}
+	b := mustJSON(t, openAICompatRequest(data, msgs))
+	if strings.Contains(string(b), "max_tokens") || strings.Contains(string(b), "max_completion_tokens") {
+		t.Errorf("gateway invented a length limit: %s", b)
 	}
 }
 

@@ -8,7 +8,6 @@ package main
 // client belongs there.
 
 import (
-	"bytes"
 	"context"
 	"encoding/csv"
 	"encoding/json"
@@ -231,7 +230,15 @@ func handleAdminSettingsPage(w http.ResponseWriter, r *http.Request) {
 	for _, e := range engines {
 		pd := snap[e.ID]
 		engineStatus[fmt.Sprintf("%d", e.ID)] = pd.status
-		engineModelDetails[fmt.Sprintf("%d", e.ID)] = pd.details
+		details := pd.details
+		// oMLX models are managed here (load, unload, delete), so the page
+		// shows which are loaded — a live, bounded read of /v1/models/status.
+		if a, ok := cachedAdapter(e.ID).(*OpenAICompatAdapter); ok && isOMLX(a) && pd.status {
+			ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+			details = withOMLXStatus(ctx, a, details)
+			cancel()
+		}
+		engineModelDetails[fmt.Sprintf("%d", e.ID)] = details
 	}
 
 	renderPage(w, "settings", SettingsData{
@@ -282,170 +289,6 @@ func handleEngineTest(w http.ResponseWriter, r *http.Request) {
 	} else {
 		addFlash(w, r, "info", msg)
 	}
-	http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
-}
-
-// ollamaPullStream streams a model pull from Ollama as SSE. Auth is checked by
-// callers. engineID selects the target engine; 0 means "the only/first one".
-func ollamaPullStream(w http.ResponseWriter, r *http.Request, model string, engineID int) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "streaming not supported", 500)
-		return
-	}
-
-	// Headers first: every exit below writes an SSE frame, and a frame written
-	// before these are set goes out as text/plain, which EventSource rejects
-	// without ever showing the error it carried.
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.Header().Set("Cache-Control", "no-cache")
-
-	target := findOllamaEngine(engineID)
-	if target == nil {
-		fmt.Fprintf(w, "data: %s\n\n", jsonErr("No matching Ollama engine configured"))
-		flusher.Flush()
-		return
-	}
-
-	// Whatever the pull achieved — including a partial one that was cut off —
-	// the engine's model list may have changed. Dropping the probe cache also
-	// marks the routing index stale, and the refill starts immediately, so a
-	// freshly pulled model is routable at once rather than after
-	// probeCacheTTL/routeIndexTTL.
-	defer onEnginesChanged()
-
-	endpoint := ollamaEndpoint(*target)
-	body, _ := json.Marshal(map[string]interface{}{"name": model, "stream": true})
-
-	ctx, cancel := context.WithTimeout(r.Context(), 600*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, "POST", endpoint+"/api/pull", bytes.NewReader(body))
-	if err != nil {
-		fmt.Fprintf(w, "data: %s\n\n", jsonErr(err.Error()))
-		flusher.Flush()
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := sharedClient.Do(req)
-	if err != nil {
-		fmt.Fprintf(w, "data: %s\n\n", jsonErr(err.Error()))
-		flusher.Flush()
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		fmt.Fprintf(w, "data: %s\n\n", jsonErr(fmt.Sprintf("Ollama returned %d", resp.StatusCode)))
-		flusher.Flush()
-		return
-	}
-
-	scanner := newStreamScanner(resp.Body)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		fmt.Fprintf(w, "data: %s\n\n", line)
-		flusher.Flush()
-	}
-	if err := scanner.Err(); err != nil {
-		// Without this a dropped connection mid-download ends in a bare [DONE],
-		// which the page cannot tell apart from a clean finish.
-		slog.Warn("ollama pull stream", "model", model, "engine", target.Name, "err", err)
-		fmt.Fprintf(w, "data: %s\n\n", jsonErr("Pull interrupted: "+err.Error()))
-	}
-	fmt.Fprintf(w, "data: [DONE]\n\n")
-	flusher.Flush()
-}
-
-// handleOllamaPullStream starts a model pull and streams its progress. It is a
-// GET only because EventSource cannot send anything else, which is why it
-// checks the CSRF token itself: the middleware exempts GETs.
-func handleOllamaPullStream(w http.ResponseWriter, r *http.Request) {
-	if !isAdminSession(r) {
-		jsonResponse(w, http.StatusUnauthorized, map[string]string{"error": "Unauthorized"})
-		return
-	}
-	if !csrfQueryValid(r) {
-		slog.Warn("csrf: rejected pull", "ip", clientIP(r))
-		jsonResponse(w, http.StatusForbidden,
-			map[string]string{"error": "CSRF token missing or invalid — reload the page and retry."})
-		return
-	}
-	model := strings.TrimSpace(r.URL.Query().Get("model"))
-	if model == "" {
-		jsonResponse(w, http.StatusBadRequest, map[string]string{"error": "Model name required"})
-		return
-	}
-	engineID, _ := strconv.Atoi(r.URL.Query().Get("engine_id"))
-	ollamaPullStream(w, r, model, engineID)
-}
-
-// findOllamaEngine resolves the Ollama engine an admin action targets.
-//
-// wantID is the engine the admin picked. Zero means none was given, and only
-// then is "first Ollama engine" an acceptable stand-in — with several Ollama
-// hosts, guessing would pull onto or delete from the wrong machine. A non-zero
-// ID that matches nothing returns nil rather than falling back for the same
-// reason.
-func findOllamaEngine(wantID int) *EngineConfig {
-	for _, e := range cachedEngines() {
-		if e.Type != EngineOllama {
-			continue
-		}
-		if wantID == 0 || e.ID == wantID {
-			return &e
-		}
-	}
-	return nil
-}
-
-func jsonErr(msg string) string {
-	b, _ := json.Marshal(map[string]string{"error": msg})
-	return string(b)
-}
-
-func handleOllamaDeleteModel(w http.ResponseWriter, r *http.Request) {
-	if !isAdminSession(r) {
-		http.Redirect(w, r, "/", http.StatusFound)
-		return
-	}
-	if !parseAdminForm(w, r, "/admin/settings-page") {
-		return
-	}
-	model := strings.TrimSpace(r.FormValue("model"))
-	if model == "" {
-		addFlash(w, r, "error", "Model name is required")
-		http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
-		return
-	}
-
-	wantID, _ := strconv.Atoi(r.FormValue("engine_id"))
-	target := findOllamaEngine(wantID)
-	if target == nil {
-		addFlash(w, r, "error", "No Ollama engine available to delete from")
-		http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
-		return
-	}
-
-	if err := OllamaDeleteModel(ollamaEndpoint(*target), model); err != nil {
-		slog.Error("delete model", "model", model, "engine", target.Name, "err", err)
-		addFlash(w, r, "error", fmt.Sprintf("Could not delete '%s': %v", model, err))
-		http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
-		return
-	}
-
-	// Drop the cached probe so the model list reflects the deletion now
-	// rather than up to probeCacheTTL later, and start the refill so no
-	// reader pays for it.
-	onEnginesChanged()
-	slog.Info("Model deleted", "model", model, "engine", target.Name)
-	addFlash(w, r, "success", fmt.Sprintf("Model '%s' deleted from %s.", model, target.Name))
-
 	http.Redirect(w, r, "/admin/settings-page", http.StatusFound)
 }
 
@@ -525,13 +368,7 @@ func handleEngineSettings(w http.ResponseWriter, r *http.Request) {
 			Type:    engineType,
 			BaseURL: baseURL,
 		}
-		// The API key input is only hidden for Ollama, not removed, so it is
-		// still submitted — and browsers autofill password fields into it.
-		if engineType == EngineOllama {
-			ec.Port = portInt
-		} else {
-			ec.APIKey = apiKey
-		}
+		ec.APIKey = apiKey
 		engines = append(engines, ec)
 		editID = newID
 	}
@@ -564,30 +401,19 @@ func handleEngineSettings(w http.ResponseWriter, r *http.Request) {
 // change, so a stale port or key cannot resurface if the type is switched back.
 // engineFormFields reads and validates the engine form fields that saving and
 // testing share. msg is the error to show the admin, empty when the fields are
-// valid. port is 11434 for engine types that do not use one.
+// valid. Both engine types take their port in the base URL, so port is 0; it
+// is kept in the signature for the callers that still pass it on.
 func engineFormFields(r *http.Request) (engineType, baseURL string, port int, msg string) {
 	engineType = r.FormValue("engine_type")
 	baseURL = strings.TrimSpace(r.FormValue("base_url"))
-	portStr := strings.TrimSpace(r.FormValue("port"))
 
-	if engineType != EngineOllama && engineType != EngineOpenAICompat {
+	if engineType != EngineOMLX && engineType != EngineOpenAICompat {
 		return "", "", 0, "Invalid engine type"
 	}
 	if baseURL == "" {
 		return "", "", 0, "Base URL is required"
 	}
-	port = 11434
-	if engineType == EngineOllama {
-		if portStr == "" {
-			return "", "", 0, "Port is required for Ollama engines"
-		}
-		var err error
-		port, err = strconv.Atoi(portStr)
-		if err != nil || port < 1 || port > 65535 {
-			return "", "", 0, "Port must be a number between 1 and 65535"
-		}
-	}
-	return engineType, baseURL, port, ""
+	return engineType, baseURL, 0, ""
 }
 
 // handleEngineTestDraft tests the engine settings typed into the form before
@@ -658,13 +484,7 @@ func applyEngineEdit(e *EngineConfig, engineType, name, baseURL string, port int
 	if apiKey != "" {
 		e.APIKey = apiKey
 	}
-	switch engineType {
-	case EngineOllama:
-		e.Port = port
-		e.APIKey = ""
-	case EngineOpenAICompat:
-		e.Port = 0
-	}
+	e.Port = 0 // legacy field; both engine types carry the port in BaseURL
 }
 
 func handleRemoveEngine(w http.ResponseWriter, r *http.Request) {
@@ -722,28 +542,6 @@ func handleRemoveEngine(w http.ResponseWriter, r *http.Request) {
 }
 
 // ─────────────────────────────── Model search ─────────────────────────────────
-
-func handleOllamaSearch(w http.ResponseWriter, r *http.Request) {
-	if !isAdminSession(r) {
-		jsonResponse(w, 401, map[string]string{"error": "Unauthorized"})
-		return
-	}
-
-	query := strings.TrimSpace(r.URL.Query().Get("q"))
-	if query == "" {
-		jsonResponse(w, 200, map[string][]ModelDetail{"results": []ModelDetail{}})
-		return
-	}
-
-	results, err := OllamaSearchModels(query)
-	if err != nil {
-		slog.Warn("ollama.com search", "q", query, "err", err)
-		jsonResponse(w, 502, map[string]string{"error": err.Error()})
-		return
-	}
-
-	jsonResponse(w, 200, map[string][]ModelDetail{"results": results})
-}
 
 // ─────────────────────────────── Password change ──────────────────────────────
 

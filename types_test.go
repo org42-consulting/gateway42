@@ -30,60 +30,6 @@ func keys(t *testing.T, v interface{}) map[string]bool {
 	return out
 }
 
-func TestChunkOmitsUsageUntilFinal(t *testing.T) {
-	mid := formatStreamChunk(
-		map[string]interface{}{"model": "m", "message": map[string]interface{}{"content": "x"}},
-		"id", false)
-	if keys(t, mid)["usage"] {
-		t.Error("mid-stream chunk carries usage; clients that sum usage would over-count")
-	}
-
-	final := formatStreamChunk(
-		map[string]interface{}{"model": "m", "done": true, "prompt_eval_count": 3, "eval_count": 4},
-		"id", false)
-	if !keys(t, final)["usage"] {
-		t.Error("final chunk is missing usage")
-	}
-}
-
-func TestChunkFinishReasonIsNullNotAbsent(t *testing.T) {
-	// OpenAI clients read choices[0].finish_reason and check it against null.
-	// Omitting the key makes some of them fault on a missing field, so it must
-	// be present and null mid-stream.
-	mid := formatStreamChunk(
-		map[string]interface{}{"model": "m", "message": map[string]interface{}{"content": "x"}},
-		"id", false)
-	b, err := json.Marshal(mid)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	if !strings.Contains(string(b), `"finish_reason":null`) {
-		t.Errorf("mid-stream finish_reason should be present and null, got: %s", b)
-	}
-}
-
-func TestFirstChunkCarriesRoleAndLaterOnesDoNot(t *testing.T) {
-	ollamaLine := map[string]interface{}{
-		"model": "m", "message": map[string]interface{}{"content": "x"},
-	}
-
-	first, err := json.Marshal(formatStreamChunk(ollamaLine, "id", true))
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	if !strings.Contains(string(first), `"role":"assistant"`) {
-		t.Errorf("first chunk should declare the role, got: %s", first)
-	}
-
-	later, err := json.Marshal(formatStreamChunk(ollamaLine, "id", false))
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	if strings.Contains(string(later), `"role"`) {
-		t.Errorf("later chunks must not repeat the role, got: %s", later)
-	}
-}
-
 func TestErrorResponseKeepsNullCode(t *testing.T) {
 	b, err := json.Marshal(openaiError("boom", "api_error"))
 	if err != nil {
@@ -105,85 +51,7 @@ func TestModelOmitsSizeWhenUnknown(t *testing.T) {
 	if keys(t, wire.Model{ID: "m", Object: "model", OwnedBy: "openai_compat"})["size"] {
 		t.Error("size should be omitted when zero")
 	}
-	if !keys(t, wire.Model{ID: "m", Object: "model", OwnedBy: "ollama", Size: 42})["size"] {
+	if !keys(t, wire.Model{ID: "m", Object: "model", OwnedBy: "omlx", Size: 42})["size"] {
 		t.Error("size should be emitted when known")
-	}
-}
-
-func TestCompletionUsageAlwaysPresent(t *testing.T) {
-	// A completion that used zero measured tokens must still report usage:
-	// absence means "not measured", zero means "measured as zero".
-	c := ollamaToOpenAI(map[string]interface{}{
-		"model":   "m",
-		"message": map[string]interface{}{"role": "assistant", "content": "hi"},
-	})
-	if !keys(t, c)["usage"] {
-		t.Error("completion is missing usage")
-	}
-	if c.Choices[0].FinishReason == nil || *c.Choices[0].FinishReason != "stop" {
-		t.Error("completed response should finish with \"stop\"")
-	}
-}
-
-// Ollama's done_reason has to survive translation on both response paths. The
-// case that matters is "length": it is how a client learns its completion was
-// cut off by max_tokens, and reporting "stop" there makes a truncated reply
-// look finished. Everything Gateway42 cannot map falls back to "stop".
-func TestFinishReasonFollowsOllamaDoneReason(t *testing.T) {
-	for _, tc := range []struct {
-		name       string
-		doneReason interface{} // nil means the field is absent
-		want       string
-	}{
-		{"natural end", "stop", "stop"},
-		{"hit num_predict", "length", "length"},
-		{"absent on older builds", nil, "stop"},
-		{"reason OpenAI has no name for", "unload", "stop"},
-		{"wrong type", 42, "stop"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			final := map[string]interface{}{
-				"model": "m", "done": true,
-				"message": map[string]interface{}{"role": "assistant", "content": "hi"},
-			}
-			if tc.doneReason != nil {
-				final["done_reason"] = tc.doneReason
-			}
-
-			c := ollamaToOpenAI(final)
-			if fr := c.Choices[0].FinishReason; fr == nil || *fr != tc.want {
-				t.Errorf("non-streaming finish_reason = %v, want %q", fr, tc.want)
-			}
-
-			chunk := formatStreamChunk(final, "id", false)
-			if fr := chunk.Choices[0].FinishReason; fr == nil || *fr != tc.want {
-				t.Errorf("final stream chunk finish_reason = %v, want %q", fr, tc.want)
-			}
-		})
-	}
-}
-
-// The shared pointees must never be written through: one caller mutating
-// *FinishReason would change the answer for every later response.
-func TestFinishReasonValuesAreNotAliasedToEachOther(t *testing.T) {
-	stop := ollamaFinishReason(map[string]interface{}{"done_reason": "stop"})
-	length := ollamaFinishReason(map[string]interface{}{"done_reason": "length"})
-	if stop == length {
-		t.Fatal("stop and length share one pointer")
-	}
-	if *stop != "stop" || *length != "length" {
-		t.Errorf("got %q / %q, want \"stop\" / \"length\"", *stop, *length)
-	}
-}
-
-func TestOllamaToOpenAIDefaultsRoleWhenUpstreamOmitsIt(t *testing.T) {
-	// Some Ollama builds omit message.role. An empty role makes clients drop
-	// the message, so it defaults to assistant.
-	c := ollamaToOpenAI(map[string]interface{}{
-		"model":   "m",
-		"message": map[string]interface{}{"content": "hi"},
-	})
-	if c.Choices[0].Message.Role != "assistant" {
-		t.Errorf("role = %q, want \"assistant\"", c.Choices[0].Message.Role)
 	}
 }

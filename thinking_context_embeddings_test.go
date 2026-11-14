@@ -1,11 +1,8 @@
 package main
 
 import (
-	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"io"
-	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -42,20 +39,6 @@ func TestEffortBecomesReasoningEffort(t *testing.T) {
 	data, _ := anthropicToOpenAI(decodeJSON(t, `{"model":"m","messages":[]}`).(map[string]interface{}))
 	if _, ok := data["reasoning_effort"]; ok {
 		t.Error("reasoning_effort invented without an effort")
-	}
-}
-
-func TestOllamaGetsThinkFalseOnly(t *testing.T) {
-	off, _ := anthropicToOpenAI(decodeJSON(t, `{"model":"m","messages":[]}`).(map[string]interface{}))
-	if req := openAIToOllama(off, nil); req["think"] != false {
-		t.Errorf("thinking off: think = %v, want false", req["think"])
-	}
-	on, _ := anthropicToOpenAI(decodeJSON(t, `{"model":"m","thinking":{"type":"enabled"},"messages":[]}`).(map[string]interface{}))
-	if req := openAIToOllama(on, nil); req["think"] != nil {
-		t.Errorf("thinking on: think = %v, want unset (Ollama rejects true for non-thinking models)", req["think"])
-	}
-	if req := openAIToOllama(map[string]interface{}{"model": "m"}, nil); req["think"] != nil {
-		t.Errorf("OpenAI request without kwargs: think = %v, want unset", req["think"])
 	}
 }
 
@@ -154,9 +137,6 @@ func embedFixture(t *testing.T, engineType string, handler http.HandlerFunc) fun
 	t.Cleanup(srv.Close)
 	ec := EngineConfig{ID: 1, Name: "emb", Type: engineType, BaseURL: srv.URL}
 	var a Engine = &OpenAICompatAdapter{cfg: ec, concurrencyLimiter: newConcurrencyLimiter(2)}
-	if engineType == EngineOllama {
-		a = &OllamaAdapter{cfg: ec, concurrencyLimiter: newConcurrencyLimiter(2)}
-	}
 	engineCachePtr.Store(&engineCache{engines: []EngineConfig{ec}, adapters: map[int]Engine{1: a}})
 	storeRouteIndex(&routeIndex{byModel: map[string][]int{"emb": {1}}, built: time.Now(), probed: true}, routeIndexGeneration())
 	t.Cleanup(invalidateRouteIndex)
@@ -187,56 +167,6 @@ func TestEmbeddingsOpenAICompatPassthrough(t *testing.T) {
 	}
 	if got["input"] != "hello" || got["dimensions"] != 2.0 || got["encoding_format"] != "float" || got["junk"] != nil {
 		t.Errorf("forwarded body = %v", got)
-	}
-}
-
-func TestEmbeddingsOllamaTranslated(t *testing.T) {
-	var got map[string]interface{}
-	var path string
-	post := embedFixture(t, EngineOllama, func(w http.ResponseWriter, r *http.Request) {
-		path = r.URL.Path
-		b, _ := io.ReadAll(r.Body)
-		json.Unmarshal(b, &got)
-		w.Write([]byte(`{"model":"emb","embeddings":[[0.25,1],[2,-0.5]],"prompt_eval_count":7}`))
-	})
-
-	rec := post(`{"model":"emb","input":["a","b"]}`)
-	if rec.Code != 200 {
-		t.Fatalf("status %d %s", rec.Code, rec.Body.String())
-	}
-	if path != "/api/embed" || got["model"] != "emb" {
-		t.Errorf("engine got %s %v", path, got)
-	}
-	var resp struct {
-		Object string
-		Data   []struct {
-			Object    string
-			Index     int
-			Embedding []float64
-		}
-		Usage struct{ PromptTokens, TotalTokens int } `json:"usage"`
-	}
-	json.Unmarshal(rec.Body.Bytes(), &resp)
-	if resp.Object != "list" || len(resp.Data) != 2 || resp.Data[1].Index != 1 ||
-		resp.Data[1].Embedding[1] != -0.5 || resp.Data[0].Object != "embedding" {
-		t.Fatalf("response = %s", rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), `"prompt_tokens":7`) {
-		t.Errorf("usage missing: %s", rec.Body.String())
-	}
-
-	// base64: little-endian float32s, as OpenAI encodes them.
-	rec = post(`{"model":"emb","input":"a","encoding_format":"base64"}`)
-	var b64 struct{ Data []struct{ Embedding string } }
-	json.Unmarshal(rec.Body.Bytes(), &b64)
-	raw, err := base64.StdEncoding.DecodeString(b64.Data[0].Embedding)
-	if err != nil || len(raw) != 8 || math.Float32frombits(binary.LittleEndian.Uint32(raw[4:])) != 1 {
-		t.Fatalf("base64 embedding = %q (%v)", b64.Data[0].Embedding, err)
-	}
-
-	// Token input cannot be expressed to Ollama.
-	if rec := post(`{"model":"emb","input":[1,2,3]}`); rec.Code != 400 {
-		t.Errorf("token input on Ollama: status %d, want 400", rec.Code)
 	}
 }
 

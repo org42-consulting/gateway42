@@ -67,7 +67,7 @@ var mcpCatalogs = struct {
 const mcpCatalogTTL = 30 * time.Second
 
 // mcpToolsFor returns the MCP tools an engine exposes to its models, or nil.
-// Only OpenAI-compatible engines can have them (Ollama has no MCP client).
+// Any engine may expose them; oMLX does when started with an MCP config.
 // The list is cached briefly, failures included, so an engine without the
 // endpoint costs one probe per TTL rather than one per request.
 func mcpToolsFor(e Engine) map[string]string {
@@ -214,7 +214,7 @@ func (s *mcpSession) execute(ctx context.Context, call mcpCall) mcpResult {
 	}
 	ctx, cancel := context.WithTimeout(ctx, upstreamChatTimeout())
 	defer cancel()
-	res, err := postJSON(ctx, EngineOpenAICompat, "mcp_execute", s.adapter.upstream("/v1/mcp/execute"), s.adapter.cfg.APIKey,
+	res, err := postJSON(ctx, s.adapter.Type(), "mcp_execute", s.adapter.upstream("/v1/mcp/execute"), s.adapter.cfg.APIKey,
 		map[string]interface{}{"tool_name": call.Name, "arguments": args})
 	out := mcpResult{}
 	switch {

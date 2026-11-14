@@ -12,24 +12,20 @@
             <div>
                 <label for="engine-type">Engine Type</label>
                 <select name="engine_type" id="engine-type" class="select-sm">
-                    <option value="ollama">Ollama</option>
+                    <option value="omlx">oMLX</option>
                     <option value="openai_compat">OpenAI-Compatible</option>
                 </select>
             </div>
             <div>
                 <label for="engine-name">Engine Name</label>
-                <input type="text" name="engine_name" id="engine-name" placeholder="e.g., Local Ollama">
+                <input type="text" name="engine_name" id="engine-name" placeholder="e.g., Mac Studio">
             </div>
             <div>
                 <label for="base-url">Base URL</label>
-                <input type="text" name="base_url" id="base-url" placeholder="e.g., http://127.0.0.1">
-            </div>
-            <div id="port-field">
-                <label for="port-input">Port Number</label>
-                <input type="number" name="port" id="port-input" value="11434" placeholder="e.g., 11434">
+                <input type="text" name="base_url" id="base-url" placeholder="e.g., http://127.0.0.1:8000">
             </div>
             <div id="api-key-field">
-                <label for="api-key-input">API Key (optional)</label>
+                <label for="api-key-input" id="api-key-label">API Key</label>
                 <input type="password" name="api_key" id="api-key-input" placeholder="e.g., sk-..." autocomplete="new-password">
             </div>
         </div>
@@ -77,15 +73,22 @@
                             {{if index $.EngineModelDetails (printf "%d" .ID)}}
                                 <div class="flex-row tag-list">
                                     {{$engineID := .ID}}
-                                    {{$isOllama := eq .Type "ollama"}}
                                     {{range index $.EngineModelDetails (printf "%d" $engineID)}}
-                                    <span class="model-tag">{{.Name}}{{if .Size}} ({{.Size}}){{end}}{{if $isOllama}}
-                                        <form action="/admin/ollama-delete-model" method="post" class="form-inline"
+                                    <span class="model-tag{{if .Loaded}} is-loaded{{end}}">{{if .Manageable}}<span class="model-state" title="{{if .Loaded}}Loaded{{else if .Loading}}Loading…{{else}}Not loaded{{end}}">{{if .Loaded}}&#9679;{{else if .Loading}}&#9680;{{else}}&#9675;{{end}}</span> {{end}}{{.Name}}{{if .Size}} ({{.Size}}){{end}}{{if .Manageable}}
+                                        <!-- oMLX model actions: load or unload, and delete from disk. -->
+                                        <form action="/admin/omlx-model-action" method="post" class="form-inline">
+                                            <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
+                                            <input type="hidden" name="engine_id" value="{{$engineID}}">
+                                            <input type="hidden" name="model" value="{{.Name}}">
+                                            {{if .Loaded}}<button type="submit" name="action" value="unload" class="tag-act" title="Unload {{.Name}} from memory">Unload</button>
+                                            {{else if not .Loading}}<button type="submit" name="action" value="load" class="tag-act" title="Load {{.Name}} into memory">Load</button>{{end}}
+                                        </form>
+                                        <form action="/admin/omlx-model-action" method="post" class="form-inline"
                                               onsubmit="return confirm('Delete model {{.Name}}? This removes the weights from disk and cannot be undone.');">
                                             <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
                                             <input type="hidden" name="engine_id" value="{{$engineID}}">
                                             <input type="hidden" name="model" value="{{.Name}}">
-                                            <button type="submit" class="tag-del" title="Delete {{.Name}}"
+                                            <button type="submit" name="action" value="delete" class="tag-del" title="Delete {{.Name}}"
                                                     aria-label="Delete {{.Name}}">&times;</button>
                                         </form>
                                     {{end}}</span>
@@ -101,7 +104,7 @@
                                  when the field is submitted blank. -->
                             <button type="button" class="btn btn-ghost btn-small engine-edit"
                                     data-id="{{.ID}}" data-name="{{.Name}}" data-type="{{.Type}}"
-                                    data-url="{{.BaseURL}}" data-port="{{.Port}}">Edit</button>
+                                    data-url="{{.BaseURL}}">Edit</button>
                             <form action="/admin/engine-remove" method="post" class="form-inline"
                                   onsubmit="return confirm('Remove this engine? This cannot be undone.');">
                                 <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
@@ -119,17 +122,18 @@
     <p class="text-hint wraps no-engines">No engines configured. Add one above.</p>
     {{end}}
 
-    <!-- Search Models Section -->
-    <label class="search-label">Search Model</label>
+    <!-- Search Models Section: MLX models on Hugging Face, downloaded by oMLX. -->
+    <label class="search-label">Download Model</label>
     <p class="section-desc flush">
-        Search for models on <a class="link" href="https://ollama.com/search" target="_blank">https://ollama.com/search</a>
+        Search MLX models on <a class="link" href="https://huggingface.co/models?library=mlx" target="_blank" rel="noopener">Hugging Face</a>
+        and download them to an oMLX engine. The engine needs its main oMLX API key for this.
     </p>
     <div class="flex-row search-row">
-        <input type="text" id="search-model-name" placeholder="e.g., llama3.2" class="search-input-narrow">
-        <!-- Which Ollama host a Pull lands on. Hidden by the script when there is
+        <input type="text" id="search-model-name" placeholder="e.g., Qwen3 8B" class="search-input-narrow">
+        <!-- Which oMLX host a download lands on. Hidden by the script when there is
              only one, since the choice is then implied. -->
-        <select id="pull-engine" class="select-sm" title="Pull to engine">
-            {{range .Engines}}{{if eq .Type "ollama"}}<option value="{{.ID}}">Pull to: {{.Name}}</option>{{end}}{{end}}
+        <select id="pull-engine" class="select-sm" title="Download to engine">
+            {{range .Engines}}{{if eq .Type "omlx"}}<option value="{{.ID}}">Download to: {{.Name}}</option>{{end}}{{end}}
         </select>
         <button class="btn btn-primary" id="search-btn" type="button" onclick="startSearch()">Search</button>
     </div>
@@ -147,6 +151,7 @@
                     <tr>
                         <th>Model</th>
                         <th class="col-90">Size</th>
+                        <th class="col-90">Downloads</th>
                         <th class="col-80"></th>
                     </tr>
                 </thead>
@@ -156,7 +161,7 @@
         </div>
     </div>
 
-    <!-- Pull Status Display -->
+    <!-- Download progress -->
     <div id="pull-status" class="pull-status below-results">
         <div class="pull-status-row">
             <span id="pull-status-text" class="pull-status-text"></span>
@@ -215,16 +220,14 @@
 <script>
 (function() {
     const sel = document.getElementById('engine-type');
-    const portField = document.getElementById('port-field');
-    const apiKeyField = document.getElementById('api-key-field');
+    const apiKeyLabel = document.getElementById('api-key-label');
     const baseUrlInput = document.getElementById('base-url');
 
     function update() {
-        const isOllama = sel.value === 'ollama';
-        portField.classList.toggle('is-hidden', !isOllama);
-        apiKeyField.classList.toggle('is-hidden', isOllama);
-        // With or without /v1 both work for OpenAI-compatible engines.
-        baseUrlInput.placeholder = isOllama ? 'e.g., http://127.0.0.1' : 'e.g., http://127.0.0.1:8000/v1';
+        const isOMLX = sel.value === 'omlx';
+        // With or without /v1 both work.
+        baseUrlInput.placeholder = isOMLX ? 'e.g., http://127.0.0.1:8000' : 'e.g., http://127.0.0.1:1234/v1';
+        apiKeyLabel.textContent = isOMLX ? 'API Key (the main oMLX key, for model management)' : 'API Key (optional)';
     }
 
     sel.addEventListener('change', update);
@@ -233,7 +236,6 @@
     // ── Edit mode: the same form, pre-filled, with engine_id set ─────────────
     const idInput   = document.getElementById('engine-id');
     const nameInput = document.getElementById('engine-name');
-    const portInput = document.getElementById('port-input');
     const keyInput  = document.getElementById('api-key-input');
     const saveBtn   = document.getElementById('save-btn');
     const cancelBtn = document.getElementById('cancel-edit-btn');
@@ -255,7 +257,6 @@
             nameInput.value = d.name;
             sel.value       = d.type;
             baseUrlInput.value = d.url;
-            portInput.value = (d.port && d.port !== '0') ? d.port : '11434';
             keyInput.value  = '';
             // The stored key is never sent to the page; blank means "keep it".
             keyInput.placeholder = 'Leave blank to keep the current key';
@@ -320,11 +321,14 @@ function startSearch() {
     btn.textContent = 'Searching…';
     status.classList.add('is-open');
     setTone(statusText);
-    statusText.textContent = 'Searching ollama.com...';
+    statusText.textContent = 'Searching Hugging Face…';
     resultsContainer.classList.add('is-hidden');
     resultsBody.innerHTML = '';
 
-    fetch('/admin/ollama-search?q=' + encodeURIComponent(query))
+    const searchParams = new URLSearchParams({ q: query });
+    const searchEngine = document.getElementById('pull-engine');
+    if (searchEngine.value) searchParams.set('engine_id', searchEngine.value);
+    fetch('/admin/omlx-search?' + searchParams)
         .then(response => response.json())
         .then(data => {
             btn.disabled = false;
@@ -351,20 +355,24 @@ function startSearch() {
                 const row = document.createElement('tr');
                 const nameCell = document.createElement('td');
                 const sizeCell = document.createElement('td');
+                const dlCell = document.createElement('td');
                 const actionCell = document.createElement('td');
                 const pullBtn = document.createElement('button');
 
                 nameCell.textContent = model.Name;
                 sizeCell.className = 'text-hint wraps';
-                sizeCell.textContent = model.Size;
+                sizeCell.textContent = model.Size || '';
+                dlCell.className = 'text-hint';
+                dlCell.textContent = model.Downloads ? model.Downloads.toLocaleString() : '';
 
                 pullBtn.className = 'btn btn-primary btn-small';
-                pullBtn.textContent = 'Pull';
+                pullBtn.textContent = 'Download';
                 pullBtn.onclick = function() { startPullSearchResult(model.Name, pullBtn); };
 
                 actionCell.appendChild(pullBtn);
                 row.appendChild(nameCell);
                 row.appendChild(sizeCell);
+                row.appendChild(dlCell);
                 row.appendChild(actionCell);
                 resultsBody.appendChild(row);
             });
@@ -379,9 +387,9 @@ function startSearch() {
         });
 }
 
-// btn is the row's own Pull button, passed in by the click handler. Looking it
-// up by id here would grab the Search button instead, disabling that and
-// leaving it relabelled "Pull" once the download finished.
+// btn is the row's own Download button, passed in by the click handler. Looking
+// it up by id here would grab the Search button instead, disabling that and
+// leaving it relabelled once the download finished.
 function startPullSearchResult(modelName, btn) {
     const status     = document.getElementById('pull-status');
     const statusText = document.getElementById('pull-status-text');
@@ -390,7 +398,7 @@ function startPullSearchResult(modelName, btn) {
     const bytesEl    = document.getElementById('pull-bytes');
 
     btn.disabled = true;
-    btn.textContent = 'Pulling…';
+    btn.textContent = 'Downloading…';
     status.classList.add('is-open');
     setTone(statusText);
     statusText.textContent = 'Starting…';
@@ -398,20 +406,13 @@ function startPullSearchResult(modelName, btn) {
     pct.textContent = '';
     bytesEl.textContent = '';
 
-    const layers = {};
-
     function fmt(b) {
         if (b >= 1e9) return (b / 1e9).toFixed(1) + ' GB';
         if (b >= 1e6) return Math.round(b / 1e6) + ' MB';
         return Math.round(b / 1e3) + ' KB';
     }
 
-    function updateBar() {
-        let totalB = 0, completedB = 0;
-        for (const v of Object.values(layers)) {
-            totalB += v.total;
-            completedB += v.completed;
-        }
+    function updateBar(completedB, totalB) {
         if (totalB > 0) {
             const p = Math.round((completedB / totalB) * 100);
             fill.style.width = p + '%';
@@ -422,9 +423,9 @@ function startPullSearchResult(modelName, btn) {
 
     function done(success) {
         btn.disabled = false;
-        btn.textContent = 'Pull';
+        btn.textContent = 'Download';
         if (success) {
-            statusText.textContent = modelName + ' pulled successfully.';
+            statusText.textContent = modelName + ' downloaded. Reload the page to see it.';
             setTone(statusText, 'ok');
             fill.style.width = '100%';
             pct.textContent = '100%';
@@ -432,15 +433,16 @@ function startPullSearchResult(modelName, btn) {
         }
     }
 
-    // The pull is a GET (EventSource cannot POST), so the CSRF token rides in
-    // the query string and the handler checks it there.
+    // The download is a GET (EventSource cannot POST), so the CSRF token rides
+    // in the query string and the handler checks it there. The download runs
+    // on the oMLX engine; closing the page stops only this progress view.
     const params = new URLSearchParams({
-        model: modelName,
+        repo_id: modelName,
         _csrf: document.querySelector('meta[name="csrf-token"]').content,
     });
     const pullEngine = document.getElementById('pull-engine');
     if (pullEngine.value) params.set('engine_id', pullEngine.value);
-    const es = new EventSource('/admin/ollama-pull-stream?' + params);
+    const es = new EventSource('/admin/omlx-download-stream?' + params);
 
     es.onmessage = (e) => {
         if (e.data === '[DONE]') { es.close(); return; }
@@ -458,9 +460,8 @@ function startPullSearchResult(modelName, btn) {
             setTone(statusText);
             statusText.textContent = d.status;
         }
-        if (d.digest && d.total !== undefined) {
-            layers[d.digest] = { total: d.total || 0, completed: d.completed || 0 };
-            updateBar();
+        if (d.total !== undefined) {
+            updateBar(d.completed || 0, d.total || 0);
         }
         if (d.status === 'success') {
             es.close();

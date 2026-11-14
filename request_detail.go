@@ -162,9 +162,9 @@ func (d *requestDetail) setOutcome(o string) {
 func newRequestID() string { return "req_" + randomHex(8) }
 
 // recordCompletionDetail fills the collector from a non-streaming completion.
-// The payload is either a *wire.ChatCompletion (Ollama, after ollamaToOpenAI) or
-// the engine's raw JSON map (OpenAI-compat, relayed unmodified), so both
-// shapes are read here rather than forcing a marshal round-trip.
+// The payload is either a typed *wire.ChatCompletion or the engine's raw JSON
+// map (relayed unmodified), so both shapes are read here rather than forcing
+// a marshal round-trip.
 func recordCompletionDetail(r *http.Request, payload interface{}) {
 	d := detailFromContext(r)
 	if d == nil {

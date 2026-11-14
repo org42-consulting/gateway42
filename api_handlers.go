@@ -91,18 +91,6 @@ func handleListModels(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		reachable++
-		// Ollama's listing has no context length; ask /api/show (cached,
-		// bounded) for this engine's models.
-		var ollamaWindows map[string]int
-		if oa, ok := cachedAdapter(e.ID).(*OllamaAdapter); ok {
-			names := make([]string, 0, len(pd.raw))
-			for _, m := range pd.raw {
-				if n := modelName(m); n != "" {
-					names = append(names, n)
-				}
-			}
-			ollamaWindows = ollamaContextWindows(oa, names, 3*time.Second)
-		}
 		for _, m := range pd.raw {
 			name := modelName(m)
 			if name == "" || seen[name] {
@@ -112,13 +100,11 @@ func handleListModels(w http.ResponseWriter, r *http.Request) {
 			}
 			seen[name] = true
 
-			// Ollama reports "modified_at"; OpenAI-compat engines already send
-			// a numeric "created". Fall back to now rather than 0, which some
-			// clients render as 1970.
+			// OpenAI-compatible engines send a numeric "created". Fall back to
+			// now rather than 0, which some clients render as 1970.
 			created, _ := m["created"].(float64)
 			if created == 0 {
-				ts, _ := m["modified_at"].(string)
-				created = float64(parseOllamaTS(ts))
+				created = float64(time.Now().Unix())
 			}
 			modelList = append(modelList, wire.Model{
 				ID:      name,
@@ -132,7 +118,7 @@ func handleListModels(w http.ResponseWriter, r *http.Request) {
 				CreatedAt:   time.Unix(int64(created), 0).UTC().Format(time.RFC3339),
 				Size:        int64(toInt(m["size"])),
 
-				MaxInputTokens:      max(modelContextWindow(m), ollamaWindows[name]),
+				MaxInputTokens:      modelContextWindow(m),
 				AnthropicFamilyTier: stringField(m, "anthropic_family_tier"),
 				IsFamilyDefault:     m["is_family_default"] == true,
 			})
@@ -274,13 +260,8 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		selected.Release()
 	}()
 
-	if selected.Type() == EngineOllama {
-		// Ollama returns one choice per request; answering n > 1 with a single
-		// choice would look like success.
-		if n := toInt(data["n"]); n > 1 {
-			writeOpenAIError(w, 400, "n > 1 is not supported by the engine serving this model (Ollama)", "invalid_request_error")
-			return
-		}
+	if isOMLX(selected) {
+		// oMLX takes images only as data: URIs; see remote_images.go.
 		messages = inlineRemoteImages(r.Context(), messages)
 	}
 	engineReq := buildEngineRequest(selected, data, messages)
@@ -309,19 +290,10 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Ollama's /api/chat answers with its own envelope
-	// ({model, message:{…}, done, eval_count}); clients calling this gateway
-	// expect the OpenAI chat.completion shape. The streaming path already
-	// translates, so the non-streaming one has to as well.
-	//
-	// An OpenAI-compatible engine's body is relayed as-is — typing it would
-	// mean dropping any field this gateway does not model, and a passthrough
-	// that silently truncates the upstream response is worse than an untyped
-	// one.
+	// The engine's body is relayed as-is — typing it would mean dropping any
+	// field this gateway does not model, and a passthrough that silently
+	// truncates the upstream response is worse than an untyped one.
 	var payload interface{} = result
-	if selected.Type() == EngineOllama {
-		payload = ollamaToOpenAI(result)
-	}
 	// What the model said before each backend MCP call is part of the
 	// answer the client receives.
 	if len(rounds) > 0 {
@@ -381,7 +353,8 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 
-	if adapter.Type() == EngineOllama {
+	if isOMLX(adapter) {
+		// oMLX takes images only as data: URIs; see remote_images.go.
 		messages = inlineRemoteImages(r.Context(), messages)
 	}
 	engineReq := buildEngineRequest(adapter, data, messages)
@@ -392,8 +365,8 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	showMCP := mcpBlocksRequested(r)
 
 	if streaming, _ := data["stream"].(bool); streaming {
-		// Asking the engine for usage is openAICompatRequest's job now, and it
-		// runs for every non-Ollama adapter — so the Claude Code case (its
+		// Asking the engine for usage is openAICompatRequest's job, and it
+		// runs for every engine — so the Claude Code case (its
 		// context window comes from message_delta.usage, and a stream without
 		// usage would read as zero tokens) is covered from one place.
 		streamMessages(w, r, adapter, engineReq, user.ID, model, messages, thinkingRequested(body),
@@ -412,11 +385,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicEngineFailure(w, err)
 		return
 	}
-	var payload interface{} = result
-	if adapter.Type() == EngineOllama {
-		payload = ollamaToOpenAI(result)
-	}
-	msg, err := openAIToAnthropic(payload, model)
+	msg, err := openAIToAnthropic(result, model)
 	if err != nil {
 		slog.Error("translate engine response", "err", err, "model", model)
 		writeAnthropicError(w, 502, "Unexpected engine response", "api_error")
@@ -649,8 +618,8 @@ func streamMessages(w http.ResponseWriter, r *http.Request, adapter Engine,
 //
 // The count comes from the engine when it can give one: oMLX (and other
 // servers that implement Anthropic's API) answer /v1/messages/count_tokens
-// with their own tokenizer. Otherwise — Ollama, an engine without the
-// endpoint, or any failure within the time budget — it is estimateTokens'
+// with their own tokenizer. Otherwise — an engine without the endpoint, or
+// any failure within the time budget — it is estimateTokens'
 // estimate, which errs on the high side, the safe direction for the
 // compaction decision clients use it for. No concurrency slot is taken:
 // counting is cheap and must not queue behind generations.
@@ -698,7 +667,7 @@ func engineTokenCount(ctx context.Context, model string, body map[string]interfa
 	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	result, err := postJSON(ctx, EngineOpenAICompat, "count_tokens", adapter.upstream("/v1/messages/count_tokens"), adapter.cfg.APIKey, req)
+	result, err := postJSON(ctx, adapter.Type(), "count_tokens", adapter.upstream("/v1/messages/count_tokens"), adapter.cfg.APIKey, req)
 	if err != nil {
 		return 0, false
 	}
@@ -898,16 +867,10 @@ func acquireEngine(w http.ResponseWriter, r *http.Request, model string,
 	}, true
 }
 
-// buildEngineRequest translates the OpenAI-shaped request for the engine —
-// only Ollama adapters need it.
+// buildEngineRequest builds the engine request body from the OpenAI-shaped
+// request: the allow-listed parameters, minus the local-engine extensions
+// when the engine is the OpenAI platform.
 func buildEngineRequest(adapter Engine, data map[string]interface{}, messages []map[string]interface{}) map[string]interface{} {
-	if adapter.Type() == EngineOllama {
-		req := openAIToOllama(data, messages)
-		if oa, ok := adapter.(*OllamaAdapter); ok {
-			applyOllamaNumCtx(oa, req)
-		}
-		return req
-	}
 	req := openAICompatRequest(data, messages)
 	// chat_template_kwargs is a local-engine extension (vLLM, oMLX, LM Studio,
 	// llama.cpp); the OpenAI platform rejects unknown parameters, and the
@@ -943,10 +906,9 @@ func isOpenAIPlatform(baseURL string) bool {
 // A stream carries usage only if the engine was asked for it, so this is where
 // the gateway asks. Without include_usage every streamed completion to this
 // engine type logs zero tokens, which the request log and the usage panel both
-// read as a free request rather than an unmeasured one. Ollama needs nothing:
-// it reports counts on its final line. This is the single owner for both
-// front-ends, since buildEngineRequest routes here for every non-Ollama
-// adapter. A caller's own stream_options sub-fields are carried through, with
+// read as a free request rather than an unmeasured one. This is the single
+// owner for both front-ends, since buildEngineRequest routes here for every
+// engine. A caller's own stream_options sub-fields are carried through, with
 // include_usage forced on — usage on a response the gateway is auditing is
 // never unwanted, and an accurate audit is not negotiable.
 func openAICompatRequest(data map[string]interface{}, messages []map[string]interface{}) map[string]interface{} {

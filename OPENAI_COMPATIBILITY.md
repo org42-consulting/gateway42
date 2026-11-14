@@ -5,7 +5,7 @@ This document describes how Gateway42 provides an OpenAI-compatible API interfac
 ## Overview
 
 Gateway42 exposes an OpenAI-compatible API in front of whatever engines you have configured —
-Ollama, oMLX, LM Studio, or OpenAI itself. Applications built against the OpenAI SDKs can point at
+oMLX (the first-class engine), vLLM, LM Studio, llama.cpp, or OpenAI itself. Applications built against the OpenAI SDKs can point at
 Gateway42 unchanged and gain its authentication, per-user rate limiting, and audit logging.
 
 ## Supported Endpoints
@@ -15,7 +15,7 @@ Only these two paths exist under `/v1/`. Anything else returns `404`.
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
 | `POST` | `/v1/chat/completions` | Chat completion, streaming or not |
-| `POST` | `/v1/embeddings` | Embeddings; Ollama engines are translated to `/api/embed` |
+| `POST` | `/v1/embeddings` | Embeddings, relayed to the engine |
 | `POST` | `/v1/responses` | Responses API, passed through to the engine (streaming or not) |
 | `POST` | `/v1/completions` | Legacy completions, passed through; streams get `include_usage` |
 | `POST` | `/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/audio/translations` | Passed through (multipart uploads byte for byte; audio returned as bytes) |
@@ -33,7 +33,7 @@ Only these two paths exist under `/v1/`. Anything else returns `404`.
 #### Request Format
 ```json
 {
-  "model": "llama3.2:latest",
+  "model": "Qwen3-8B-4bit",
   "messages": [
     {"role": "user", "content": "Hello"}
   ],
@@ -52,7 +52,7 @@ Only these two paths exist under `/v1/`. Anything else returns `404`.
   "id": "chatcmpl-...",
   "object": "chat.completion",
   "created": 1234567890,
-  "model": "llama3.2:latest",
+  "model": "Qwen3-8B-4bit",
   "choices": [
     {
       "index": 0,
@@ -71,11 +71,6 @@ Only these two paths exist under `/v1/`. Anything else returns `404`.
 }
 ```
 
-On the Ollama path `finish_reason` follows Ollama's `done_reason`: `"length"` when the reply was cut
-off by `max_tokens` (Ollama's `num_predict`), so a client can tell a truncated completion from a
-finished one, and `"stop"` otherwise. An absent `done_reason` (older Ollama builds) or a value
-OpenAI has no name for is reported as `"stop"`, never `null` or a non-standard string.
-
 ### 2. Model Listing
 
 **GET /v1/models**
@@ -86,11 +81,11 @@ OpenAI has no name for is reported as `"stop"`, never `null` or a non-standard s
   "object": "list",
   "data": [
     {
-      "id": "llama3.2:latest",
+      "id": "Qwen3-8B-4bit",
       "object": "model",
       "created": 1234567890,
-      "owned_by": "ollama",
-      "size": 2019393189
+      "owned_by": "omlx",
+      "max_input_tokens": 40960
     }
   ]
 }
@@ -115,8 +110,8 @@ the README's *Backend MCP tools* for details.
 ## Pass-through endpoints
 
 `/v1/responses`, `/v1/completions`, `/v1/audio/*`, `/v1/images/generations` and `/v1/moderations` are
-relayed to the engine's own implementation rather than translated: oMLX, vLLM, LM Studio and Ollama
-(on its OpenAI-compatible `/v1` routes) implement most of them, and a translation onto chat
+relayed to the engine's own implementation rather than translated: oMLX, vLLM and LM Studio
+implement most of them, and a translation onto chat
 completions would lose what makes each one different. The request is routed by its `model` (a
 multipart field for audio uploads; optional for moderations, which then use the default engine)
 with the usual admission and failover. Server-sent events are relayed line for line, flushed at each
@@ -129,12 +124,8 @@ client receives with the engine's reason.
 ## Embeddings
 
 `POST /v1/embeddings` takes OpenAI's body: `model`, `input` (a string, a list of strings, or token
-arrays), `dimensions`, `encoding_format` and `user`. OpenAI-compatible engines receive exactly those
-fields and their response is relayed unchanged. Ollama engines receive `/api/embed` with `model`,
-`input` and `dimensions`; the response is translated to OpenAI's `list` of `embedding` objects, with
-`usage.prompt_tokens` from `prompt_eval_count`. `encoding_format: "base64"` is encoded by the gateway
-as little-endian float32, as OpenAI does. Token-array input is rejected with `400` for Ollama, which
-accepts text only. Rate limit, quota, routing with failover and engine-error handling are the same as
+arrays), `dimensions`, `encoding_format` and `user`. The engine receives exactly those fields and
+its response is relayed unchanged. Rate limit, quota, routing with failover and engine-error handling are the same as
 for chat completions.
 
 ## Engine Routing
@@ -150,13 +141,13 @@ Consequences worth knowing:
 
 - Requesting a model that no reachable engine reports returns `404`, not an upstream error. This is
   the one case where Gateway42 answers on the engine's behalf.
-- An omitted or empty `model` falls back to the default engine (the first configured Ollama engine,
-  or the first engine of any type if none is Ollama), matching the previous behaviour.
+- An omitted or empty `model` falls back to the default engine: the first configured oMLX engine,
+  or the first engine of any type if there is none.
 - If *every* engine is unreachable, the gateway does not conclude that the model is missing; it
   falls back to the default engine so the failure is reported as `502` from the engine rather than
   as a misleading `404`.
 - The index is cached for 60 seconds and refreshed in the background, so a routing lookup never
-  blocks on a probe. Model sets change only on a pull or delete, both of which invalidate the cache.
+  blocks on a probe. A download, delete, load or unload from the admin page invalidates it.
 
 `/v1/models` aggregates across every reachable engine and reports `owned_by` as the type of the
 engine that actually holds each model. A model present on two engines appears once. An engine that
@@ -184,43 +175,12 @@ asked for usage is an engine that reports it, and a completion the gateway canno
 hole rather than a free request. Your own sub-fields ride along untouched. On a non-stream it is
 dropped, because the field describes a stream that is not happening.
 
-`chat_template_kwargs.enable_thinking: false` becomes Ollama's `think: false`.
-Reasoning from an Ollama thinking model (`message.thinking`) is returned as `reasoning_content`,
-the field OpenAI-compatible reasoning engines use; replies without reasoning are unchanged.
-
-For Ollama engines, parameters are instead mapped into Ollama's `options` object:
-
-| OpenAI | Ollama | Note |
-| ------ | ------ | ---- |
-| `temperature` | `temperature` | Direct |
-| `top_p` | `top_p` | Direct |
-| `seed` | `seed` | Direct |
-| `max_tokens` | `num_predict` | Direct |
-| `max_completion_tokens` | `num_predict` | Wins over `max_tokens` when both are sent; OpenAI treats `max_tokens` as its deprecated alias |
-| `stop` | `stop` | A bare string is wrapped into a list |
-| `frequency_penalty` | `frequency_penalty` | Direct — Ollama takes this parameter under its own name |
-| `presence_penalty` | `presence_penalty` | Direct — Ollama takes this parameter under its own name |
-| `top_k` / `min_p` | `top_k` / `min_p` | Direct |
-| `repetition_penalty` | `repeat_penalty` | Renamed |
-| `tools` | `tools` | Same schema. Ollama has no `tool_choice`: `"none"` withholds the tools, a named function offers only that tool, `"required"` and `"auto"` offer them all |
-| `functions` / `function_call` | `tools` | The legacy function-calling fields become tools; a history's `function_call` turns and `function` results become tool calls and tool results. Replies use `tool_calls` |
-| `logprobs` / `top_logprobs` | `logprobs` / `top_logprobs` | Returned as the choice's `logprobs.content`, streaming or not |
-| `n` | — | Ollama returns one choice; `n > 1` is rejected with `400` rather than answered with one |
-| `logit_bias`, `parallel_tool_calls` | — | Not supported by Ollama; ignored |
-| — | `options.num_ctx` | Set from `GW42_OLLAMA_NUM_CTX` when configured, clamped to the model's maximum |
-| `response_format` | `format` | `json_object` → `"json"`; `json_schema` → the schema object |
-
-Tool calls from an Ollama engine are returned in OpenAI shape — string `arguments`, a minted `id`
-per call, a streaming `index`, and `finish_reason: "tool_calls"` — and the message history of a tool
-loop is translated back (a tool result's `tool_call_id` becomes Ollama's `tool_name`). Array content
-is split into text and `images`. `http(s)` image URLs are fetched by the gateway and inlined (see
-`GW42_FETCH_IMAGE_URLS`: public addresses only, 15 s, 20 MB, image types only, cached for 30
-minutes because a conversation resends its images every turn); one that cannot be fetched becomes a
-text note. A `file` part (a PDF) becomes a note too, as Ollama reads no files.
-
-On both paths, messages keep `tool_calls`, `tool_call_id` and `name`, and array content is
-preserved, with each text part truncated to `GW42_MAX_INPUT_LENGTH` when that is set. Anything not in the table above is
-dropped rather than rejected on the Ollama path.
+On both API paths, messages keep `tool_calls`, `tool_call_id` and `name`, and array content is
+preserved, with each text part truncated to `GW42_MAX_INPUT_LENGTH` when that is set. For oMLX
+engines, which take images only as `data:` URIs, `http(s)` image URLs are fetched by the gateway and
+inlined (see `GW42_FETCH_IMAGE_URLS`: public addresses only, 15 s, 20 MB, image types only, cached
+for 30 minutes because a conversation resends its images every turn); one that cannot be fetched
+becomes a text note.
 
 ## Authentication
 
@@ -240,11 +200,10 @@ displayed exactly once, at creation. A disabled user's key stops working immedia
 - The final chunk before `[DONE]` carries `usage`
 - The first chunk's delta includes `"role": "assistant"`
 
-That usage chunk is guaranteed rather than best-effort: on the OpenAI-compatible path the gateway asks
-for it with `include_usage`, so it arrives even if your request set `include_usage: false`. There it
-takes OpenAI's own shape — a separate final chunk whose `choices` array is empty — because compat
-streams are forwarded verbatim. (An Ollama engine's counts are instead folded into the terminating
-chunk that carries `finish_reason`, so there is no extra chunk to notice.) Well-behaved SDKs skip an
+That usage chunk is guaranteed rather than best-effort: the gateway asks the engine for it with
+`include_usage`, so it arrives even if your request set `include_usage: false`. It takes OpenAI's own
+shape — a separate final chunk whose `choices` array is empty — because streams are forwarded
+verbatim. Well-behaved SDKs skip an
 empty `choices`, but strict client code that assumes every chunk carries a choice should index
 defensively.
 
@@ -305,7 +264,7 @@ curl http://localhost:7000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_API_KEY_HERE" \
   -d '{
-    "model": "llama3.2:latest",
+    "model": "Qwen3-8B-4bit",
     "messages": [{"role": "user", "content": "Explain quantum computing"}]
   }'
 
@@ -314,7 +273,7 @@ curl http://localhost:7000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_API_KEY_HERE" \
   -d '{
-    "model": "llama3.2:latest",
+    "model": "Qwen3-8B-4bit",
     "messages": [{"role": "user", "content": "Explain quantum computing"}],
     "stream": true
   }'
@@ -335,7 +294,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="llama3.2:latest",
+    model="Qwen3-8B-4bit",
     messages=[
         {"role": "user", "content": "Explain quantum computing"}
     ],
@@ -348,23 +307,18 @@ print(response.choices[0].message.content)
 The `/v1` handlers live in `api_handlers.go`, kept apart from the admin web UI in `handlers.go` so a
 change to the admin panel cannot alter this contract.
 
-The translation layer lives in `openai.go`:
-
-- `openAIToOllama` maps OpenAI parameters onto Ollama's `options` object
-- `ollamaToOpenAI` wraps a complete Ollama reply in the `chat.completion` envelope
-- `formatStreamChunk` converts each Ollama streaming line into a `chat.completion.chunk`
-- `openaiError` builds the error envelope above
-
-The response bodies themselves are typed structs in `types.go`. Only what Gateway42 *authors* is
-typed — completions, chunks, the model list and errors. Inbound requests and the bodies relayed from
+Every engine speaks OpenAI's wire format, so there is no translation layer on this path:
+`openAICompatRequest` builds the engine request from the allow-list, and `openaiError` builds the
+error envelope above. The response bodies the gateway authors are typed structs in
+`internal/wire` — the model list, errors, and the Anthropic translation's shapes. Inbound requests and the bodies relayed from
 OpenAI-compatible engines stay as maps on purpose, so unrecognised parameters and unmodelled
 response fields pass through instead of being dropped.
 
-Engine-specific transport is in `engine.go`, behind the `Engine` interface implemented by
-`OllamaAdapter` and `OpenAICompatAdapter`. Streaming crosses that interface as a `ChatStream`
-(`Recv() ([]byte, error)`, terminated by `io.EOF`) rather than an `http.ResponseWriter`: adapters
-produce OpenAI-shaped payloads, and `api_handlers.go` owns the SSE framing, flushing and `[DONE]`
-for both engine types.
+Engine transport is in `engine.go`, behind the `Engine` interface implemented by
+`OpenAICompatAdapter` for both engine types (oMLX and OpenAI-compatible). Streaming crosses that
+interface as a `ChatStream` (`Recv() ([]byte, chunkMeta, error)`, terminated by `io.EOF`) rather
+than an `http.ResponseWriter`, and `api_handlers.go` owns the SSE framing, flushing and `[DONE]`.
+oMLX's model management lives in `omlx.go`.
 
 Model-name routing is in `routing.go`; `selectEngine` resolves a model to an adapter against the
 cached routing index.

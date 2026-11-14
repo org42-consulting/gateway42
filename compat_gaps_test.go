@@ -191,12 +191,6 @@ func TestToolResultImagesFollowToolMessages(t *testing.T) {
 	if string(got) != want {
 		t.Fatalf("messages:\n got %s\nwant %s", got, want)
 	}
-
-	// Ollama receives them as the user message's images.
-	om := ollamaMessages(sanitizeMessages(msgs))
-	if imgs, _ := om[2]["images"].([]string); len(imgs) != 2 {
-		t.Fatalf("Ollama images = %v, want both tool images", om[2]["images"])
-	}
 }
 
 func TestTextOnlyToolResultUnchanged(t *testing.T) {
@@ -286,24 +280,6 @@ func TestThinkingRequested(t *testing.T) {
 	}
 }
 
-func TestOllamaThinkingBecomesReasoningContent(t *testing.T) {
-	cc := ollamaToOpenAI(map[string]interface{}{"done": true,
-		"message": map[string]interface{}{"role": "assistant", "content": "hi", "thinking": "greet"}})
-	if cc.Choices[0].Message.ReasoningContent != "greet" {
-		t.Fatalf("message = %+v", cc.Choices[0].Message)
-	}
-	chunk := formatStreamChunk(map[string]interface{}{"message": map[string]interface{}{"thinking": "hm"}}, "id", false)
-	if chunk.Choices[0].Delta.ReasoningContent != "hm" {
-		t.Fatalf("delta = %+v", chunk.Choices[0].Delta)
-	}
-	// No thinking, no new field: authored bodies are unchanged.
-	b, _ := json.Marshal(ollamaToOpenAI(map[string]interface{}{"done": true,
-		"message": map[string]interface{}{"role": "assistant", "content": "hi"}}))
-	if strings.Contains(string(b), "reasoning") {
-		t.Fatalf("reasoning field without reasoning: %s", b)
-	}
-}
-
 func TestReasoningParamsForwarded(t *testing.T) {
 	data := decodeJSON(t, `{"model":"m","reasoning_effort":"low","chat_template_kwargs":{"enable_thinking":false}}`).(map[string]interface{})
 	b, _ := json.Marshal(openAICompatRequest(data, nil))
@@ -340,13 +316,6 @@ func TestDocumentBlocksReachTheModel(t *testing.T) {
 		if !strings.Contains(string(got), want) {
 			t.Errorf("content missing %s:\n%s", want, got)
 		}
-	}
-
-	// Ollama reads no files: the PDF becomes a note, its bytes never reach the prompt.
-	om := ollamaMessages(clean)
-	text, _ := om[0]["content"].(string)
-	if !strings.Contains(text, `[Attached file "spec.pdf" could not be included`) || strings.Contains(text, "JVBERi0x") {
-		t.Errorf("Ollama content = %q", text)
 	}
 }
 

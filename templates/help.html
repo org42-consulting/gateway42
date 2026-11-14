@@ -7,12 +7,12 @@
         Gateway42 is a secure, multi-user API gateway for local and remote AI inference backends.
         It sits between your users and your inference engines, exposing an <strong>OpenAI-compatible API</strong>
         while adding authentication, logging, and rate limiting. Supported backends:
-        <a class="link" href="https://ollama.com" target="_blank">Ollama</a> (local) and any
-        <strong>OpenAI-compatible endpoint</strong> — LM Studio, oMLX, or the real OpenAI API.
+        <a class="link" href="https://github.com/jundot/omlx" target="_blank" rel="noopener">oMLX</a> (local, Apple silicon),
+        managed from this page, and any <strong>OpenAI-compatible endpoint</strong> — vLLM, LM Studio, llama.cpp, or the real OpenAI API.
     </p>
     <ul>
         <li><strong>OpenAI-compatible API</strong> — clients built for the OpenAI API work with Gateway42 without modification — just swap the base URL and API key.</li>
-        <li><strong>Multiple engine backends</strong> — connect Ollama instances and OpenAI-compatible endpoints; manage them from the Settings page without restarting.</li>
+        <li><strong>Multiple engine backends</strong> — connect oMLX instances and OpenAI-compatible endpoints; manage them from the Settings page without restarting.</li>
         <li><strong>API key authentication</strong> — every user receives a unique key; only active users can send requests.</li>
         <li><strong>Per-user rate limiting</strong> — configurable maximum requests per minute per user.</li>
         <li><strong>Daily token quotas</strong> — optional per-user budget of tokens per day (input + output combined), enforced alongside rate limiting.</li>
@@ -125,17 +125,18 @@
         <thead><tr><th>Type</th><th>Description</th></tr></thead>
         <tbody>
             <tr>
-                <td><strong>Ollama</strong></td>
+                <td><strong>oMLX</strong></td>
                 <td>
-                    A local (or LAN-accessible) <a class="link" href="https://ollama.com" target="_blank">Ollama</a>
-                    instance. Provide the host address and port (default: <code>11434</code>). The gateway
-                    translates OpenAI-format requests to Ollama's native API automatically.
+                    A local (or LAN-accessible) <a class="link" href="https://github.com/jundot/omlx" target="_blank" rel="noopener">oMLX</a>
+                    server, e.g. <code>http://127.0.0.1:8000</code>. Give it oMLX's main API key: besides inference, the
+                    gateway uses it to manage the engine's models (download, load, unload, delete) and to run the
+                    tools of oMLX's MCP servers.
                 </td>
             </tr>
             <tr>
                 <td><strong>OpenAI-compatible</strong></td>
                 <td>
-                    Any endpoint that speaks the OpenAI API — oMLX, LM Studio, vLLM, or the real OpenAI API.
+                    Any other endpoint that speaks the OpenAI API — vLLM, LM Studio, llama.cpp, or the real OpenAI API.
                     Provide the base URL and an API key if required. The base URL works with or without its
                     <code>/v1</code>. Requests pass through without translation.
                 </td>
@@ -146,7 +147,7 @@
     <h3>Engine Management</h3>
     <p>For each engine you can:</p>
     <ul>
-        <li><strong>Add</strong> — name it, select the type, and provide the URL/host, port (Ollama), and API key (OpenAI-compatible).</li>
+        <li><strong>Add</strong> — name it, select the type, and provide the base URL (with its port) and the API key.</li>
         <li><strong>Edit</strong> — update an existing engine's connection details or API key. Leave the API key blank to keep the current one; it is never shown back.</li>
         <li><strong>Remove</strong> — delete an engine you no longer need.</li>
         <li><strong>Test Saved Engines</strong> — probe every engine already added. Typed-in values are not tested; click <em>Add Engine</em> first. A refusal shows the engine's status and reason, e.g. <code>401 Unauthorized: Invalid API key</code>.</li>
@@ -162,29 +163,33 @@
     <p>
         A model that no reachable engine reports gets <code>404</code> rather than being forwarded
         somewhere it will fail. A request with no <code>model</code> falls back to the first
-        configured Ollama engine, or the first engine of any type if none is Ollama.
+        configured oMLX engine, or the first engine of any type if there is none.
     </p>
 
-    <h3>Model Management (Ollama engines)</h3>
+    <h3>Model Management (oMLX engines)</h3>
     <p>
         Lists every configured engine with its reachability status and, for reachable ones, the models
-        installed on it and their disk size. An engine that cannot be reached shows an
-        <strong>INACTIVE</strong> badge and an empty model list.
+        on it. An engine that cannot be reached shows an <strong>INACTIVE</strong> badge and an empty
+        model list. For oMLX engines each model shows whether it is loaded (&#9679; loaded,
+        &#9680; loading, &#9675; not loaded), read live from oMLX.
     </p>
     <ul>
-        <li><strong>Delete</strong> (the <code>&times;</code> on a model tag, Ollama engines only) — removes that model from that engine. A confirmation dialog is shown first. This frees disk space but does not affect logs that referenced the model.</li>
+        <li><strong>Load / Unload</strong> (oMLX engines) — loads the model into memory, or frees the memory it holds. Loading a large model can take a while; the page waits for it.</li>
+        <li><strong>Delete</strong> (the <code>&times;</code> on a model tag, oMLX engines) — removes that model's weights from that engine's disk. A confirmation dialog is shown first. Logs that referenced the model are not affected.</li>
         <li><strong>Remove</strong> — deletes the engine from Gateway42's configuration. It does not touch the engine itself or any models on it.</li>
     </ul>
 
-    <h3>Search Models (Ollama engines)</h3>
+    <h3>Download Models (oMLX engines)</h3>
     <p>
-        Search for available models on <a class="link" href="https://ollama.com/search" target="_blank">ollama.com</a>.
-        Enter a model name or keyword and click <em>Search</em>. Results show matching models from the Ollama library,
-        including both standard models (e.g. <code>llama3.2</code>) and namespaced models (e.g. <code>batiai/qwen3.6-35b</code>).
+        Search MLX models on <a class="link" href="https://huggingface.co/models?library=mlx" target="_blank" rel="noopener">Hugging Face</a>
+        through oMLX. Enter a name or keyword (e.g. <code>Qwen3 8B</code>) and click <em>Search</em>; results show
+        the repository, its size and its download count.
     </p>
     <p>
-        Each search result includes a <strong>Pull</strong> button. Clicking it downloads the model to your Ollama instance — with several Ollama engines, choose which one in the selector next to <em>Search</em>. The model is routable as soon as the pull finishes.
-        A live progress bar tracks the download layer by layer, showing bytes transferred and overall percentage.
+        Each result has a <strong>Download</strong> button that has oMLX download the model — with several oMLX
+        engines, choose which one in the selector next to <em>Search</em>. A live progress bar shows the bytes
+        transferred. The download runs on the oMLX engine: closing the page stops only the progress display.
+        The model is routable as soon as the download finishes. Model management needs the engine's main oMLX API key.
     </p>
 
     <h3>Change Admin Password</h3>
@@ -297,7 +302,7 @@
   -H "Authorization: Bearer &lt;api_key&gt;" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "llama3.2:latest",
+    "model": "Qwen3-8B-4bit",
     "messages": [{"role": "user", "content": "Hello!"}]
   }'</pre>
 
@@ -310,35 +315,14 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="llama3.2:latest",
+    model="Qwen3-8B-4bit",
     messages=[{"role": "user", "content": "Hello!"}],
 )
 print(response.choices[0].message.content)</pre>
 
-    <h3>Parameters — Ollama engine</h3>
-    <p>When routing to an Ollama engine, Gateway42 translates standard OpenAI parameters to their Ollama equivalents:</p>
-    <table class="help-table">
-        <thead><tr><th>OpenAI parameter</th><th>Ollama parameter</th><th>Notes</th></tr></thead>
-        <tbody>
-            <tr><td><code>model</code></td><td><code>model</code></td><td>Must match an installed Ollama model name.</td></tr>
-            <tr><td><code>messages</code></td><td><code>messages</code></td><td>Full conversation history.</td></tr>
-            <tr><td><code>stream</code></td><td><code>stream</code></td><td>SSE streaming when <code>true</code>.</td></tr>
-            <tr><td><code>temperature</code></td><td><code>temperature</code></td><td></td></tr>
-            <tr><td><code>top_p</code></td><td><code>top_p</code></td><td></td></tr>
-            <tr><td><code>max_tokens</code></td><td><code>num_predict</code></td><td></td></tr>
-            <tr><td><code>max_completion_tokens</code></td><td><code>num_predict</code></td><td>Wins over <code>max_tokens</code> when both are sent.</td></tr>
-            <tr><td><code>seed</code></td><td><code>seed</code></td><td></td></tr>
-            <tr><td><code>stop</code></td><td><code>stop</code></td><td>String or list of strings.</td></tr>
-            <tr><td><code>presence_penalty</code></td><td><code>presence_penalty</code></td><td>Direct — Ollama takes this parameter under its own name.</td></tr>
-            <tr><td><code>frequency_penalty</code></td><td><code>frequency_penalty</code></td><td>Direct — Ollama takes this parameter under its own name.</td></tr>
-            <tr><td><code>tools</code></td><td><code>tools</code></td><td>Forwarded as-is. <code>tool_choice: "none"</code> withholds them. Tool calls come back in OpenAI format with <code>finish_reason: "tool_calls"</code>.</td></tr>
-            <tr><td><code>response_format</code></td><td><code>format</code></td><td><code>json_object</code> → <code>"json"</code>; <code>json_schema</code> → the schema.</td></tr>
-        </tbody>
-    </table>
-
-    <h3>Parameters — OpenAI-compatible engine</h3>
+    <h3>Parameters</h3>
     <p>
-        When routing to an OpenAI-compatible engine, the standard OpenAI parameters pass through
+        Every engine speaks the OpenAI API, so the standard OpenAI parameters pass through
         without translation: <code>temperature</code>, <code>top_p</code>, <code>seed</code>,
         <code>max_tokens</code>, <code>max_completion_tokens</code>, <code>frequency_penalty</code>,
         <code>presence_penalty</code>, <code>stop</code>, <code>response_format</code>,
