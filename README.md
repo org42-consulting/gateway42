@@ -434,7 +434,7 @@ Errors use the OpenAI error envelope, so SDK error handling works unchanged:
 | `400` | `invalid_request_error` | Body is not valid JSON, or `messages` is missing |
 | `401` | `authentication_error` | Missing, invalid, or deactivated API key |
 | `404` | `invalid_request_error` | The requested model is not available on any reachable engine — including, on `/v1/chat/completions`, when no engine is reachable at all |
-| `413` | `invalid_request_error` | Request body too large (over 8 × `MAX_MESSAGE_LENGTH`) |
+| `413` | `invalid_request_error` | Request body too large (over `GW42_MAX_REQUEST_BYTES`) |
 | `429` | `rate_limit_error` | Per-minute rate limit exceeded, or daily token quota exhausted — wait before retrying |
 | `502` | `api_error` | Gateway42. could not reach the engine; also "no engines configured" on `/v1/models` and `/v1/messages` |
 | `503` | `api_error` | Engine is at its concurrency cap — retry after the `Retry-After` interval |
@@ -649,7 +649,7 @@ exported from that page.
 | Admin forms | CSRF token required on every state-changing POST; session cookie is `SameSite=Lax` and AES-encrypted as well as signed, so its contents (CSRF token, flash messages) are not readable client-side. |
 | Engine credentials | Upstream API keys are stored in the database and never rendered back into the settings form. Editing an engine with the key field left blank keeps the stored key. |
 | Transport | HTTPS when `TLS_CERT` and `TLS_KEY` are both set. |
-| Input bounds | Request bodies capped at 8 × `MAX_MESSAGE_LENGTH`; each logged prompt and response truncated to `MAX_MESSAGE_LENGTH`, on a rune boundary so truncation cannot split a multi-byte character. |
+| Input bounds | Request bodies capped at `GW42_MAX_REQUEST_BYTES`; the text of each message sent to an engine, and each logged prompt and response, truncated to `MAX_MESSAGE_LENGTH`, on a rune boundary so truncation cannot split a multi-byte character. |
 | Log retention | Prompts and responses are deleted after `GW42_LOG_RETENTION_DAYS`, so stored user content has a bounded lifetime. |
 | Panics | Recovered per request and returned as `500`; one bad request cannot take down the gateway. |
 
@@ -871,7 +871,8 @@ All configuration is via environment variables. No variables are strictly requir
 | `DEFAULT_RATE_LIMIT` | `10` | Default requests-per-minute for newly registered users. |
 | `SESSION_TIMEOUT` | `3600` | Admin session lifetime in seconds. |
 | `GW42_SESSION_KEY` | _(empty)_ | Base secret for signing and encrypting session cookies. Set it to keep sessions valid across restarts — unset, fresh random keys are generated at every boot and all users are logged out on restart. Derivation is `SHA-256(secret + "\|hash")` for the HMAC key and `SHA-256(secret + "\|block")` for the encryption key, so one secret safely yields two independent 32-byte keys. |
-| `MAX_MESSAGE_LENGTH` | `262144` | Maximum characters stored per prompt or response in the AI interaction log (~256 KB). |
+| `MAX_MESSAGE_LENGTH` | `262144` | Maximum bytes of text per message (~256 KB). Longer message text is truncated before it reaches the engine, and each prompt and response stored in the AI interaction log is capped at the same size. Raise it if clients send single messages larger than this, such as large tool results or pasted documents. |
+| `GW42_MAX_REQUEST_BYTES` | `33554432` | Maximum API request body (32 MiB, the Anthropic API's own limit). Claude Desktop, Cowork and Claude Code resend the whole session, screenshots included, on every turn, so this bounds the usable conversation, not a single message. Larger bodies get `413`. |
 | `LOG_LEVEL` | `INFO` | Log verbosity: `DEBUG`, `INFO`, `WARN` (or `WARNING`), `ERROR`. An unrecognised value falls back to `INFO` with a warning. |
 | `LOG_FILE` | `./logs/gateway.log` | Application log file, written in addition to stderr; the directory is created if needed. Set it empty to log to stderr only. When stderr is already redirected to this same file (as `install.sh` does under launchd) it is written once, not twice. |
 | `TLS_CERT` | _(empty)_ | Path to TLS certificate file. When set with `TLS_KEY`, enables HTTPS. |

@@ -111,7 +111,41 @@ func newStreamDeadline(parent context.Context, idle, overall time.Duration) *str
 		d.max = time.Now().Add(overall)
 	}
 	d.timer = time.AfterFunc(d.until(), d.fired)
+	// The adapters find touch in the context and call it for every byte the
+	// engine sends, not only for frames the handler sees. Engines keep a
+	// connection alive during a long prefill with SSE comments (oMLX sends
+	// ": keep-alive" every 10s) that the frame parsers rightly skip; touching
+	// only per frame read those as silence, so a prompt that took more than
+	// streamIdle to prefill — a long Claude Code / Cowork session on a local
+	// model — was cut off before the first token.
+	d.ctx = context.WithValue(ctx, streamActivityKey{}, d.touch)
 	return d
+}
+
+type streamActivityKey struct{}
+
+// touchOnRead wraps an upstream body so each read that returns data records
+// progress on the streamDeadline carried by ctx, if any. Reads happen on the
+// goroutine that calls Recv, the same one that touches the deadline per frame.
+func touchOnRead(ctx context.Context, r io.Reader) io.Reader {
+	touch, ok := ctx.Value(streamActivityKey{}).(func())
+	if !ok {
+		return r
+	}
+	return activityReader{r: r, touch: touch}
+}
+
+type activityReader struct {
+	r     io.Reader
+	touch func()
+}
+
+func (a activityReader) Read(p []byte) (int, error) {
+	n, err := a.r.Read(p)
+	if n > 0 {
+		a.touch()
+	}
+	return n, err
 }
 
 // fired runs on the timer goroutine. It can only have been armed for the sooner
@@ -993,7 +1027,7 @@ func (a *OllamaAdapter) StreamChat(ctx context.Context, req map[string]interface
 	}
 	return &ollamaStream{
 		body:         stream,
-		scanner:      newStreamScanner(stream),
+		scanner:      newStreamScanner(touchOnRead(ctx, stream)),
 		completionID: newCompletionID(),
 		isFirst:      true,
 	}, nil
@@ -1165,7 +1199,7 @@ func (a *OpenAICompatAdapter) StreamChat(ctx context.Context, req map[string]int
 	if err != nil {
 		return nil, err
 	}
-	return &passthroughStream{body: stream, scanner: newStreamScanner(stream)}, nil
+	return &passthroughStream{body: stream, scanner: newStreamScanner(touchOnRead(ctx, stream))}, nil
 }
 
 // ── Ollama-only helpers (search, pull, delete) ────────────────────────────────

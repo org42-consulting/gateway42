@@ -498,7 +498,7 @@ func handleCountTokens(w http.ResponseWriter, r *http.Request) {
 	}
 	// Rate limited like the completion endpoints by rateLimitMiddleware: no
 	// engine is involved, but each call still decodes and re-encodes a body
-	// of up to 8× MaxMsgLen.
+	// of up to maxRequestBytes.
 	body, ok := decodeAPIBody(w, r, writeAnthropicError)
 	if !ok {
 		return
@@ -523,12 +523,23 @@ func writeAnthropicError(w http.ResponseWriter, status int, message, errType str
 	jsonResponse(w, status, anthropicError(status, message, errType))
 }
 
-// decodeAPIBody reads a bounded JSON object body.
-//
-// The bound is ~8× MaxMsgLen so a multi-turn conversation of bounded-length
-// messages still fits; truncateInput then trims each field.
+// defaultMaxRequestBytes is the GW42_MAX_REQUEST_BYTES default: 32 MiB, the
+// Anthropic Messages API's own request limit. See Config.MaxRequestBytes.
+const defaultMaxRequestBytes = 32 << 20
+
+// maxRequestBytes is the configured body bound, or the default when the
+// setting is unset or not positive (a zero Config, as in tests, included).
+func maxRequestBytes() int64 {
+	if cfg.MaxRequestBytes > 0 {
+		return int64(cfg.MaxRequestBytes)
+	}
+	return defaultMaxRequestBytes
+}
+
+// decodeAPIBody reads a bounded JSON object body. The bound is
+// maxRequestBytes; truncateInput then trims each message's text.
 func decodeAPIBody(w http.ResponseWriter, r *http.Request, writeErr apiErrorWriter) (map[string]interface{}, bool) {
-	r.Body = http.MaxBytesReader(w, r.Body, int64(cfg.MaxMsgLen)*8)
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes())
 	var data map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&data); err != nil || data == nil {
 		var mbe *http.MaxBytesError
