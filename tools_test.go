@@ -64,8 +64,26 @@ func TestSanitizeMessagesAbsentContentStaysEmptyString(t *testing.T) {
 	}
 }
 
-func TestSanitizeMessagesTruncatesArrayTextWithoutMutatingInput(t *testing.T) {
+func withMaxInputLen(t *testing.T, n int) {
+	t.Helper()
+	prev := cfg.MaxInputLen
+	cfg.MaxInputLen = n
+	t.Cleanup(func() { cfg.MaxInputLen = prev })
+}
+
+// MAX_MESSAGE_LENGTH bounds the audit log, not the model's input: by default a
+// message reaches the engine whole, however long.
+func TestSanitizeMessagesKeepsLongTextByDefault(t *testing.T) {
 	withMaxMsgLen(t, 5)
+	withMaxInputLen(t, 0)
+	msgs := sanitizeMessages(decodeJSON(t, `[{"role":"user","content":"0123456789"}]`).([]interface{}))
+	if msgs[0]["content"] != "0123456789" {
+		t.Fatalf("content = %q, want it whole", msgs[0]["content"])
+	}
+}
+
+func TestSanitizeMessagesTruncatesArrayTextWithoutMutatingInput(t *testing.T) {
+	withMaxInputLen(t, 5)
 	raw := decodeJSON(t, `[{"role":"user","content":[
 		{"type":"text","text":"0123456789"},
 		{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}

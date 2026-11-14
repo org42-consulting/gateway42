@@ -57,6 +57,10 @@ type Config struct {
 	DefaultRL     int
 	SessionTTL    int
 	MaxMsgLen     int
+	// MaxInputLen caps the text of each message sent to an engine, in bytes;
+	// 0 (the default) means no per-message cap. Separate from MaxMsgLen,
+	// which bounds what the audit log stores. See truncateEngineInput.
+	MaxInputLen int
 	// MaxRequestBytes bounds an API request body. It is its own setting, not
 	// a multiple of MaxMsgLen: a Claude Desktop / Cowork / Claude Code request
 	// carries the whole conversation — tool definitions, every earlier turn
@@ -137,6 +141,7 @@ func loadConfig() Config {
 		DefaultRL:           getEnvInt("DEFAULT_RATE_LIMIT", 10),
 		SessionTTL:          getEnvInt("SESSION_TIMEOUT", 3600),
 		MaxMsgLen:           getEnvInt("MAX_MESSAGE_LENGTH", 262144), // ~256KB
+		MaxInputLen:         getEnvInt("GW42_MAX_INPUT_LENGTH", 0),
 		MaxRequestBytes:     getEnvInt("GW42_MAX_REQUEST_BYTES", defaultMaxRequestBytes),
 		LogLevel:            getEnv("LOG_LEVEL", "INFO"),
 		LogFile:             getEnv("LOG_FILE", "./logs/gateway.log"),
@@ -1064,6 +1069,7 @@ func setupRouter() *mux.Router {
 	r.HandleFunc("/v1/models", handleListModels).Methods("GET")
 	r.HandleFunc("/v1/whoami", handleWhoami).Methods("GET")
 	r.HandleFunc("/v1/chat/completions", handleChatCompletions).Methods("POST")
+	r.HandleFunc("/v1/embeddings", handleEmbeddings).Methods("POST")
 
 	// Anthropic Messages API (Claude Code, Anthropic SDKs)
 	r.HandleFunc("/v1/messages", handleMessages).Methods("POST")

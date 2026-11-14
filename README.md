@@ -229,6 +229,7 @@ Requests with a missing, invalid, or deactivated key are rejected with `401 Unau
 | Endpoint | Method | Description |
 | -------- | ------ | ----------- |
 | `/v1/chat/completions` | POST | Chat completion. Accepts OpenAI-format bodies. Set `"stream": true` for SSE streaming. |
+| `/v1/embeddings` | POST | Embeddings. OpenAI-format body (`model`, `input`, `dimensions`, `encoding_format`). OpenAI-compatible engines get it as-is; Ollama gets `/api/embed`, with `base64` encoded by the gateway. Ollama takes text input only, not token arrays. |
 | `/v1/messages` | POST | Anthropic Messages API, translated onto the same engines — see [Claude Code](#claude-code--anthropic-messages-api). |
 | `/v1/messages/count_tokens` | POST | Estimated input token count (≈ 4 bytes per token) in Anthropic format. |
 | `/v1/models` | GET | Returns the combined catalogue of every reachable engine. Each entry carries both OpenAI (`object`, `owned_by`) and Anthropic (`type`, `display_name`, `created_at`) fields. Duplicates are collapsed; an engine that is down is skipped rather than failing the listing. |
@@ -273,8 +274,8 @@ print(response.choices[0].message.content)
 `POST /v1/messages` accepts Anthropic-format requests — system prompt, content blocks, images,
 `tools`/`tool_choice`, `tool_use`/`tool_result` turns, streaming — and translates them onto the
 OpenAI-shaped pipeline every engine already speaks. Rate limits, token quotas, concurrency slots,
-metrics and the audit log are shared with `/v1/chat/completions`; routing stays on the
-single-engine path (see [Engine selection](#engine-selection)). Errors on these paths use
+metrics and the audit log are shared with `/v1/chat/completions`, and so is failover routing
+(see [Engine selection](#engine-selection)). Errors on these paths use
 Anthropic's envelope (`{"type":"error","error":{…}}`), with `not_found_error` for an unknown
 model and `overloaded_error` when the engine is busy.
 
@@ -306,7 +307,13 @@ Translated with care:
 - **Thinking**: when the request enables `thinking`, the engine's reasoning (`reasoning_content`,
   `reasoning`, or Ollama's `thinking`) is returned as `thinking` blocks, streamed as
   `thinking_delta`, with an empty signature. Without it, reasoning is dropped as before.
-  Thinking blocks sent back in history are not forwarded.
+  Thinking blocks sent back in history are not forwarded. The setting also reaches the engine:
+  `chat_template_kwargs.enable_thinking` is `true` for `enabled`/`adaptive` and `false` otherwise,
+  since Anthropic's default is no thinking. Ollama gets `think: false` when thinking is off and
+  nothing when it is on, because it rejects `think: true` for models that cannot think.
+  `output_config.effort` (the app's Effort control) becomes `reasoning_effort`, with `max` sent as
+  `high`. `chat_template_kwargs` is never sent to `api.openai.com`.
+- **Parallel tool use**: `tool_choice.disable_parallel_tool_use` becomes `parallel_tool_calls: false`.
 - **Failover**: `/v1/messages` tries every engine that holds the model, like `/v1/chat/completions`.
 
 #### Prompt caching (Claude Desktop, Cowork, Claude Code)
@@ -662,7 +669,7 @@ exported from that page.
 | Admin forms | CSRF token required on every state-changing POST; session cookie is `SameSite=Lax` and AES-encrypted as well as signed, so its contents (CSRF token, flash messages) are not readable client-side. |
 | Engine credentials | Upstream API keys are stored in the database and never rendered back into the settings form. Editing an engine with the key field left blank keeps the stored key. |
 | Transport | HTTPS when `TLS_CERT` and `TLS_KEY` are both set. |
-| Input bounds | Request bodies capped at `GW42_MAX_REQUEST_BYTES`; the text of each message sent to an engine, and each logged prompt and response, truncated to `MAX_MESSAGE_LENGTH`, on a rune boundary so truncation cannot split a multi-byte character. |
+| Input bounds | Request bodies capped at `GW42_MAX_REQUEST_BYTES`; each logged prompt and response truncated to `MAX_MESSAGE_LENGTH` and, only when `GW42_MAX_INPUT_LENGTH` is set, the text of each message sent to an engine truncated to it, both on a rune boundary so truncation cannot split a multi-byte character. |
 | Log retention | Prompts and responses are deleted after `GW42_LOG_RETENTION_DAYS`, so stored user content has a bounded lifetime. |
 | Panics | Recovered per request and returned as `500`; one bad request cannot take down the gateway. |
 
@@ -884,7 +891,8 @@ All configuration is via environment variables. No variables are strictly requir
 | `DEFAULT_RATE_LIMIT` | `10` | Default requests-per-minute for newly registered users. |
 | `SESSION_TIMEOUT` | `3600` | Admin session lifetime in seconds. |
 | `GW42_SESSION_KEY` | _(empty)_ | Base secret for signing and encrypting session cookies. Set it to keep sessions valid across restarts — unset, fresh random keys are generated at every boot and all users are logged out on restart. Derivation is `SHA-256(secret + "\|hash")` for the HMAC key and `SHA-256(secret + "\|block")` for the encryption key, so one secret safely yields two independent 32-byte keys. |
-| `MAX_MESSAGE_LENGTH` | `262144` | Maximum bytes of text per message (~256 KB). Longer message text is truncated before it reaches the engine, and each prompt and response stored in the AI interaction log is capped at the same size. Raise it if clients send single messages larger than this, such as large tool results or pasted documents. |
+| `MAX_MESSAGE_LENGTH` | `262144` | Maximum bytes stored per prompt or response in the AI interaction log (~256 KB). It does not limit what reaches the model. |
+| `GW42_MAX_INPUT_LENGTH` | `0` | Maximum bytes of text per message sent to an engine; longer text is truncated. `0` sends every message whole, so model input is bounded only by `GW42_MAX_REQUEST_BYTES`. |
 | `GW42_MAX_REQUEST_BYTES` | `33554432` | Maximum API request body (32 MiB, the Anthropic API's own limit). Claude Desktop, Cowork and Claude Code resend the whole session, screenshots included, on every turn, so this bounds the usable conversation, not a single message. Larger bodies get `413`. |
 | `LOG_LEVEL` | `INFO` | Log verbosity: `DEBUG`, `INFO`, `WARN` (or `WARNING`), `ERROR`. An unrecognised value falls back to `INFO` with a warning. |
 | `LOG_FILE` | `./logs/gateway.log` | Application log file, written in addition to stderr; the directory is created if needed. Set it empty to log to stderr only. When stderr is already redirected to this same file (as `install.sh` does under launchd) it is written once, not twice. |

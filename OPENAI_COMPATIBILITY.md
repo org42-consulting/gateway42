@@ -15,7 +15,8 @@ Only these two paths exist under `/v1/`. Anything else returns `404`.
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
 | `POST` | `/v1/chat/completions` | Chat completion, streaming or not |
-| `GET` | `/v1/models` | List models across configured engines |
+| `POST` | `/v1/embeddings` | Embeddings; Ollama engines are translated to `/api/embed` |
+| `GET` | `/v1/models` | List models across configured engines, with `max_input_tokens` when the engine reports a context window |
 
 `OPTIONS` on any `/v1/` path is answered as a CORS preflight.
 
@@ -93,6 +94,17 @@ OpenAI has no name for is reported as `"stop"`, never `null` or a non-standard s
 fields. `created` comes from the engine where available and falls back to the current time rather
 than `0`, which some clients render as 1970.
 
+## Embeddings
+
+`POST /v1/embeddings` takes OpenAI's body: `model`, `input` (a string, a list of strings, or token
+arrays), `dimensions`, `encoding_format` and `user`. OpenAI-compatible engines receive exactly those
+fields and their response is relayed unchanged. Ollama engines receive `/api/embed` with `model`,
+`input` and `dimensions`; the response is translated to OpenAI's `list` of `embedding` objects, with
+`usage.prompt_tokens` from `prompt_eval_count`. `encoding_format: "base64"` is encoded by the gateway
+as little-endian float32, as OpenAI does. Token-array input is rejected with `400` for Ollama, which
+accepts text only. Rate limit, quota, routing with failover and engine-error handling are the same as
+for chat completions.
+
 ## Engine Routing
 
 Gateway42 routes a chat completion to an engine that actually holds the requested `model`.
@@ -135,6 +147,7 @@ asked for usage is an engine that reports it, and a completion the gateway canno
 hole rather than a free request. Your own sub-fields ride along untouched. On a non-stream it is
 dropped, because the field describes a stream that is not happening.
 
+`chat_template_kwargs.enable_thinking: false` becomes Ollama's `think: false`.
 Reasoning from an Ollama thinking model (`message.thinking`) is returned as `reasoning_content`,
 the field OpenAI-compatible reasoning engines use; replies without reasoning are unchanged.
 

@@ -94,6 +94,14 @@ func openAIToOllama(data map[string]interface{}, messages []map[string]interface
 	if format := ollamaFormat(data["response_format"]); format != nil {
 		req["format"] = format
 	}
+	// chat_template_kwargs.enable_thinking (sent by OpenAI clients, and by
+	// the Anthropic translation) is Ollama's top-level "think". Only false is
+	// forwarded: Ollama rejects think:true for a model without thinking
+	// support, while a thinking model already thinks by default, so true
+	// would add an error case and nothing else.
+	if ctk, _ := data["chat_template_kwargs"].(map[string]interface{}); ctk["enable_thinking"] == false {
+		req["think"] = false
+	}
 	return req
 }
 

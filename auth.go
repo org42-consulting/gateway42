@@ -321,10 +321,28 @@ func validatePassword(password string) (bool, string) {
 // a partial UTF-8 rune at the tail, which json.Marshal silently replaces with
 // U+FFFD in the audit log rather than rejecting.
 func truncateInput(text string) string {
-	if len(text) <= cfg.MaxMsgLen {
+	return truncateAt(text, cfg.MaxMsgLen)
+}
+
+// truncateEngineInput caps the text of a message sent to an engine at
+// MaxInputLen bytes, on a rune boundary; MaxInputLen <= 0 (the default) sends
+// it whole. This used to be truncateInput — the audit log's limit — so every
+// message over 256 KB reached the model cut short without a word: a large
+// tool result or pasted document silently lost its tail. What reaches the
+// model is now bounded only by GW42_MAX_REQUEST_BYTES unless an operator
+// sets a per-message limit on purpose.
+func truncateEngineInput(text string) string {
+	if cfg.MaxInputLen <= 0 {
 		return text
 	}
-	cut := cfg.MaxMsgLen
+	return truncateAt(text, cfg.MaxInputLen)
+}
+
+func truncateAt(text string, limit int) string {
+	if len(text) <= limit {
+		return text
+	}
+	cut := limit
 	for cut > 0 && !utf8.RuneStart(text[cut]) {
 		cut--
 	}
