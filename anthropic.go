@@ -225,11 +225,10 @@ func randomHex(n int) string {
 //
 // Parameters with no OpenAI equivalent — metadata, container, mcp_servers —
 // are dropped: an engine that cannot honour them would only reject the
-// request. top_k is forwarded, since local engines take it (Ollama as an
-// option).
+// request. top_k is forwarded, since local engines take it.
 //
-// cache_control is dropped too, but caching is not: oMLX, vLLM, llama.cpp,
-// LM Studio and Ollama all reuse the KV cache for the longest prompt prefix
+// cache_control is dropped too, but caching is not: oMLX, vLLM, llama.cpp
+// and LM Studio all reuse the KV cache for the longest prompt prefix
 // they have seen, with no per-request marker. What they need is a prefix that
 // is byte-identical from one turn to the next, so this translation must be
 // deterministic (json.Marshal sorts map keys, and nothing here depends on the
@@ -260,8 +259,8 @@ func anthropicToOpenAI(data map[string]interface{}) (map[string]interface{}, []i
 	// "thinking" (or with type "disabled") turns it off; "enabled" and
 	// "adaptive" turn it on. The switch local engines read is the chat
 	// template's enable_thinking (Qwen3, DeepSeek, GLM and others; a template
-	// without the variable ignores it), sent as chat_template_kwargs, which
-	// openAIToOllama turns into Ollama's think:false. Without it a reasoning
+	// without the variable ignores it), sent as chat_template_kwargs. Without
+	// it a reasoning
 	// model thinks on every turn the client asked it not to — minutes of
 	// tokens on a local model, all thrown away by withoutThinking.
 	out["chat_template_kwargs"] = map[string]interface{}{"enable_thinking": thinkingRequested(data)}
@@ -536,8 +535,7 @@ func mediaParts(v interface{}) []interface{} {
 // documentFilePart turns a base64 PDF document into OpenAI's file content
 // part ({"type":"file","file":{"filename","file_data"}}), which oMLX converts
 // to text itself (its MarkItDown integration) and the OpenAI platform reads
-// natively. Engines that take no files get a note instead — Ollama via
-// flattenContent. nil for any other document.
+// natively. nil for any other document.
 func documentFilePart(block map[string]interface{}) map[string]interface{} {
 	src, _ := block["source"].(map[string]interface{})
 	mt, _ := src["media_type"].(string)
@@ -622,8 +620,8 @@ func joinTextParts(parts []interface{}) string {
 }
 
 // imageDataURL turns an Anthropic base64 image source into the data: URL
-// OpenAI image parts use. URL sources are returned as-is; ollamaMessages
-// drops those, as it does for OpenAI clients.
+// OpenAI image parts use. URL sources are returned as-is; for oMLX, which
+// takes only data: URIs, inlineRemoteImages fetches them.
 func imageDataURL(src interface{}) string {
 	s, ok := src.(map[string]interface{})
 	if !ok {
@@ -716,10 +714,9 @@ func toolInput(args string) json.RawMessage {
 	return json.RawMessage(args)
 }
 
-// openAIToAnthropic converts a non-streaming chat completion — either the
-// typed body ollamaToOpenAI produced or a relayed OpenAI-compatible map — to
-// an Anthropic message. Round-tripping through wire.ChatCompletion gives both
-// sources one typed shape to read.
+// openAIToAnthropic converts a non-streaming chat completion — the engine's
+// OpenAI-shaped body, typed or as a decoded map — to an Anthropic message.
+// Round-tripping through wire.ChatCompletion gives both one typed shape.
 func openAIToAnthropic(payload interface{}, model string) (*AnthropicMessage, error) {
 	var cc wire.ChatCompletion
 	switch p := payload.(type) {

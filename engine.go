@@ -12,8 +12,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
-	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -304,9 +302,20 @@ func cachedAdaptersByType(t string) []Engine {
 	return out
 }
 
-// Engine type constants
+// Engine type constants.
+//
+// EngineOMLX is oMLX, the first-class engine: OpenAI-compatible on the wire,
+// plus what the gateway uses beyond that — its model management (Hugging
+// Face search and download, delete, load and unload; see omlx.go), backend
+// MCP tools, exact token counts, and the inlining of image URLs it does not
+// fetch itself. EngineOpenAICompat is any other OpenAI-compatible server
+// (vLLM, LM Studio, llama.cpp, the OpenAI API). Both use OpenAICompatAdapter.
+//
+// Ollama was a third type with its own adapter and wire translation; it was
+// replaced by oMLX. Engines saved with it are moved to EngineOpenAICompat on
+// Ollama's OpenAI-compatible /v1 endpoint at startup (engine_migration.go).
 const (
-	EngineOllama       = "ollama"
+	EngineOMLX         = "omlx"
 	EngineOpenAICompat = "openai_compat"
 )
 
@@ -316,7 +325,7 @@ type EngineConfig struct {
 	Name    string `json:"name"`
 	Type    string `json:"type"`
 	BaseURL string `json:"base_url"`
-	Port    int    `json:"port,omitempty"`    // for Ollama, default 11434
+	Port    int    `json:"port,omitempty"`    // legacy (Ollama); read only by the migration
 	APIKey  string `json:"api_key,omitempty"` // for openai_compat engines
 }
 
@@ -328,7 +337,7 @@ type Engine interface {
 	ListModels() ([]map[string]interface{}, error)                                        // list available models
 	Chat(ctx context.Context, req map[string]interface{}) (map[string]interface{}, error) // non-streaming
 	StreamChat(ctx context.Context, req map[string]interface{}) (ChatStream, error)       // streaming
-	baseURL() string                                                                      // host:port for Ollama-only ops
+	baseURL() string                                                                      // the engine's scheme://host[:port]/path, for display
 
 	// Upstream concurrency control. Acquire blocks until a slot is free OR
 	// ctx fires; Release returns the slot. Always pair them with defer.
@@ -351,34 +360,14 @@ type Engine interface {
 // test can drive an adapter's translator straight from a bytes.Reader.
 //
 // The metadata rides along for the same reason the payload is pre-shaped:
-// the adapter has already parsed the chunk (ollamaStream to translate it,
-// passthroughStream to read it), so it can hand the handler its audit text
+// the adapter has already parsed the chunk (passthroughStream reads it), so
+// it can hand the handler its audit text
 // and usage for free. Having the handler re-unmarshal every frame was a
 // second full parse of every token of every completion, on the request path,
 // to re-derive text that was in hand one frame earlier.
 type ChatStream interface {
 	Recv() (payload []byte, meta chunkMeta, err error)
 	Close() error
-}
-
-// deltaAuditText renders a delta's client-visible text for the audit log:
-// the content plus each tool call as "[tool_call name] arguments". OpenAI
-// streams a call as a name on its first fragment and argument fragments
-// after; Ollama sends both at once. Writing the name when it appears and
-// every fragment as it arrives reassembles both shapes.
-func deltaAuditText(d wire.Delta) string {
-	if len(d.ToolCalls) == 0 {
-		return d.Content
-	}
-	var b strings.Builder
-	b.WriteString(d.Content)
-	for _, tc := range d.ToolCalls {
-		if tc.Function.Name != "" {
-			b.WriteString("\n[tool_call " + tc.Function.Name + "] ")
-		}
-		b.WriteString(tc.Function.Arguments)
-	}
-	return b.String()
 }
 
 // auditChunk is the subset of a chat.completion.chunk the gateway reads for
@@ -431,77 +420,6 @@ func metaFromChunk(payload []byte) chunkMeta {
 	return meta
 }
 
-// ollamaStream translates Ollama's newline-delimited JSON into OpenAI chunks.
-type ollamaStream struct {
-	body         io.ReadCloser
-	scanner      *bufio.Scanner
-	completionID string
-	isFirst      bool
-	done         bool
-
-	// toolCalls counts the tool calls already sent. OpenAI clients assemble
-	// calls by their index across the whole stream, and the terminal chunk's
-	// finish_reason must say "tool_calls" if any were made — while Ollama
-	// sends the calls on an earlier line and ends with an ordinary "stop".
-	toolCalls int
-}
-
-func (s *ollamaStream) Recv() ([]byte, chunkMeta, error) {
-	if s.done {
-		return nil, chunkMeta{}, io.EOF
-	}
-	for s.scanner.Scan() {
-		line := strings.TrimSpace(s.scanner.Text())
-		if line == "" {
-			continue
-		}
-		var chunk map[string]interface{}
-		if err := json.Unmarshal([]byte(line), &chunk); err != nil {
-			// One unparseable line does not justify tearing down the stream:
-			// Ollama emits a self-contained JSON object per line, so the next
-			// one is still usable.
-			continue
-		}
-		c := formatStreamChunk(chunk, s.completionID, s.isFirst)
-		choice := &c.Choices[0]
-		for i := range choice.Delta.ToolCalls {
-			choice.Delta.ToolCalls[i].Index = s.toolCalls
-			s.toolCalls++
-		}
-		if choice.FinishReason != nil && s.toolCalls > 0 {
-			choice.FinishReason = &wire.FinishToolCalls
-		}
-		// The metadata comes out of the typed chunk that is already in
-		// hand — no second parse, and the tool-call renumbering above is
-		// already reflected in the audit text.
-		meta := chunkMeta{auditText: deltaAuditText(choice.Delta), model: c.Model}
-		if choice.FinishReason != nil {
-			meta.finish = *choice.FinishReason
-		}
-		if c.Usage != nil {
-			meta.inTokens, meta.outTokens = c.Usage.PromptTokens, c.Usage.CompletionTokens
-		}
-		out, err := json.Marshal(c)
-		if err != nil {
-			return nil, chunkMeta{}, err
-		}
-		s.isFirst = false
-		// Report this chunk, then stop on the next call — the final Ollama
-		// object carries both done:true and the usage counts, so returning
-		// EOF here instead would discard them.
-		if fin, _ := chunk["done"].(bool); fin {
-			s.done = true
-		}
-		return out, meta, nil
-	}
-	if err := s.scanner.Err(); err != nil {
-		return nil, chunkMeta{}, err
-	}
-	return nil, chunkMeta{}, io.EOF
-}
-
-func (s *ollamaStream) Close() error { return s.body.Close() }
-
 // passthroughStream forwards an upstream that already speaks OpenAI SSE. It
 // unwraps the "data: " framing so the handler can re-apply it uniformly for
 // both engine types. Non-data lines (SSE comments, "event:", "id:") are
@@ -544,8 +462,8 @@ func (s *passthroughStream) Recv() ([]byte, chunkMeta, error) {
 func (s *passthroughStream) Close() error { return s.body.Close() }
 
 // concurrencyLimiter caps simultaneous in-flight upstream requests per engine.
-// One Ollama instance cannot serve many parallel streams without thrashing;
-// the cap returns 503 instead of letting the GPU OOM.
+// One local engine cannot serve many parallel streams without thrashing; the
+// cap returns 503 instead of letting the GPU run out of memory.
 type concurrencyLimiter struct {
 	sem chan struct{}
 }
@@ -625,22 +543,20 @@ func saveEngines(engines []EngineConfig) error {
 func newEngine(cf EngineConfig) (Engine, error) {
 	cl := newConcurrencyLimiter(cfg.UpstreamConcurrency)
 	switch cf.Type {
-	case EngineOllama:
-		return &OllamaAdapter{cfg: cf, concurrencyLimiter: cl}, nil
-	case EngineOpenAICompat:
+	case EngineOMLX, EngineOpenAICompat:
 		return &OpenAICompatAdapter{cfg: cf, concurrencyLimiter: cl}, nil
 	default:
 		return nil, fmt.Errorf("unknown engine type: %s", cf.Type)
 	}
 }
 
-// modelName extracts the model identifier from a model map, handling both
-// Ollama ("name") and OpenAI-compat ("id") response formats.
+// modelName extracts the model identifier from a model listing entry: "id"
+// in OpenAI's shape, with "name" as a fallback for servers that use it.
 func modelName(m map[string]interface{}) string {
-	if n, _ := m["name"].(string); n != "" {
+	if n, _ := m["id"].(string); n != "" {
 		return n
 	}
-	n, _ := m["id"].(string)
+	n, _ := m["name"].(string)
 	return n
 }
 
@@ -932,131 +848,6 @@ func probeEngineFull(e Engine) probeData {
 	return probeData{status: true, models: names, details: details, raw: models}
 }
 
-// ─────────────────── OllamaAdapter ────────────────────────────────────────────
-
-type OllamaAdapter struct {
-	cfg EngineConfig
-	*concurrencyLimiter
-}
-
-func (a *OllamaAdapter) Type() string { return EngineOllama }
-func (a *OllamaAdapter) Name() string { return a.cfg.Name }
-
-func (a *OllamaAdapter) baseURL() string { return ollamaEndpoint(a.cfg) }
-
-// ollamaEndpoint is the one place an Ollama engine's scheme://host:port is
-// assembled. Every Ollama call — the adapter, the dashboard's endpoint column,
-// model deletion — must go through it: building "base:port" by hand elsewhere
-// is how a BaseURL that already carried a port became "host:11434:11434".
-func ollamaEndpoint(cf EngineConfig) string {
-	u := strings.TrimRight(strings.TrimSpace(cf.BaseURL), "/")
-	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
-		// Without a scheme net/http rejects the URL outright, so a BaseURL
-		// typed as a bare "127.0.0.1" would fail every probe.
-		u = "http://" + u
-	}
-	hostPort := strings.TrimPrefix(strings.TrimPrefix(u, "http://"), "https://")
-	if _, _, err := net.SplitHostPort(hostPort); err == nil {
-		// URL already contains a port — use as-is.
-		return u
-	}
-
-	port := cf.Port
-	if port == 0 {
-		port = 11434
-	}
-	return fmt.Sprintf("%s:%d", u, port)
-}
-
-func (a *OllamaAdapter) Status() (bool, error) {
-	var up bool
-	err := observeUpstream(EngineOllama, "status", func() error {
-		resp, err := controlClient.Get(a.baseURL() + "/api/version")
-		if err != nil {
-			return err
-		}
-		defer resp.Body.Close()
-		return statusErr(resp, &up)
-	})
-	return up, err
-}
-
-func (a *OllamaAdapter) ListModels() ([]map[string]interface{}, error) {
-	var tags map[string]interface{}
-	err := observeUpstream(EngineOllama, "list_models", func() error {
-		resp, err := controlClient.Get(a.baseURL() + "/api/tags")
-		if err != nil {
-			return err
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != 200 {
-			return fmt.Errorf("ollama returned %d", resp.StatusCode)
-		}
-		return json.NewDecoder(resp.Body).Decode(&tags)
-	})
-	if err != nil {
-		return nil, err
-	}
-	models, _ := tags["models"].([]interface{})
-	result := make([]map[string]interface{}, 0, len(models))
-	for _, m := range models {
-		if mm, ok := m.(map[string]interface{}); ok {
-			result = append(result, mm)
-		}
-	}
-	return result, nil
-}
-
-func (a *OllamaAdapter) Chat(ctx context.Context, req map[string]interface{}) (map[string]interface{}, error) {
-	body, _ := json.Marshal(req)
-	ctx, cancel := context.WithTimeout(ctx, upstreamChatTimeout())
-	defer cancel()
-
-	var result map[string]interface{}
-	err := observeUpstream(EngineOllama, "chat", func() error {
-		httpReq, _ := http.NewRequestWithContext(ctx, "POST", a.baseURL()+"/api/chat", bytes.NewReader(body))
-		httpReq.Header.Set("Content-Type", "application/json")
-		resp, err := completionClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != 200 {
-			return newUpstreamStatusError(resp)
-		}
-		return json.NewDecoder(resp.Body).Decode(&result)
-	})
-	if err != nil {
-		return nil, err
-	}
-	return result, nil
-}
-
-// StreamChat opens a streaming completion. The caller owns ctx — including its
-// deadline — because the returned stream outlives this call.
-func (a *OllamaAdapter) StreamChat(ctx context.Context, req map[string]interface{}) (ChatStream, error) {
-	body, err := json.Marshal(req)
-	if err != nil {
-		return nil, err
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", a.baseURL()+"/api/chat", bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	stream, err := openUpstreamStream(EngineOllama, httpReq)
-	if err != nil {
-		return nil, err
-	}
-	return &ollamaStream{
-		body:         stream,
-		scanner:      newStreamScanner(touchOnRead(ctx, stream)),
-		completionID: newCompletionID(),
-		isFirst:      true,
-	}, nil
-}
-
 // openUpstreamStream sends a streaming request and, once upstream has accepted
 // it, returns the live response body. On success the caller owns the body and
 // must Close it.
@@ -1093,7 +884,16 @@ type OpenAICompatAdapter struct {
 	*concurrencyLimiter
 }
 
-func (a *OpenAICompatAdapter) Type() string { return EngineOpenAICompat }
+// Type is EngineOMLX for an oMLX engine and EngineOpenAICompat otherwise.
+func (a *OpenAICompatAdapter) Type() string {
+	if a.cfg.Type == EngineOMLX {
+		return EngineOMLX
+	}
+	return EngineOpenAICompat
+}
+
+// isOMLX reports whether e is an oMLX engine.
+func isOMLX(e Engine) bool                  { return e != nil && e.Type() == EngineOMLX }
 func (a *OpenAICompatAdapter) Name() string { return a.cfg.Name }
 
 func (a *OpenAICompatAdapter) baseURL() string {
@@ -1138,7 +938,7 @@ func (a *OpenAICompatAdapter) doReq(method, path string, body io.Reader) (*http.
 
 func (a *OpenAICompatAdapter) Status() (bool, error) {
 	var up bool
-	err := observeUpstream(EngineOpenAICompat, "status", func() error {
+	err := observeUpstream(a.Type(), "status", func() error {
 		resp, err := a.doReq("GET", "/v1/models", nil)
 		if err != nil {
 			return err
@@ -1151,7 +951,7 @@ func (a *OpenAICompatAdapter) Status() (bool, error) {
 
 func (a *OpenAICompatAdapter) ListModels() ([]map[string]interface{}, error) {
 	var result map[string]interface{}
-	err := observeUpstream(EngineOpenAICompat, "list_models", func() error {
+	err := observeUpstream(a.Type(), "list_models", func() error {
 		resp, err := a.doReq("GET", "/v1/models", nil)
 		if err != nil {
 			return err
@@ -1181,7 +981,7 @@ func (a *OpenAICompatAdapter) Chat(ctx context.Context, req map[string]interface
 	defer cancel()
 
 	var result map[string]interface{}
-	err := observeUpstream(EngineOpenAICompat, "chat", func() error {
+	err := observeUpstream(a.Type(), "chat", func() error {
 		httpReq, _ := http.NewRequestWithContext(ctx, "POST", a.upstream("/v1/chat/completions"), bytes.NewReader(body))
 		httpReq.Header.Set("Content-Type", "application/json")
 		if a.cfg.APIKey != "" {
@@ -1219,77 +1019,11 @@ func (a *OpenAICompatAdapter) StreamChat(ctx context.Context, req map[string]int
 		httpReq.Header.Set("Authorization", "Bearer "+a.cfg.APIKey)
 	}
 
-	stream, err := openUpstreamStream(EngineOpenAICompat, httpReq)
+	stream, err := openUpstreamStream(a.Type(), httpReq)
 	if err != nil {
 		return nil, err
 	}
 	return &passthroughStream{body: stream, scanner: newStreamScanner(touchOnRead(ctx, stream))}, nil
-}
-
-// ── Ollama-only helpers (search, pull, delete) ────────────────────────────────
-
-// ollamaSearchLinkRe matches the model links on an ollama.com search page,
-// e.g. <a href="/library/llama3.2" class="group w-full"> and namespaced
-// entries like <a href="/batiai/qwen3.6-35b" class="group w-full">.
-var ollamaSearchLinkRe = regexp.MustCompile(`href="/(?:library/)?([^"/]+(?:/[^"/]+)?)\"[^>]*class="group w-full"`)
-
-// OllamaSearchModels scrapes ollama.com/search for models matching query.
-// This parses HTML, so it is inherently brittle to upstream redesigns; an
-// empty result set is far more likely than an error when that happens.
-func OllamaSearchModels(query string) ([]ModelDetail, error) {
-	resp, err := controlClient.Get(fmt.Sprintf("https://ollama.com/search?q=%s", url.QueryEscape(query)))
-	if err != nil {
-		return nil, fmt.Errorf("could not reach ollama.com: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("ollama.com search returned %d", resp.StatusCode)
-	}
-
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("reading ollama.com response: %w", err)
-	}
-	matches := ollamaSearchLinkRe.FindAllStringSubmatch(string(bodyBytes), -1)
-
-	seen := make(map[string]bool, len(matches))
-	results := make([]ModelDetail, 0, len(matches))
-	for _, m := range matches {
-		if len(m) > 1 && !seen[m[1]] {
-			seen[m[1]] = true
-			// Size is not exposed on the search page.
-			results = append(results, ModelDetail{Name: m[1], Size: "N/A"})
-		}
-	}
-	return results, nil
-}
-
-// OllamaDeleteModel deletes a model from an Ollama instance. endpoint is the
-// full scheme://host:port, as returned by ollamaEndpoint.
-func OllamaDeleteModel(endpoint, model string) error {
-	body, _ := json.Marshal(map[string]string{"name": model})
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	httpReq, _ := http.NewRequestWithContext(ctx, "DELETE", endpoint+"/api/delete", bytes.NewReader(body))
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := sharedClient.Do(httpReq)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	// Ollama answers a refused delete with a non-2xx and a reason in the body.
-	// Discarding the status made every rejection — unknown model, model in
-	// use, read-only store — look like a successful delete to the caller, and
-	// the admin UI reported one.
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("ollama delete %q: %s%s", model, resp.Status, upstreamErrDetail(resp.Body))
-	}
-	return nil
 }
 
 // statusErr turns a health-probe response into the Status result. A non-200
@@ -1326,7 +1060,7 @@ func upstreamErrMessage(body io.Reader) string {
 	if err != nil || len(raw) == 0 {
 		return ""
 	}
-	// Ollama puts the reason in a JSON "error" string; OpenAI-compatible
+	// Some servers put the reason in a JSON "error" string; OpenAI-compatible
 	// engines nest it as error.message; FastAPI-based engines (vLLM's and
 	// oMLX's bare HTTPExceptions) use a "detail" string. Anything that
 	// matches none is shown as-is, so an unexpected upstream is still

@@ -4,8 +4,7 @@ package main
 // /v1/images/generations and /v1/moderations.
 //
 // These are relayed to the engine's own implementation rather than
-// translated. oMLX, vLLM, LM Studio and Ollama (on its OpenAI-compatible /v1
-// routes) implement most of them, each faithfully in its own way; a
+// translated. oMLX, vLLM and LM Studio implement most of them, each faithfully in its own way; a
 // translation onto chat completions would lose what makes them different
 // (the Responses API's items and event stream, audio and image bodies). An
 // engine without the endpoint answers 404, and the client gets that 404 with
@@ -232,14 +231,10 @@ func inspectPassthroughBody(path, contentType string, raw []byte) (model string,
 	return model, streaming, raw, nil
 }
 
-// passthroughTarget is the engine URL for path: an OpenAI-compatible engine's
-// own route, or Ollama's OpenAI-compatible /v1 route.
+// passthroughTarget is the engine URL for path: the engine's own route.
 func passthroughTarget(adapter Engine, path string) (url, apiKey string) {
-	switch a := adapter.(type) {
-	case *OpenAICompatAdapter:
+	if a, ok := adapter.(*OpenAICompatAdapter); ok {
 		return a.upstream(path), a.cfg.APIKey
-	case *OllamaAdapter:
-		return a.baseURL() + path, ""
 	}
 	return "", ""
 }

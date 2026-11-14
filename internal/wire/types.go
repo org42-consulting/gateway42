@@ -26,8 +26,7 @@ type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
 	// ReasoningContent is the model's reasoning, kept apart from the answer:
-	// the de-facto field (DeepSeek, oMLX, older vLLM) for what Ollama calls
-	// "thinking". Reasoning is newer vLLM's name for the same thing; it is
+	// the de-facto field (DeepSeek, oMLX, older vLLM). Reasoning is newer vLLM's name for the same thing; it is
 	// only ever read, never authored. Both omitempty, so a reply without
 	// reasoning is the same body it always was.
 	ReasoningContent string     `json:"reasoning_content,omitempty"`
@@ -72,7 +71,6 @@ type StreamToolCall struct {
 
 // FunctionCall names the function and its arguments. Arguments is a string
 // of JSON, not an object: that is the OpenAI schema, and SDKs json.loads it.
-// Ollama sends an object, so the translation re-encodes it.
 type FunctionCall struct {
 	Name      string `json:"name"`
 	Arguments string `json:"arguments"`
@@ -123,8 +121,7 @@ type Choice struct {
 }
 
 // Logprobs is a choice's per-token log probabilities. Content holds OpenAI's
-// token objects ({token, logprob, bytes, top_logprobs}), which is also the
-// shape Ollama reports them in, so they are carried as decoded.
+// token objects ({token, logprob, bytes, top_logprobs}), carried as decoded.
 type Logprobs struct {
 	Content []interface{} `json:"content"`
 }

@@ -66,8 +66,11 @@ func TestEngineTestDraft(t *testing.T) {
 			"engine_type": {EngineOpenAICompat}, "base_url": {srv.URL}, "engine_id": {"1"},
 		}, true, "Connected. 2 model(s) available."},
 		{"invalid form is rejected before any request", url.Values{
-			"engine_type": {EngineOllama}, "base_url": {"http://127.0.0.1"}, "port": {"99999"},
-		}, false, "Port must be a number between 1 and 65535"},
+			"engine_type": {"ollama"}, "base_url": {"http://127.0.0.1"},
+		}, false, "Invalid engine type"},
+		{"missing base URL is rejected", url.Values{
+			"engine_type": {EngineOMLX},
+		}, false, "Base URL is required"},
 	}
 	for _, tt := range tests {
 		ok, msg := testDraft(t, tt.form)

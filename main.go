@@ -62,12 +62,8 @@ type Config struct {
 	// which bounds what the audit log stores. See truncateEngineInput.
 	MaxInputLen int
 	// FetchImageURLs lets the gateway download http(s) images for engines
-	// that only take inline images (Ollama). See remote_images.go.
+	// that only take inline images (oMLX). See remote_images.go.
 	FetchImageURLs bool
-	// OllamaNumCtx, when > 0, is the context window (options.num_ctx) sent
-	// with every Ollama request, clamped to the model's own maximum. 0 leaves
-	// it to Ollama (OLLAMA_CONTEXT_LENGTH or the model's Modelfile).
-	OllamaNumCtx int
 	// UpstreamTimeoutSec bounds a single non-streaming engine call, in
 	// seconds. See upstreamChatTimeout.
 	UpstreamTimeoutSec int
@@ -159,7 +155,6 @@ func loadConfig() Config {
 		MaxMsgLen:           getEnvInt("MAX_MESSAGE_LENGTH", 262144), // ~256KB
 		MaxInputLen:         getEnvInt("GW42_MAX_INPUT_LENGTH", 0),
 		FetchImageURLs:      getEnv("GW42_FETCH_IMAGE_URLS", "true") != "false",
-		OllamaNumCtx:        getEnvInt("GW42_OLLAMA_NUM_CTX", 0),
 		UpstreamTimeoutSec:  getEnvInt("GW42_UPSTREAM_TIMEOUT", 600),
 		MCPMode:             strings.ToLower(getEnv("GW42_MCP", "on")),
 		MCPMaxRounds:        getEnvInt("GW42_MCP_MAX_ROUNDS", 8),
@@ -218,6 +213,13 @@ type UserLogRow struct {
 type ModelDetail struct {
 	Name string
 	Size string
+	// oMLX models: Manageable when the engine is oMLX (load, unload, delete
+	// apply), Loaded / Loading from its /v1/models/status. Downloads is a
+	// Hugging Face search result's download count.
+	Manageable bool
+	Loaded     bool
+	Loading    bool
+	Downloads  int
 }
 
 // FlashMsg represents a flash message for UI notifications
@@ -591,9 +593,6 @@ func getEngineURLs(engines []EngineConfig) map[string]string {
 
 // engineEndpoint returns the full endpoint for an engine config.
 func engineEndpoint(cfg EngineConfig) string {
-	if cfg.Type == EngineOllama {
-		return ollamaEndpoint(cfg)
-	}
 	host := cfg.BaseURL
 	if !strings.HasPrefix(host, "http://") && !strings.HasPrefix(host, "https://") {
 		host = "http://" + host
@@ -1061,11 +1060,11 @@ func setupRouter() *mux.Router {
 	r.HandleFunc("/admin/settings-page", handleAdminSettingsPage).Methods("GET")
 	r.HandleFunc("/admin/engine-test", handleEngineTest).Methods("GET")
 	r.HandleFunc("/admin/engine-test-draft", handleEngineTestDraft).Methods("POST")
-	r.HandleFunc("/admin/ollama-pull-stream", handleOllamaPullStream).Methods("GET")
-	r.HandleFunc("/admin/ollama-delete-model", handleOllamaDeleteModel).Methods("POST")
+	r.HandleFunc("/admin/omlx-download-stream", handleOMLXDownloadStream).Methods("GET")
+	r.HandleFunc("/admin/omlx-model-action", handleOMLXModelAction).Methods("POST")
 	r.HandleFunc("/admin/engine-settings", handleEngineSettings).Methods("POST")
 	r.HandleFunc("/admin/engine-remove", handleRemoveEngine).Methods("POST")
-	r.HandleFunc("/admin/ollama-search", handleOllamaSearch).Methods("GET")
+	r.HandleFunc("/admin/omlx-search", handleOMLXSearch).Methods("GET")
 	r.HandleFunc("/admin/change-password", handleChangePassword).Methods("POST")
 	r.HandleFunc("/admin/help", handleAdminHelp).Methods("GET")
 	r.HandleFunc("/admin/logs", handleAdminLogs).Methods("GET")
@@ -1284,6 +1283,11 @@ func main() {
 	// Engine cache (engines + their HTTP adapters). No engines configured yet
 	// is not an error; one here means the list could not be read, so the
 	// gateway starts with none rather than refusing to start.
+	if n, err := migrateLegacyEngines(); err != nil {
+		slog.Error("could not migrate legacy engines", "err", err)
+	} else if n > 0 {
+		slog.Warn("legacy engines migrated", "count", n)
+	}
 	if err := reloadEngineCache(); err != nil {
 		slog.Error("could not load engines on startup", "err", err)
 	}

@@ -180,36 +180,6 @@ func TestAnthropicStreamSequencesBlocks(t *testing.T) {
 	}
 }
 
-// End to end through the real Ollama translator: an Ollama tool-calling reply
-// becomes a tool_use block with the whole arguments in one delta.
-func TestAnthropicStreamOverOllama(t *testing.T) {
-	src := newOllamaTestStream(`{"model":"q","message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"Read","arguments":{"path":"a"}}}]},"done":false}
-{"model":"q","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop","prompt_eval_count":3,"eval_count":2}
-`)
-	s := newAnthropicStream("q")
-	var events []sseEvent
-	for _, payload := range drain(t, src) {
-		b, _ := json.Marshal(payload)
-		events = append(events, s.chunk(b)...)
-	}
-	events = append(events, s.end()...)
-
-	var all strings.Builder
-	for _, ev := range events {
-		b, _ := json.Marshal(ev.data)
-		all.Write(b)
-	}
-	for _, want := range []string{
-		`"type":"tool_use"`, `"name":"Read"`,
-		`"partial_json":"{\"path\":\"a\"}"`,
-		`"stop_reason":"tool_use"`, `"input_tokens":3`,
-	} {
-		if !strings.Contains(all.String(), want) {
-			t.Errorf("stream missing %s\n%s", want, all.String())
-		}
-	}
-}
-
 func TestAnthropicErrorTypes(t *testing.T) {
 	for status, want := range map[int]string{
 		404: "not_found_error", 503: "overloaded_error", 429: "rate_limit_error", 400: "invalid_request_error",

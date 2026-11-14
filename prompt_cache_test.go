@@ -8,6 +8,7 @@ package main
 
 import (
 	"encoding/json"
+	"gateway42/internal/wire"
 	"strings"
 	"testing"
 )
@@ -138,7 +139,7 @@ func TestWireUsageOmitsAbsentDetails(t *testing.T) {
 	if msg.Usage.CacheReadInputTokens != 0 || msg.Usage.InputTokens != 3 {
 		t.Fatalf("usage = %+v", msg.Usage)
 	}
-	b, _ := json.Marshal(ollamaToOpenAI(map[string]interface{}{"done": true, "prompt_eval_count": 3, "eval_count": 1}))
+	b, _ := json.Marshal(wire.Usage{PromptTokens: 3, CompletionTokens: 1, TotalTokens: 4})
 	if strings.Contains(string(b), "prompt_tokens_details") {
 		t.Fatalf("authored usage gained prompt_tokens_details: %s", b)
 	}

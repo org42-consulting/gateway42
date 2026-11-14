@@ -67,8 +67,8 @@ func adminPost(t *testing.T, target string, form url.Values) *http.Request {
 }
 
 var twoEngines = []EngineConfig{
-	{ID: 1, Name: "gpu-a", Type: EngineOllama, BaseURL: "http://10.0.0.1", Port: 11434},
-	{ID: 2, Name: "gpu-b", Type: EngineOllama, BaseURL: "http://10.0.0.2", Port: 11434},
+	{ID: 1, Name: "mac-a", Type: EngineOMLX, BaseURL: "http://10.0.0.1:8000"},
+	{ID: 2, Name: "mac-b", Type: EngineOMLX, BaseURL: "http://10.0.0.2:8000"},
 }
 
 func TestAddEngineDoesNotWipeListWhenReadFails(t *testing.T) {
@@ -80,8 +80,8 @@ func TestAddEngineDoesNotWipeListWhenReadFails(t *testing.T) {
 	breakReads(t)
 
 	handleEngineSettings(httptest.NewRecorder(), adminPost(t, "/admin/engine-settings", url.Values{
-		"engine_type": {EngineOllama}, "engine_name": {"gpu-c"},
-		"base_url": {"http://10.0.0.3"}, "port": {"11434"},
+		"engine_type": {EngineOMLX}, "engine_name": {"mac-c"},
+		"base_url": {"http://10.0.0.3:8000"},
 	}))
 
 	if got := storedEngines(t); len(got) != 2 {
@@ -95,8 +95,8 @@ func TestAddEngineOnFreshDatabase(t *testing.T) {
 	withTestDB(t)
 
 	handleEngineSettings(httptest.NewRecorder(), adminPost(t, "/admin/engine-settings", url.Values{
-		"engine_type": {EngineOllama}, "engine_name": {"first"},
-		"base_url": {"http://10.0.0.1"}, "port": {"11434"},
+		"engine_type": {EngineOMLX}, "engine_name": {"first"},
+		"base_url": {"http://10.0.0.1:8000"}, "api_key": {"sk-omlx"},
 	}))
 
 	got := storedEngines(t)

@@ -305,8 +305,8 @@ func TestUsagePanelRendersIntoTheDashboard(t *testing.T) {
 	var sb strings.Builder
 	err := tmpl.ExecuteTemplate(&sb, "base.html", DashboardData{
 		BaseData:     BaseData{CurrentPath: "/admin/panel", CSRFToken: "tok"},
-		Engines:      []EngineConfig{{ID: 1, Name: "local", Type: EngineOllama, Port: 11434}},
-		EngineURLs:   map[string]string{"1": "http://127.0.0.1:11434"},
+		Engines:      []EngineConfig{{ID: 1, Name: "local", Type: EngineOMLX, BaseURL: "http://127.0.0.1:8000"}},
+		EngineURLs:   map[string]string{"1": "http://127.0.0.1:8000"},
 		EngineStatus: map[string]bool{"1": true},
 		EngineModels: map[string][]string{"1": {"qwen3-coder:30b"}},
 		Users:        []User{{ID: 1, Name: "claude-code", Status: "active", RateLimit: 30}},

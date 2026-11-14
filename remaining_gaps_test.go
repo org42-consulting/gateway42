@@ -10,7 +10,6 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -27,9 +26,6 @@ func engineFixture(t *testing.T, engineType, model string, handler http.HandlerF
 	t.Cleanup(srv.Close)
 	ec := EngineConfig{ID: 1, Name: "gap3", Type: engineType, BaseURL: srv.URL}
 	var a Engine = &OpenAICompatAdapter{cfg: ec, concurrencyLimiter: newConcurrencyLimiter(4)}
-	if engineType == EngineOllama {
-		a = &OllamaAdapter{cfg: ec, concurrencyLimiter: newConcurrencyLimiter(4)}
-	}
 	engineCachePtr.Store(&engineCache{engines: []EngineConfig{ec}, adapters: map[int]Engine{1: a}})
 	storeRouteIndex(&routeIndex{byModel: map[string][]int{model: {1}}, built: time.Now(), probed: true}, routeIndexGeneration())
 	t.Cleanup(invalidateRouteIndex)
@@ -45,116 +41,7 @@ func engineFixture(t *testing.T, engineType, model string, handler http.HandlerF
 	}
 }
 
-// ── Ollama request mapping ───────────────────────────────────────────────────
-
-func TestOllamaSamplerOptions(t *testing.T) {
-	req := openAIToOllama(map[string]interface{}{"model": "m", "top_k": 40.0, "min_p": 0.05, "repetition_penalty": 1.1}, nil)
-	opts := req["options"].(map[string]interface{})
-	if opts["top_k"] != 40.0 || opts["min_p"] != 0.05 || opts["repeat_penalty"] != 1.1 {
-		t.Fatalf("options = %v", opts)
-	}
-}
-
-func TestOllamaToolChoice(t *testing.T) {
-	tools := []interface{}{
-		map[string]interface{}{"type": "function", "function": map[string]interface{}{"name": "read"}},
-		map[string]interface{}{"type": "function", "function": map[string]interface{}{"name": "write"}},
-	}
-	offered := func(choice interface{}) []interface{} {
-		data := map[string]interface{}{"model": "m", "tools": tools}
-		if choice != nil {
-			data["tool_choice"] = choice
-		}
-		got, _ := openAIToOllama(data, nil)["tools"].([]interface{})
-		return got
-	}
-	if n := len(offered(nil)); n != 2 {
-		t.Errorf("no tool_choice: %d tools, want 2", n)
-	}
-	if n := len(offered("required")); n != 2 {
-		t.Errorf("required: %d tools, want 2", n)
-	}
-	if got := offered("none"); got != nil {
-		t.Errorf("none: tools = %v, want none", got)
-	}
-	named := offered(map[string]interface{}{"type": "function", "function": map[string]interface{}{"name": "write"}})
-	if len(named) != 1 || named[0].(map[string]interface{})["function"].(map[string]interface{})["name"] != "write" {
-		t.Errorf("named: tools = %v, want only write", named)
-	}
-}
-
-func TestOllamaLegacyFunctions(t *testing.T) {
-	data := map[string]interface{}{
-		"model":         "m",
-		"functions":     []interface{}{map[string]interface{}{"name": "f1"}, map[string]interface{}{"name": "f2"}},
-		"function_call": map[string]interface{}{"name": "f2"},
-	}
-	req := openAIToOllama(data, nil)
-	tools, _ := req["tools"].([]interface{})
-	if len(tools) != 1 || tools[0].(map[string]interface{})["function"].(map[string]interface{})["name"] != "f2" {
-		t.Fatalf("tools = %v, want f2 only", req["tools"])
-	}
-	if _, mutated := data["tool_choice"]; mutated {
-		t.Error("the caller's request was modified")
-	}
-
-	// History: an assistant function_call and the "function" result message.
-	raw := decodeJSON(t, `[
-		{"role":"assistant","content":null,"function_call":{"name":"f1","arguments":"{\"a\":1}"}},
-		{"role":"function","name":"f1","content":"done"}
-	]`).([]interface{})
-	clean := sanitizeMessages(raw)
-	if clean[0]["content"] != nil {
-		t.Errorf("legacy call turn content = %#v, want null", clean[0]["content"])
-	}
-	om := ollamaMessages(clean)
-	calls, _ := om[0]["tool_calls"].([]map[string]interface{})
-	if len(calls) != 1 || calls[0]["function"].(map[string]interface{})["name"] != "f1" {
-		t.Errorf("assistant tool_calls = %v", om[0]["tool_calls"])
-	}
-	if om[1]["role"] != "tool" || om[1]["tool_name"] != "f1" {
-		t.Errorf("function result = %v, want a tool message named f1", om[1])
-	}
-}
-
-func TestOllamaLogprobs(t *testing.T) {
-	req := openAIToOllama(map[string]interface{}{"model": "m", "logprobs": true, "top_logprobs": 3.0}, nil)
-	if req["logprobs"] != true || req["top_logprobs"] != 3.0 {
-		t.Fatalf("request = %v", req)
-	}
-	lp := []interface{}{map[string]interface{}{"token": "hi", "logprob": -0.1}}
-	cc := ollamaToOpenAI(map[string]interface{}{"done": true, "message": map[string]interface{}{"content": "hi"}, "logprobs": lp})
-	b, _ := json.Marshal(cc.Choices[0])
-	if !strings.Contains(string(b), `"logprobs":{"content":[{"logprob":-0.1,"token":"hi"}]}`) {
-		t.Errorf("choice = %s", b)
-	}
-	chunk := formatStreamChunk(map[string]interface{}{"message": map[string]interface{}{"content": "hi"}, "logprobs": lp}, "id", false)
-	if chunk.Choices[0].Logprobs == nil || len(chunk.Choices[0].Logprobs.Content) != 1 {
-		t.Errorf("chunk logprobs = %+v", chunk.Choices[0].Logprobs)
-	}
-	// Not asked, not present: authored bodies unchanged.
-	b, _ = json.Marshal(ollamaToOpenAI(map[string]interface{}{"done": true, "message": map[string]interface{}{"content": "hi"}}))
-	if strings.Contains(string(b), "logprobs") {
-		t.Errorf("logprobs without logprobs: %s", b)
-	}
-}
-
-func TestOllamaRejectsNGreaterThanOne(t *testing.T) {
-	called := false
-	post := engineFixture(t, EngineOllama, "m", func(w http.ResponseWriter, r *http.Request) {
-		called = true
-		w.Write([]byte(`{"model":"m","message":{"role":"assistant","content":"x"},"done":true}`))
-	})
-	rec := post("POST", "/v1/chat/completions", "application/json", `{"model":"m","n":2,"messages":[{"role":"user","content":"hi"}]}`)
-	var e struct{ Error struct{ Message string } }
-	json.Unmarshal(rec.Body.Bytes(), &e)
-	if rec.Code != 400 || !strings.Contains(e.Error.Message, "n > 1") || called {
-		t.Fatalf("n=2 → %d %s (engine called: %v)", rec.Code, rec.Body.String(), called)
-	}
-	if rec := post("POST", "/v1/chat/completions", "application/json", `{"model":"m","n":1,"messages":[{"role":"user","content":"hi"}]}`); rec.Code != 200 {
-		t.Fatalf("n=1 → %d %s", rec.Code, rec.Body.String())
-	}
-}
+// ── Request mapping ──────────────────────────────────────────────────────────
 
 // ── OpenAI-compatible parameters ─────────────────────────────────────────────
 
@@ -189,120 +76,6 @@ func TestAnthropicTopKAndThinkingBudget(t *testing.T) {
 	data, _ = anthropicToOpenAI(decodeJSON(t, `{"model":"m","thinking":{"type":"disabled","budget_tokens":2048},"messages":[]}`).(map[string]interface{}))
 	if _, ok := data["thinking_budget"]; ok {
 		t.Error("thinking_budget sent with thinking disabled")
-	}
-	// Ollama takes top_k as an option.
-	if opts := openAIToOllama(map[string]interface{}{"model": "m", "top_k": 40.0}, nil)["options"].(map[string]interface{}); opts["top_k"] != 40.0 {
-		t.Errorf("Ollama options = %v", opts)
-	}
-}
-
-// ── Ollama context window ────────────────────────────────────────────────────
-
-func withOllamaNumCtx(t *testing.T, n int) {
-	t.Helper()
-	prev := cfg.OllamaNumCtx
-	cfg.OllamaNumCtx = n
-	t.Cleanup(func() { cfg.OllamaNumCtx = prev })
-}
-
-func TestParseOllamaShow(t *testing.T) {
-	info := parseOllamaShow(map[string]interface{}{"qwen3.context_length": 40960.0, "general.architecture": "qwen3"},
-		"stop \"<|im_end|>\"\nnum_ctx 16384\ntemperature 0.6")
-	if info.native != 40960 || info.modelfileCtx != 16384 {
-		t.Fatalf("info = %+v", info)
-	}
-	withOllamaNumCtx(t, 0)
-	if n := info.effectiveContext(); n != 16384 {
-		t.Errorf("no gateway num_ctx: %d, want the Modelfile's 16384", n)
-	}
-	withOllamaNumCtx(t, 65536)
-	if n := info.effectiveContext(); n != 40960 {
-		t.Errorf("num_ctx above the model maximum: %d, want clamped to 40960", n)
-	}
-	withOllamaNumCtx(t, 8192)
-	if n := info.effectiveContext(); n != 8192 {
-		t.Errorf("num_ctx 8192: %d", n)
-	}
-}
-
-func ollamaShowServer(t *testing.T, native int, seen *[]string, mu *sync.Mutex) *httptest.Server {
-	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b, _ := io.ReadAll(r.Body)
-		mu.Lock()
-		*seen = append(*seen, r.URL.Path+" "+string(b))
-		mu.Unlock()
-		switch r.URL.Path {
-		case "/api/show":
-			json.NewEncoder(w).Encode(map[string]interface{}{"model_info": map[string]interface{}{"llama.context_length": native}, "parameters": ""})
-		case "/api/chat":
-			w.Write([]byte(`{"model":"m","message":{"role":"assistant","content":"ok"},"done":true}`))
-		}
-	}))
-	t.Cleanup(srv.Close)
-	return srv
-}
-
-func TestOllamaNumCtxSentAndClamped(t *testing.T) {
-	var seen []string
-	var mu sync.Mutex
-	srv := ollamaShowServer(t, 8192, &seen, &mu)
-	a := &OllamaAdapter{cfg: EngineConfig{BaseURL: srv.URL + "/numctx"}}
-	a.cfg.BaseURL = srv.URL
-
-	withOllamaNumCtx(t, 0)
-	req := buildEngineRequest(a, map[string]interface{}{"model": "numctx-a"}, nil)
-	if opts, _ := req["options"].(map[string]interface{}); opts["num_ctx"] != nil {
-		t.Errorf("num_ctx sent without GW42_OLLAMA_NUM_CTX: %v", opts)
-	}
-
-	withOllamaNumCtx(t, 32768)
-	req = buildEngineRequest(a, map[string]interface{}{"model": "numctx-b", "temperature": 0.2}, nil)
-	opts := req["options"].(map[string]interface{})
-	if opts["num_ctx"] != 8192 || opts["temperature"] != 0.2 {
-		t.Errorf("options = %v, want num_ctx clamped to the model's 8192 beside temperature", opts)
-	}
-}
-
-func TestListModelsReportsOllamaContextWindow(t *testing.T) {
-	withSessionStore(t)
-	withTestDB(t)
-	resetProbeCache(t)
-	withOllamaNumCtx(t, 0)
-	foSeedUser(t, "octx-user", "sk-gw-octx", 60)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req map[string]string
-		json.NewDecoder(r.Body).Decode(&req)
-		params := ""
-		if req["model"] == "ctx-modelfile" {
-			params = "num_ctx 24576"
-		}
-		json.NewEncoder(w).Encode(map[string]interface{}{"model_info": map[string]interface{}{"llama.context_length": 131072}, "parameters": params})
-	}))
-	defer srv.Close()
-	ec := EngineConfig{ID: 1, Name: "ollama", Type: EngineOllama, BaseURL: srv.URL}
-	engineCachePtr.Store(&engineCache{engines: []EngineConfig{ec}, adapters: map[int]Engine{1: &OllamaAdapter{cfg: ec}}})
-	probeCacheMu.Lock()
-	probeCache[1] = probeEntry{expiry: time.Now().Add(time.Minute), probeData: probeData{status: true, raw: []map[string]interface{}{
-		{"name": "ctx-modelfile", "modified_at": "2026-01-01T00:00:00Z"},
-		{"name": "ctx-default", "modified_at": "2026-01-01T00:00:00Z"},
-	}}}
-	probeCacheMu.Unlock()
-
-	rec := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
-	r.Header.Set("Authorization", "Bearer sk-gw-octx")
-	setupRouter().ServeHTTP(rec, r)
-	var list struct{ Data []map[string]interface{} }
-	json.Unmarshal(rec.Body.Bytes(), &list)
-	got := map[string]interface{}{}
-	for _, m := range list.Data {
-		got[m["id"].(string)] = m["max_input_tokens"]
-	}
-	// The Modelfile's num_ctx is the window Ollama uses; without one, it is the
-	// server default the gateway cannot see, so nothing is claimed.
-	if got["ctx-modelfile"] != 24576.0 || got["ctx-default"] != nil {
-		t.Fatalf("max_input_tokens = %v\n%s", got, rec.Body.String())
 	}
 }
 
@@ -571,9 +344,9 @@ func TestPassthroughResponsesStreaming(t *testing.T) {
 
 func TestPassthroughCompletionsAsksForUsageOnStreams(t *testing.T) {
 	var body map[string]interface{}
-	post := engineFixture(t, EngineOllama, "m", func(w http.ResponseWriter, r *http.Request) {
+	post := engineFixture(t, EngineOMLX, "m", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/completions" {
-			t.Errorf("Ollama path = %s, want its OpenAI-compatible /v1/completions", r.URL.Path)
+			t.Errorf("engine path = %s, want /v1/completions", r.URL.Path)
 		}
 		json.NewDecoder(r.Body).Decode(&body)
 		w.Header().Set("Content-Type", "text/event-stream")

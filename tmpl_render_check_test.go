@@ -21,15 +21,16 @@ func TestRenderSettingsPage(t *testing.T) {
 	data := SettingsData{
 		BaseData: BaseData{CurrentPath: "/admin/settings-page"},
 		Engines: []EngineConfig{
-			{ID: 1, Name: "local-ollama", Type: EngineOllama, BaseURL: "http://127.0.0.1", Port: 11434},
+			{ID: 1, Name: "mac-studio", Type: EngineOMLX, BaseURL: "http://127.0.0.1:8000"},
 			{ID: 2, Name: "lmstudio", Type: EngineOpenAICompat, BaseURL: "http://127.0.0.1:1234/v1"},
-			{ID: 3, Name: "dead-engine", Type: EngineOllama, BaseURL: "http://127.0.0.1", Port: 9},
+			{ID: 3, Name: "dead-engine", Type: EngineOMLX, BaseURL: "http://127.0.0.1:9"},
 		},
-		EngineURLs:   map[string]string{"1": "http://127.0.0.1:11434", "2": "http://127.0.0.1:1234/v1", "3": "http://127.0.0.1:9"},
+		EngineURLs:   map[string]string{"1": "http://127.0.0.1:8000", "2": "http://127.0.0.1:1234/v1", "3": "http://127.0.0.1:9"},
 		EngineStatus: map[string]bool{"1": true, "2": true, "3": false},
 		EngineModelDetails: map[string][]ModelDetail{
-			"1": {{Name: "llama3.2:latest", Size: "2.0 GB"}, {Name: "qwen3:8b", Size: ""}},
-			"2": {{Name: "mlx-community/Qwen3-8B", Size: "N/A"}},
+			"1": {{Name: "Qwen3-8B-4bit", Size: "4.6 GB", Manageable: true, Loaded: true},
+				{Name: "gemma-3-12b", Size: "", Manageable: true}},
+			"2": {{Name: "qwen3-coder", Size: "N/A"}},
 			"3": {},
 		},
 		SearchResults: []ModelDetail{},
@@ -41,12 +42,17 @@ func TestRenderSettingsPage(t *testing.T) {
 	}
 	out := sb.String()
 
-	// The per-model delete control must be bound to the right engine id and
-	// must not appear for the non-Ollama engine.
+	// Each oMLX model carries its actions, bound to the right engine id:
+	// unload for a loaded model, load for one that is not, delete for both.
 	for _, want := range []string{
+		`action="/admin/omlx-model-action"`,
 		`name="engine_id" value="1"`,
-		`name="model" value="llama3.2:latest"`,
-		`name="model" value="qwen3:8b"`,
+		`name="model" value="Qwen3-8B-4bit"`,
+		`name="model" value="gemma-3-12b"`,
+		`name="action" value="unload"`,
+		`name="action" value="load"`,
+		`name="action" value="delete"`,
+		`<option value="omlx">oMLX</option>`,
 		`<th>Actions</th>`,
 		`name="next" value="settings_page"`,
 	} {
@@ -54,24 +60,32 @@ func TestRenderSettingsPage(t *testing.T) {
 			t.Errorf("rendered settings page missing %q", want)
 		}
 	}
-	if strings.Contains(out, `name="model" value="mlx-community/Qwen3-8B"`) {
-		t.Error("delete control rendered for a non-Ollama engine")
+	if strings.Count(out, `name="action" value="unload"`) != 1 || strings.Count(out, `name="action" value="load"`) != 1 {
+		t.Error("load/unload must follow each model's state")
+	}
+	if strings.Contains(out, `name="model" value="qwen3-coder"`) {
+		t.Error("model actions rendered for a non-oMLX engine")
+	}
+	for _, gone := range []string{"ollama", "Ollama", `name="port"`} {
+		if strings.Contains(out, gone) {
+			t.Errorf("settings page still contains %q", gone)
+		}
 	}
 
-	// Every engine is editable, and the pull target offers only Ollama hosts.
+	// Every engine is editable, and the download target offers only oMLX hosts.
 	if got := strings.Count(out, `class="btn btn-ghost btn-small engine-edit"`); got != 3 {
 		t.Errorf("got %d Edit buttons, want one per engine (3)", got)
 	}
 	for _, want := range []string{
-		`<option value="1">Pull to: local-ollama</option>`,
-		`<option value="3">Pull to: dead-engine</option>`,
+		`<option value="1">Download to: mac-studio</option>`,
+		`<option value="3">Download to: dead-engine</option>`,
 	} {
 		if !strings.Contains(out, want) {
-			t.Errorf("pull-target selector missing %q", want)
+			t.Errorf("download-target selector missing %q", want)
 		}
 	}
-	if strings.Contains(out, `Pull to: lmstudio`) {
-		t.Error("pull-target selector offers a non-Ollama engine")
+	if strings.Contains(out, `Download to: lmstudio`) {
+		t.Error("download-target selector offers a non-oMLX engine")
 	}
 
 	// The stored upstream credential must never reach the page.
