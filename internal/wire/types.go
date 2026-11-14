@@ -116,6 +116,10 @@ type Choice struct {
 	Message      Message   `json:"message"`
 	Logprobs     *Logprobs `json:"logprobs,omitempty"`
 	FinishReason *string   `json:"finish_reason"`
+	// StopReason is vLLM's extension naming the stop string (or token id)
+	// that ended the completion. Only read; omitted from bodies the gateway
+	// writes.
+	StopReason interface{} `json:"stop_reason,omitempty"`
 }
 
 // Logprobs is a choice's per-token log probabilities. Content holds OpenAI's

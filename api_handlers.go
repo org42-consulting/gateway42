@@ -480,21 +480,70 @@ func streamMessages(w http.ResponseWriter, r *http.Request, adapter Engine,
 
 	tr := newAnthropicStream(model)
 	tr.thinking = thinking
-	if !send(tr.start()) {
+	tr.inputEstimate = estimateTokens(engineReq["messages"], engineReq["tools"])
+	// Anthropic follows message_start with a ping, and keeps pinging while
+	// the model is silent. Local engines can be silent for minutes while
+	// they prefill a long prompt; without pings a client (or a proxy in
+	// between) may give up on a connection that shows no sign of life.
+	if !send(tr.start(), pingEvent) {
 		outcome = "client disconnected"
 		return
 	}
+
+	// Recv runs on its own goroutine so the loop can ping between chunks.
+	// It also touches the deadline there, on the read, not after the write —
+	// the bound tracks whether the engine is alive, not how fast this client
+	// drains — and every touch stays on that one goroutine. The goroutine
+	// ends when Recv fails, which the deferred stream.Close and
+	// deadline.stop guarantee once this function returns.
+	type recvResult struct {
+		payload []byte
+		meta    chunkMeta
+		err     error
+	}
+	results := make(chan recvResult)
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		for {
+			payload, meta, err := stream.Recv()
+			if err == nil {
+				deadline.touch()
+			}
+			select {
+			case results <- recvResult{payload, meta, err}:
+			case <-done:
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	ping := time.NewTicker(pingInterval)
+	defer ping.Stop()
+
 	for {
-		payload, meta, err := stream.Recv()
-		if err == io.EOF {
+		var res recvResult
+		select {
+		case <-ping.C:
+			if !send(pingEvent) {
+				outcome = "client disconnected"
+				detail.setOutcome(outcome)
+				return
+			}
+			continue
+		case res = <-results:
+		}
+		if res.err == io.EOF {
 			break
 		}
-		if err != nil {
+		if res.err != nil {
 			// Anthropic's in-stream error event: the client surfaces it
 			// instead of treating the truncated message as complete. The
 			// deadline cause replaces the read error when the gateway capped
 			// the stream, so the audit can tell that from a transport failure.
-			why := err
+			why := res.err
 			if cause := deadline.cause(); cause != nil {
 				why = cause
 			}
@@ -505,40 +554,78 @@ func streamMessages(w http.ResponseWriter, r *http.Request, adapter Engine,
 			detail.setUpstreamErr(why)
 			return
 		}
-		// Touched on the read, not after the write — the bound tracks whether
-		// the engine is alive, not how fast this client drains.
-		deadline.touch()
-		if !send(tr.chunk(payload)...) {
+		if !send(tr.chunk(res.payload)...) {
 			slog.Info("client disconnected mid-stream", "model", model, "user", userID)
 			outcome = "client disconnected"
 			detail.setOutcome(outcome)
 			return
 		}
 		detail.setFirstToken()
-		detail.applyMeta(meta)
-		audit.write(meta.auditText)
+		detail.applyMeta(res.meta)
+		audit.write(res.meta.auditText)
 	}
 	send(tr.end()...)
 }
 
-// handleCountTokens serves POST /v1/messages/count_tokens with an estimate;
-// see estimateTokens for why an estimate is enough.
+// handleCountTokens serves POST /v1/messages/count_tokens.
+//
+// The count comes from the engine when it can give one: oMLX (and other
+// servers that implement Anthropic's API) answer /v1/messages/count_tokens
+// with their own tokenizer. Otherwise — Ollama, an engine without the
+// endpoint, or any failure within the time budget — it is estimateTokens'
+// estimate, which errs on the high side, the safe direction for the
+// compaction decision clients use it for. No concurrency slot is taken:
+// counting is cheap and must not queue behind generations.
 func handleCountTokens(w http.ResponseWriter, r *http.Request) {
 	user := userFromContext(r)
 	if user == nil {
 		writeAnthropicError(w, 401, "Invalid API key", "authentication_error")
 		return
 	}
-	// Rate limited like the completion endpoints by rateLimitMiddleware: no
-	// engine is involved, but each call still decodes and re-encodes a body
-	// of up to maxRequestBytes.
+	// Rate limited like the completion endpoints by rateLimitMiddleware.
 	body, ok := decodeAPIBody(w, r, writeAnthropicError)
 	if !ok {
+		return
+	}
+	model, _ := body["model"].(string)
+	if n, ok := engineTokenCount(r.Context(), model, body); ok {
+		jsonResponse(w, 200, map[string]int{"input_tokens": n})
 		return
 	}
 	jsonResponse(w, 200, map[string]int{
 		"input_tokens": estimateTokens(body["system"], body["messages"], body["tools"]),
 	})
+}
+
+// engineTokenCount asks the first OpenAI-compatible engine holding model to
+// count the request's tokens. The billing header is stripped first, as for a
+// completion, so the count is of the prompt the engine will actually see.
+func engineTokenCount(ctx context.Context, model string, body map[string]interface{}) (int, bool) {
+	var adapter *OpenAICompatAdapter
+	for _, e := range routeModelOrdered(model) {
+		if a, ok := e.(*OpenAICompatAdapter); ok {
+			adapter = a
+			break
+		}
+	}
+	if adapter == nil {
+		return 0, false
+	}
+	req := make(map[string]interface{}, len(body))
+	for k, v := range body {
+		req[k] = v
+	}
+	if sys, ok := body["system"]; ok {
+		req["system"] = systemPrompt(sys)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	result, err := postJSON(ctx, EngineOpenAICompat, "count_tokens", adapter.upstream("/v1/messages/count_tokens"), adapter.cfg.APIKey, req)
+	if err != nil {
+		return 0, false
+	}
+	n := toInt(result["input_tokens"])
+	return n, n > 0
 }
 
 // ─────────────────────────────── Shared admission ─────────────────────────────

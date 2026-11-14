@@ -26,16 +26,16 @@ type Embedder interface {
 }
 
 func (a *OpenAICompatAdapter) Embed(ctx context.Context, req map[string]interface{}) (map[string]interface{}, error) {
-	return postJSON(ctx, EngineOpenAICompat, a.upstream("/v1/embeddings"), a.cfg.APIKey, req)
+	return postJSON(ctx, EngineOpenAICompat, "embed", a.upstream("/v1/embeddings"), a.cfg.APIKey, req)
 }
 
 func (a *OllamaAdapter) Embed(ctx context.Context, req map[string]interface{}) (map[string]interface{}, error) {
-	return postJSON(ctx, EngineOllama, a.baseURL()+"/api/embed", "", req)
+	return postJSON(ctx, EngineOllama, "embed", a.baseURL()+"/api/embed", "", req)
 }
 
 // postJSON sends one bounded JSON request to an engine and decodes the JSON
 // answer; a non-200 is an upstreamStatusError, as for completions.
-func postJSON(ctx context.Context, engineType, url, apiKey string, req map[string]interface{}) (map[string]interface{}, error) {
+func postJSON(ctx context.Context, engineType, op, url, apiKey string, req map[string]interface{}) (map[string]interface{}, error) {
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
@@ -44,7 +44,7 @@ func postJSON(ctx context.Context, engineType, url, apiKey string, req map[strin
 	defer cancel()
 
 	var result map[string]interface{}
-	err = observeUpstream(engineType, "embed", func() error {
+	err = observeUpstream(engineType, op, func() error {
 		httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 		if err != nil {
 			return err

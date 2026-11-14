@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"gateway42/internal/wire"
 	"strings"
+	"time"
 )
 
 // ── Wire types ────────────────────────────────────────────────────────────────
@@ -164,7 +165,20 @@ var (
 	stopEndTurn   = "end_turn"
 	stopMaxTokens = "max_tokens"
 	stopToolUse   = "tool_use"
+	// stop_sequence is reported only when the engine says which stop string
+	// it matched; OpenAI's finish_reason "stop" alone cannot tell a stop
+	// sequence from the model finishing on its own.
+	stopStopSequence = "stop_sequence"
 )
+
+// stopSequence returns the matched stop sequence when the engine named one
+// for a "stop" finish, else nil.
+func stopSequence(finish, matched string) *string {
+	if finish != "stop" || matched == "" {
+		return nil
+	}
+	return &matched
+}
 
 // anthropicError builds an Anthropic-shaped error. The type names overlap
 // OpenAI's for the cases the gateway produces, with two exceptions mapped by
@@ -702,6 +716,9 @@ func openAIToAnthropic(payload interface{}, model string) (*AnthropicMessage, er
 		finish = *choice.FinishReason
 	}
 	msg.StopReason = stopReasonFromFinish(finish)
+	if seq, _ := choice.StopReason.(string); stopSequence(finish, seq) != nil {
+		msg.StopReason, msg.StopSequence = &stopStopSequence, stopSequence(finish, seq)
+	}
 	// Some engines finish with "stop" even after calling tools; the client
 	// must still be told to run them.
 	if len(choice.Message.ToolCalls) > 0 {
@@ -743,8 +760,22 @@ type anthropicStream struct {
 	sawTool    bool
 
 	finish string
-	usage  AnthropicUsage
+	// stopSeq is the stop sequence the engine reports having matched (vLLM's
+	// choice.stop_reason); "" when it did not say.
+	stopSeq string
+	usage   AnthropicUsage
+	// inputEstimate is message_start's input_tokens: Anthropic reports the
+	// prompt size up front, an engine only at the end. message_delta carries
+	// the engine's count, which replaces it.
+	inputEstimate int
 }
+
+// pingEvent is Anthropic's keep-alive event; pingInterval its cadence while
+// the engine is silent (a var so tests need not wait).
+var (
+	pingEvent    = sseEvent{"ping", map[string]interface{}{"type": "ping"}}
+	pingInterval = 10 * time.Second
+)
 
 func newAnthropicStream(model string) *anthropicStream {
 	return &anthropicStream{id: newMessageID(), model: model, blockIndex: -1}
@@ -759,6 +790,7 @@ func (s *anthropicStream) start() sseEvent {
 		"message": AnthropicMessage{
 			ID: s.id, Type: "message", Role: "assistant", Model: s.model,
 			Content: []AnthropicContentBlock{},
+			Usage:   AnthropicUsage{InputTokens: s.inputEstimate},
 		},
 	}}
 }
@@ -781,6 +813,9 @@ type streamChunk struct {
 			} `json:"tool_calls"`
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
+		// StopReason is vLLM's extension: the stop string (or token id)
+		// that ended the completion.
+		StopReason interface{} `json:"stop_reason"`
 	} `json:"choices"`
 	Usage *wire.Usage `json:"usage"`
 }
@@ -860,6 +895,9 @@ func (s *anthropicStream) chunk(payload []byte) []sseEvent {
 		if ch.FinishReason != nil {
 			s.finish = *ch.FinishReason
 		}
+		if seq, ok := ch.StopReason.(string); ok && seq != "" {
+			s.stopSeq = seq
+		}
 	}
 	return events
 }
@@ -877,14 +915,17 @@ func (s *anthropicStream) closeBlock() []sseEvent {
 // end closes the open block and emits message_delta and message_stop.
 func (s *anthropicStream) end() []sseEvent {
 	events := s.closeBlock()
-	stop := stopReasonFromFinish(s.finish)
+	stop, seq := stopReasonFromFinish(s.finish), stopSequence(s.finish, s.stopSeq)
+	if seq != nil {
+		stop = &stopStopSequence
+	}
 	if s.sawTool {
-		stop = &stopToolUse
+		stop, seq = &stopToolUse, nil
 	}
 	return append(events,
 		sseEvent{"message_delta", map[string]interface{}{
 			"type":  "message_delta",
-			"delta": map[string]interface{}{"stop_reason": stop, "stop_sequence": nil},
+			"delta": map[string]interface{}{"stop_reason": stop, "stop_sequence": seq},
 			"usage": s.usage,
 		}},
 		sseEvent{"message_stop", map[string]interface{}{"type": "message_stop"}},
