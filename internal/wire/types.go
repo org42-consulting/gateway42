@@ -68,6 +68,25 @@ type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+	// PromptTokensDetails carries the engine's prefix-cache hits (oMLX, vLLM,
+	// llama.cpp and OpenAI report cached_tokens here). A pointer with
+	// omitempty: Gateway42 never authors it, so bodies it writes are unchanged,
+	// and absence means "engine did not say", not "nothing was cached".
+	PromptTokensDetails *PromptTokensDetails `json:"prompt_tokens_details,omitempty"`
+}
+
+// PromptTokensDetails is the breakdown of prompt_tokens an engine may report.
+type PromptTokensDetails struct {
+	CachedTokens int `json:"cached_tokens"`
+}
+
+// CachedTokens is the number of prompt tokens the engine served from its
+// prefix cache, clamped to PromptTokens; 0 when the engine did not report it.
+func (u Usage) CachedTokens() int {
+	if u.PromptTokensDetails == nil || u.PromptTokensDetails.CachedTokens < 0 {
+		return 0
+	}
+	return min(u.PromptTokensDetails.CachedTokens, u.PromptTokens)
 }
 
 // Choice is one completion alternative in a non-streaming response.

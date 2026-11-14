@@ -93,7 +93,8 @@ func TestOpenAIToAnthropicNonStreaming(t *testing.T) {
 		`{"type":"tool_use","id":"call_9","name":"Read","input":{"path":"x"}}`,
 		// An engine that said "stop" after calling tools still means tool_use.
 		`"stop_reason":"tool_use"`, `"stop_sequence":null`,
-		`"usage":{"input_tokens":11,"output_tokens":4}`,
+		`"usage":{"input_tokens":11,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,` +
+			`"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":4}`,
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("response missing %s\n%s", want, s)

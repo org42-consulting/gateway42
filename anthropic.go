@@ -35,11 +35,45 @@ type AnthropicContentBlock struct {
 	Input json.RawMessage `json:"input,omitempty"`
 }
 
-// AnthropicUsage reports token accounting. Both fields are always emitted,
+// AnthropicUsage reports token accounting. Every field is always emitted,
 // matching Usage on the OpenAI side.
+//
+// As on Anthropic's API, the prompt is split three ways: InputTokens is what
+// the engine had to process, CacheReadInputTokens what it served from its
+// prefix cache, and CacheCreationInputTokens what it wrote to a cache. The
+// client adds all three to size its context window, so the split never
+// changes that total. Local engines cache every prompt implicitly and report
+// no writes, so creation is always 0 — but the cache_creation object is still
+// sent, because Claude Desktop reads its two TTL fields from it.
 type AnthropicUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens              int                    `json:"input_tokens"`
+	CacheCreationInputTokens int                    `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int                    `json:"cache_read_input_tokens"`
+	CacheCreation            AnthropicCacheCreation `json:"cache_creation"`
+	OutputTokens             int                    `json:"output_tokens"`
+}
+
+// AnthropicCacheCreation splits cache writes by requested lifetime.
+type AnthropicCacheCreation struct {
+	Ephemeral5mInputTokens int `json:"ephemeral_5m_input_tokens"`
+	Ephemeral1hInputTokens int `json:"ephemeral_1h_input_tokens"`
+}
+
+// PromptTokens is the whole prompt as the engine counted it — the figure the
+// request log and the quota record, whatever share of it came from cache.
+func (u AnthropicUsage) PromptTokens() int {
+	return u.InputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens
+}
+
+// anthropicUsage converts OpenAI-shaped usage, moving the engine's reported
+// prefix-cache hits from input_tokens to cache_read_input_tokens.
+func anthropicUsage(u wire.Usage) AnthropicUsage {
+	cached := u.CachedTokens()
+	return AnthropicUsage{
+		InputTokens:          u.PromptTokens - cached,
+		CacheReadInputTokens: cached,
+		OutputTokens:         u.CompletionTokens,
+	}
 }
 
 // AnthropicMessage is a non-streaming /v1/messages response, and also the
@@ -107,9 +141,16 @@ func randomHex(n int) string {
 // sanitised) so the caller runs them through the same sanitizeMessages as the
 // OpenAI path.
 //
-// Parameters with no OpenAI equivalent — top_k, metadata, thinking,
-// cache_control — are dropped: an engine that cannot honour them would only
-// reject the request.
+// Parameters with no OpenAI equivalent — top_k, metadata, thinking — are
+// dropped: an engine that cannot honour them would only reject the request.
+//
+// cache_control is dropped too, but caching is not: oMLX, vLLM, llama.cpp,
+// LM Studio and Ollama all reuse the KV cache for the longest prompt prefix
+// they have seen, with no per-request marker. What they need is a prefix that
+// is byte-identical from one turn to the next, so this translation must be
+// deterministic (json.Marshal sorts map keys, and nothing here depends on the
+// time or on randomness), and systemPrompt removes the one line Claude
+// clients put at the top of the prompt that changes on every request.
 func anthropicToOpenAI(data map[string]interface{}) (map[string]interface{}, []interface{}) {
 	out := map[string]interface{}{"model": data["model"]}
 	for _, key := range []string{"max_tokens", "temperature", "top_p", "stream"} {
@@ -128,7 +169,7 @@ func anthropicToOpenAI(data map[string]interface{}) (map[string]interface{}, []i
 	}
 
 	var messages []interface{}
-	if sys := blocksText(data["system"]); sys != "" {
+	if sys := systemPrompt(data["system"]); sys != "" {
 		messages = append(messages, map[string]interface{}{"role": "system", "content": sys})
 	}
 	raw, _ := data["messages"].([]interface{})
@@ -221,6 +262,43 @@ func anthropicMessageToOpenAI(msg map[string]interface{}) []interface{} {
 		turn["tool_calls"] = toolCalls
 	}
 	return append(out, turn)
+}
+
+// billingHeaderPrefix opens the attribution line Claude Code, Claude Desktop
+// and Cowork prepend to the system prompt, e.g.
+//
+//	x-anthropic-billing-header: cc_version=2.1.37.a1b; cc_entrypoint=cli; cch=9f3c2;
+//
+// Anthropic's API reads it as metadata. To a local engine it is just the
+// first tokens of the prompt, and its cch hash differs on every request, so
+// every turn misses the prefix cache at token zero and the engine reprocesses
+// the whole conversation — tools, system prompt and history.
+const billingHeaderPrefix = "x-anthropic-billing-header:"
+
+// systemPrompt flattens the system prompt like blocksText, minus the billing
+// header: dropped as a block when sent as its own text block (how the clients
+// send it), or as the first line when the system prompt is a single string.
+func systemPrompt(v interface{}) string {
+	switch c := v.(type) {
+	case string:
+		if strings.HasPrefix(c, billingHeaderPrefix) {
+			_, rest, _ := strings.Cut(c, "\n")
+			return strings.TrimLeft(rest, "\n")
+		}
+		return c
+	case []interface{}:
+		kept := make([]interface{}, 0, len(c))
+		for _, b := range c {
+			if block, ok := b.(map[string]interface{}); ok {
+				if t, _ := block["text"].(string); strings.HasPrefix(t, billingHeaderPrefix) {
+					continue
+				}
+			}
+			kept = append(kept, b)
+		}
+		return blocksText(kept)
+	}
+	return ""
 }
 
 // blocksText flattens a string-or-blocks value (system prompt, tool_result
@@ -368,15 +446,12 @@ func openAIToAnthropic(payload interface{}, model string) (*AnthropicMessage, er
 	}
 
 	msg := &AnthropicMessage{
-		ID:      newMessageID(),
-		Type:    "message",
-		Role:    "assistant",
-		Model:   model,
-		Content: []AnthropicContentBlock{},
-		Usage: AnthropicUsage{
-			InputTokens:  cc.Usage.PromptTokens,
-			OutputTokens: cc.Usage.CompletionTokens,
-		},
+		ID:         newMessageID(),
+		Type:       "message",
+		Role:       "assistant",
+		Model:      model,
+		Content:    []AnthropicContentBlock{},
+		Usage:      anthropicUsage(cc.Usage),
 		StopReason: &stopEndTurn,
 	}
 	if len(cc.Choices) == 0 {
@@ -484,7 +559,7 @@ func (s *anthropicStream) chunk(payload []byte) []sseEvent {
 	}
 	var events []sseEvent
 	if c.Usage != nil {
-		s.usage = AnthropicUsage{InputTokens: c.Usage.PromptTokens, OutputTokens: c.Usage.CompletionTokens}
+		s.usage = anthropicUsage(*c.Usage)
 	}
 	for _, ch := range c.Choices {
 		if ch.Delta.Content != "" {

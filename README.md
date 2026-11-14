@@ -292,10 +292,33 @@ claude
 ```
 
 Not translated: Anthropic server tools (`web_search`, `code_execution`, … — no local engine can run
-them, so they are not offered to the model), extended `thinking`, `top_k` and prompt caching
-(`cache_control` is accepted and ignored). Claude Code relies heavily on tool calling, so use a model
-that supports it. It also assumes a 200k context window for model IDs it does not recognise; see
-the Claude Code model-config docs to set the real window for your model.
+them, so they are not offered to the model), extended `thinking` and `top_k`. Claude Code relies
+heavily on tool calling, so use a model that supports it. It also assumes a 200k context window for
+model IDs it does not recognise; see the Claude Code model-config docs to set the real window for
+your model.
+
+#### Prompt caching (Claude Desktop, Cowork, Claude Code)
+
+Local engines (oMLX, vLLM, llama.cpp, LM Studio, Ollama) have no `cache_control` markers; they reuse
+the KV cache for the longest prompt prefix they have already seen. Gateway42 keeps that working:
+
+- **Stable prefix.** The `x-anthropic-billing-header: …; cch=…;` line that Claude clients put at
+  the top of the system prompt changes on every request. Forwarded, it would make every turn miss
+  the cache at the very first token and reprocess the whole conversation. Gateway42 drops it. The
+  rest of the translation is deterministic, so tools, system prompt and earlier turns reach the
+  engine byte-identical from turn to turn. `cache_control` itself is accepted and not forwarded.
+- **Cache usage reported.** An engine's `usage.prompt_tokens_details.cached_tokens` becomes
+  `cache_read_input_tokens`, with `input_tokens` holding only the tokens the engine had to process,
+  and every response carries the `cache_creation` object Claude Desktop reads. To check caching,
+  look for `cache_read_input_tokens` well above zero after a session's first request. Ollama does
+  not report cache hits, so with Ollama it stays 0 even when the cache is used. The request log and
+  the quota still count the whole prompt.
+
+To use Gateway42 with Claude Desktop / Cowork, set `inferenceProvider` to `gateway`,
+`inferenceGatewayBaseUrl` to the gateway's URL, `inferenceGatewayApiKey` to a Gateway42 key (either
+auth scheme works) and list the local model IDs in `inferenceModels`. Model auto-discovery only
+shows Claude model IDs, so local models must be listed explicitly; set `behavesAs` on an entry to
+choose the context window the app assumes.
 
 ### Parameters
 
