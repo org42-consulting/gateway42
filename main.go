@@ -71,6 +71,12 @@ type Config struct {
 	// UpstreamTimeoutSec bounds a single non-streaming engine call, in
 	// seconds. See upstreamChatTimeout.
 	UpstreamTimeoutSec int
+	// MCPMode is GW42_MCP: "off" disables backend MCP support (the relayed
+	// /v1/mcp endpoints and the execution of backend MCP tool calls).
+	MCPMode string
+	// MCPMaxRounds bounds how many rounds of backend MCP tool calls one
+	// request may execute (GW42_MCP_MAX_ROUNDS, default 8).
+	MCPMaxRounds int
 	// MaxRequestBytes bounds an API request body. It is its own setting, not
 	// a multiple of MaxMsgLen: a Claude Desktop / Cowork / Claude Code request
 	// carries the whole conversation — tool definitions, every earlier turn
@@ -155,6 +161,8 @@ func loadConfig() Config {
 		FetchImageURLs:      getEnv("GW42_FETCH_IMAGE_URLS", "true") != "false",
 		OllamaNumCtx:        getEnvInt("GW42_OLLAMA_NUM_CTX", 0),
 		UpstreamTimeoutSec:  getEnvInt("GW42_UPSTREAM_TIMEOUT", 600),
+		MCPMode:             strings.ToLower(getEnv("GW42_MCP", "on")),
+		MCPMaxRounds:        getEnvInt("GW42_MCP_MAX_ROUNDS", 8),
 		MaxRequestBytes:     getEnvInt("GW42_MAX_REQUEST_BYTES", defaultMaxRequestBytes),
 		LogLevel:            getEnv("LOG_LEVEL", "INFO"),
 		LogFile:             getEnv("LOG_FILE", "./logs/gateway.log"),
@@ -1083,6 +1091,9 @@ func setupRouter() *mux.Router {
 	r.HandleFunc("/v1/whoami", handleWhoami).Methods("GET")
 	r.HandleFunc("/v1/chat/completions", handleChatCompletions).Methods("POST")
 	r.HandleFunc("/v1/embeddings", handleEmbeddings).Methods("POST")
+	r.HandleFunc("/v1/mcp/tools", handleMCPTools).Methods("GET")
+	r.HandleFunc("/v1/mcp/servers", handleMCPServers).Methods("GET")
+	r.HandleFunc("/v1/mcp/execute", handleMCPExecute).Methods("POST")
 	for _, p := range passthroughPaths {
 		r.HandleFunc(p, handlePassthrough).Methods("POST")
 	}

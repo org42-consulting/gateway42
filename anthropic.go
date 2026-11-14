@@ -43,6 +43,14 @@ type AnthropicContentBlock struct {
 	ID        string          `json:"id,omitempty"`
 	Name      string          `json:"name,omitempty"`
 	Input     json.RawMessage `json:"input,omitempty"`
+
+	// Anthropic's MCP blocks: mcp_tool_use (ID, Name, ServerName, Input) and
+	// mcp_tool_result (ToolUseID, IsError, Content), used for backend MCP
+	// calls the gateway executed (see mcp.go).
+	ServerName string                  `json:"server_name,omitempty"`
+	ToolUseID  string                  `json:"tool_use_id,omitempty"`
+	IsError    *bool                   `json:"is_error,omitempty"`
+	Content    []AnthropicContentBlock `json:"content,omitempty"`
 }
 
 // thinkingBlock is a thinking content block holding text.
@@ -292,6 +300,9 @@ func anthropicMessageToOpenAI(msg map[string]interface{}) []interface{} {
 		return []interface{}{map[string]interface{}{"role": role, "content": s}}
 	}
 	blocks, _ := msg["content"].([]interface{})
+	if role == "assistant" && hasBlockType(blocks, "mcp_tool_result") {
+		return assistantWithMCPResults(blocks)
+	}
 
 	var out []interface{}
 	var parts []interface{}
@@ -314,7 +325,7 @@ func anthropicMessageToOpenAI(msg map[string]interface{}) []interface{} {
 					"type": "image_url", "image_url": map[string]interface{}{"url": url},
 				})
 			}
-		case "tool_use":
+		case "tool_use", "mcp_tool_use":
 			args, err := json.Marshal(block["input"])
 			if err != nil || block["input"] == nil {
 				args = []byte("{}")
@@ -420,6 +431,49 @@ func systemPrompt(v interface{}) string {
 		return blocksText(kept)
 	}
 	return ""
+}
+
+func hasBlockType(blocks []interface{}, t string) bool {
+	for _, b := range blocks {
+		if bm, ok := b.(map[string]interface{}); ok && bm["type"] == t {
+			return true
+		}
+	}
+	return false
+}
+
+// assistantWithMCPResults translates an assistant turn that carries backend
+// MCP calls the gateway executed — Anthropic's mcp_tool_use and
+// mcp_tool_result blocks, as a client that asked for them sends them back —
+// into the OpenAI sequence the engine saw: an assistant turn with the calls,
+// a tool message per result, and so on for each round, then the rest.
+// Keeping that sequence keeps the engine's prompt prefix as it was.
+func assistantWithMCPResults(blocks []interface{}) []interface{} {
+	var out, seg []interface{}
+	flush := func() {
+		if len(seg) > 0 {
+			out = append(out, anthropicMessageToOpenAI(map[string]interface{}{"role": "assistant", "content": seg})...)
+			seg = nil
+		}
+	}
+	for _, b := range blocks {
+		block, ok := b.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if block["type"] != "mcp_tool_result" {
+			seg = append(seg, block)
+			continue
+		}
+		flush()
+		content := blocksText(block["content"])
+		if isErr, _ := block["is_error"].(bool); isErr {
+			content = "Error: " + content
+		}
+		out = append(out, map[string]interface{}{"role": "tool", "tool_call_id": block["tool_use_id"], "content": content})
+	}
+	flush()
+	return out
 }
 
 // blocksText flattens a string-or-blocks value (system prompt, tool_result
@@ -768,6 +822,69 @@ type anthropicStream struct {
 	// prompt size up front, an engine only at the end. message_delta carries
 	// the engine's count, which replaces it.
 	inputEstimate int
+
+	// Backend MCP calls (see mcp.go). With a session, tool calls for backend
+	// MCP tools are collected in pending — never emitted as tool_use — for
+	// the handler to execute between rounds; roundText is the round's text,
+	// which becomes the assistant turn that made the calls; priorUsage sums
+	// the rounds before the current one.
+	mcp          *mcpSession
+	pending      map[int]*mcpCall
+	pendingOrder []int
+	roundText    strings.Builder
+	priorUsage   AnthropicUsage
+}
+
+// takeRound returns the backend MCP calls of the round just streamed, its
+// text, and whether the client's own tools were called too.
+func (s *anthropicStream) takeRound() ([]mcpCall, string, bool) {
+	calls := make([]mcpCall, 0, len(s.pendingOrder))
+	for _, i := range s.pendingOrder {
+		calls = append(calls, *s.pending[i])
+	}
+	return calls, s.roundText.String(), s.sawTool
+}
+
+// nextRound prepares for the engine's next stream in the same message: the
+// open block is closed (its events returned), usage so far is banked, and
+// the per-round state is cleared.
+func (s *anthropicStream) nextRound() []sseEvent {
+	events := s.closeBlock()
+	s.priorUsage = s.priorUsage.plus(s.usage)
+	s.usage = AnthropicUsage{}
+	s.pending, s.pendingOrder = nil, nil
+	s.roundText.Reset()
+	s.finish, s.stopSeq = "", ""
+	return events
+}
+
+// mcpBlockEvents emits executed calls as Anthropic's mcp_tool_use and
+// mcp_tool_result blocks, each complete in its content_block_start.
+func (s *anthropicStream) mcpBlockEvents(calls []mcpCall, results []mcpResult) []sseEvent {
+	events := s.closeBlock()
+	for i, c := range calls {
+		for _, b := range []AnthropicContentBlock{mcpUseBlock(c, s.mcp.server(c.Name)), mcpResultBlock(c, results[i])} {
+			s.blockIndex++
+			events = append(events,
+				sseEvent{"content_block_start", map[string]interface{}{
+					"type": "content_block_start", "index": s.blockIndex, "content_block": b,
+				}},
+				sseEvent{"content_block_stop", map[string]interface{}{
+					"type": "content_block_stop", "index": s.blockIndex,
+				}})
+		}
+	}
+	return events
+}
+
+// plus adds two usages field by field.
+func (u AnthropicUsage) plus(v AnthropicUsage) AnthropicUsage {
+	return AnthropicUsage{
+		InputTokens:              u.InputTokens + v.InputTokens,
+		CacheCreationInputTokens: u.CacheCreationInputTokens + v.CacheCreationInputTokens,
+		CacheReadInputTokens:     u.CacheReadInputTokens + v.CacheReadInputTokens,
+		OutputTokens:             u.OutputTokens + v.OutputTokens,
+	}
 }
 
 // pingEvent is Anthropic's keep-alive event; pingInterval its cadence while
@@ -852,6 +969,7 @@ func (s *anthropicStream) chunk(payload []byte) []sseEvent {
 			}})
 		}
 		if ch.Delta.Content != "" {
+			s.roundText.WriteString(ch.Delta.Content)
 			if s.open != "text" {
 				events = append(events, s.closeBlock()...)
 				s.blockIndex++
@@ -868,6 +986,22 @@ func (s *anthropicStream) chunk(payload []byte) []sseEvent {
 			}})
 		}
 		for _, tc := range ch.Delta.ToolCalls {
+			if p, ok := s.pending[tc.Index]; ok {
+				p.Args += tc.Function.Arguments
+				continue
+			}
+			if s.mcp.isMCP(tc.Function.Name) && (s.open != "tool" || s.toolIndex != tc.Index) {
+				if s.pending == nil {
+					s.pending = map[int]*mcpCall{}
+				}
+				id := tc.ID
+				if id == "" {
+					id = newToolUseID()
+				}
+				s.pending[tc.Index] = &mcpCall{ID: id, Name: tc.Function.Name, Args: tc.Function.Arguments}
+				s.pendingOrder = append(s.pendingOrder, tc.Index)
+				continue
+			}
 			if s.open != "tool" || s.toolIndex != tc.Index {
 				events = append(events, s.closeBlock()...)
 				s.blockIndex++
@@ -921,12 +1055,16 @@ func (s *anthropicStream) end() []sseEvent {
 	}
 	if s.sawTool {
 		stop, seq = &stopToolUse, nil
+	} else if *stop == stopToolUse {
+		// The only calls were backend MCP calls left unexecuted (the round
+		// limit): nothing for the client to run, so the turn has ended.
+		stop = &stopEndTurn
 	}
 	return append(events,
 		sseEvent{"message_delta", map[string]interface{}{
 			"type":  "message_delta",
 			"delta": map[string]interface{}{"stop_reason": stop, "stop_sequence": seq},
-			"usage": s.usage,
+			"usage": s.priorUsage.plus(s.usage),
 		}},
 		sseEvent{"message_stop", map[string]interface{}{"type": "message_stop"}},
 	)

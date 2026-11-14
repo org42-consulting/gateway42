@@ -234,6 +234,8 @@ Requests with a missing, invalid, or deactivated key are rejected with `401 Unau
 | `/v1/messages/count_tokens` | POST | Input token count in Anthropic format: exact from engines that implement it (oMLX), otherwise estimated (≈ 4 bytes per token). |
 | `/v1/responses`, `/v1/completions` | POST | Passed through to the engine's own implementation, streaming or not (Ollama: its OpenAI-compatible `/v1` routes). Usage is read from the response for the request log and quota. |
 | `/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/audio/translations`, `/v1/images/generations`, `/v1/moderations` | POST | Passed through as well (JSON or multipart; audio comes back as bytes). An engine without the endpoint answers `404`, which reaches the client. |
+| `/v1/mcp/tools`, `/v1/mcp/servers` | GET | The backend MCP tools and servers of every engine that has them (oMLX), each tagged with its `engine`. See [Backend MCP tools](#backend-mcp-tools). |
+| `/v1/mcp/execute` | POST | Runs a backend MCP tool (`{"tool_name", "arguments"}`) on the engine that exposes it. |
 | `/v1/models` | GET | Returns the combined catalogue of every reachable engine. Each entry carries both OpenAI (`object`, `owned_by`) and Anthropic (`type`, `display_name`, `created_at`) fields. Duplicates are collapsed; an engine that is down is skipped rather than failing the listing. |
 | `/v1/whoami` | GET | Reports the identity the caller authenticated as: `name`, `status`, `rate_limit_rpm`, and `key_created_at`. A no-side-effect way for a key holder to verify credentials without reaching the admin UI. It is a `/v1/` route, so it goes through the same rate limiting as the other `/v1` endpoints. |
 | `/health` | GET | Returns `{"status": "ok"}`. No auth required. Use for uptime monitoring. |
@@ -329,6 +331,49 @@ Translated with care:
   there is nothing to sign for a local model's.
 - **Parallel tool use**: `tool_choice.disable_parallel_tool_use` becomes `parallel_tool_calls: false`.
 - **Failover**: `/v1/messages` tries every engine that holds the model, like `/v1/chat/completions`.
+
+#### Backend MCP tools
+
+An engine can bring its own MCP tools. oMLX, started with an MCP configuration, connects to the
+MCP servers in it and adds their tools — named `server__tool` — to every chat, Responses and
+Messages request, so the model can call them. It does not run them: the call comes back like any
+tool call, and the caller is expected to run it through the engine's `POST /v1/mcp/execute`. A
+client that only knows its own tools (Claude Desktop, Cowork, Claude Code, OpenAI SDK apps) cannot,
+and the turn fails.
+
+Gateway42. runs those calls itself, on `/v1/chat/completions` and `/v1/messages`, streaming or not:
+
+1. A tool call for a backend MCP tool — one the engine lists under `/v1/mcp/tools` and the client
+   did not offer itself — is executed through the engine's `/v1/mcp/execute`.
+2. The call and its result are appended to the conversation and the engine is asked again, in the
+   same response, until the model answers or calls one of the client's own tools, at most
+   `GW42_MCP_MAX_ROUNDS` times.
+3. The client gets one answer. Backend calls never reach it as tool calls. The text the model wrote
+   before each call is part of the answer, usage is summed over all rounds, and a stream keeps one
+   completion id, one finish and one message. Streams send pings or SSE comments while a tool runs.
+   On `/v1/messages`, a client that sends the `anthropic-beta` flag `mcp-client-…` also gets each
+   call and result as Anthropic's `mcp_tool_use` and `mcp_tool_result` blocks, and sending those
+   back in history reproduces what the engine saw.
+
+Details:
+
+- **Name clashes:** the client's own tools always win, as they do in oMLX.
+- **Mixed rounds:** a round that calls both kinds ends the loop with only the client's calls; the
+  model can call the backend tool again on the next turn.
+- **Tool failures:** a failing tool, or arguments that are not JSON, become an error result the
+  model sees, not a failed request.
+- **Logging:** every execution is logged with user, engine, tool and outcome.
+
+The engine's MCP endpoints are relayed too, for clients that run the calls themselves — for example
+on `/v1/responses`, which is passed through unchanged:
+
+- `GET /v1/mcp/tools` and `GET /v1/mcp/servers`, combined across engines;
+- `POST /v1/mcp/execute`, routed to the engine that has the tool.
+
+MCP tools can have side effects (a filesystem or shell server). Through the gateway any valid API
+key can trigger them, as any holder of the engine's own key could. `GW42_MCP=off` turns all of this
+off. Anthropic's MCP connector, where the request names remote servers in `mcp_servers`, is a
+different feature and is not supported: `mcp_servers` is dropped.
 
 #### Prompt caching (Claude Desktop, Cowork, Claude Code)
 
@@ -911,6 +956,8 @@ All configuration is via environment variables. No variables are strictly requir
 | `GW42_MAX_INPUT_LENGTH` | `0` | Maximum bytes of text per message sent to an engine; longer text is truncated. `0` sends every message whole, so model input is bounded only by `GW42_MAX_REQUEST_BYTES`. |
 | `GW42_UPSTREAM_TIMEOUT` | `600` | Seconds a single non-streaming engine call may take. Streams are bounded by silence instead (60 s without a byte), up to 30 minutes. |
 | `GW42_OLLAMA_NUM_CTX` | `0` | Context window (`num_ctx`) sent with every Ollama request, clamped to the model's maximum from `/api/show`. `0` leaves it to Ollama (`OLLAMA_CONTEXT_LENGTH` or the Modelfile), which trims longer prompts from the front. Keep it one fixed value: Ollama reloads a model whenever `num_ctx` changes. |
+| `GW42_MCP` | `on` | Backend MCP tools: executing their calls on the chat and messages routes, and the `/v1/mcp/*` endpoints. `off` turns both off; calls for backend tools then reach the client unrun. |
+| `GW42_MCP_MAX_ROUNDS` | `8` | Most rounds of backend MCP calls one request may execute before the answer is returned as it stands. |
 | `GW42_FETCH_IMAGE_URLS` | `true` | Download `http(s)` images for Ollama, which only takes inline images. Only public addresses are fetched (loopback, private, link-local and CGNAT ranges are refused, also after DNS and redirects), within 15 s and 20 MB, and only image content types. `false` drops URL images for Ollama. |
 | `GW42_MAX_REQUEST_BYTES` | `33554432` | Maximum API request body (32 MiB, the Anthropic API's own limit). Claude Desktop, Cowork and Claude Code resend the whole session, screenshots included, on every turn, so this bounds the usable conversation, not a single message. Larger bodies get `413`. |
 | `LOG_LEVEL` | `INFO` | Log verbosity: `DEBUG`, `INFO`, `WARN` (or `WARNING`), `ERROR`. An unrecognised value falls back to `INFO` with a warning. |
@@ -976,6 +1023,7 @@ The race detector works without a C toolchain because the SQLite driver is pure 
 | `limits_test.go` | `max_tokens` passed through unchanged, nothing invented when absent, the request-body bound, keep-alives holding the stream idle deadline. |
 | `compat_gaps_test.go` | Engine errors passed on with their status (end to end, both APIs), `/v1/messages` failover, tool-result images, reasoning as thinking blocks, documents. |
 | `thinking_context_embeddings_test.go` | The thinking switch sent to engines, effort, context windows in `/v1/models`, and `/v1/embeddings` against fake oMLX- and Ollama-style engines. |
+| `mcp_test.go` | Backend MCP tools against a fake oMLX: execution and round loop on both APIs, streaming and not (no call reaches the client; one id, finish and message; usage summed), client tools winning a clash, mixed rounds, the round limit, `GW42_MCP=off`, Anthropic MCP blocks and their history form, failing tools, and the relayed `/v1/mcp/*` endpoints. |
 | `remaining_gaps_test.go` | Ollama option, tool-choice, legacy-function and logprobs mapping; `num_ctx` and context windows from `/api/show`; the image fetcher's address guard and cache; pings, stop sequences and engine-backed `count_tokens`; every pass-through endpoint end to end; the header-limit split for non-streaming calls. |
 | `recovery_test.go` | Panic recovery: the JSON envelope on `/v1/`, plain text on the admin UI, an SSE error frame when the response is already committed mid-stream, and that a committed body is never appended to. Also that the `statusRecorder` wrapper stays transparent about the writer's other interfaces — `Flusher`, `Hijacker` and `io.ReaderFrom` are not promoted through an embedded interface, so each is asserted and delegated to, including that a hijacked response gets no panic body appended to its raw protocol bytes. |
 | `metrics_test.go` | That a recovered panic is counted, with the status the client actually saw; that a mid-stream panic counts as `200` and raises `gw42_panics_total`; that the in-flight gauge unwinds; that one `statusRecorder` is shared; and that a panicked request still produces an audit row. |
@@ -1030,14 +1078,15 @@ Single `package main`, one file per concern:
 | ---- | ----- | -------------- |
 | `main.go` | 1323 | Config, routing table, middleware chain, panic recovery, rate limiting, trusted-proxy client-IP resolution, server lifecycle, graceful shutdown. |
 | `handlers.go` | 1472 | Admin web UI handlers only. |
-| `api_handlers.go` | 1131 | The `/v1/*` OpenAI-compatible surface, including `/v1/whoami` and the completion-path quota checks. Separate from the admin UI so a change to one cannot alter the other's contract. |
+| `api_handlers.go` | 1297 | The `/v1/*` OpenAI-compatible surface, including `/v1/whoami` and the completion-path quota checks. Separate from the admin UI so a change to one cannot alter the other's contract. |
 | `engine.go` | 1389 | The `Engine` interface and its two adapters, plus the probe cache, stream implementations and the streaming deadline. |
 | `routing.go` | 370 | Model-name → ordered engine lists (primary plus failover targets) and the cached routing index. |
 | `openai.go` | 571 | Request and response translation between OpenAI and Ollama shapes. |
-| `anthropic.go` | 950 | The Anthropic Messages API front-end: both translation directions and the streaming block sequencer. |
+| `anthropic.go` | 1088 | The Anthropic Messages API front-end: both translation directions and the streaming block sequencer. |
 | `embeddings.go` | 204 | `/v1/embeddings`: the engines' embedding calls, Ollama's `/api/embed` translation (base64 included) and the handler. |
 | `passthrough.go` | 296 | `/v1/responses`, `/v1/completions`, audio, images and moderations relayed to the engine, with SSE relay and usage capture. |
 | `remote_images.go` | 226 | Fetching `http(s)` images for Ollama behind a public-address-only dialer, with a small cache. |
+| `mcp.go` | 789 | Backend MCP tools: the per-engine tool catalogue, execution through `/v1/mcp/execute`, the non-streaming round loop, the OpenAI stream filter, Anthropic MCP blocks and the relayed `/v1/mcp/*` endpoints. |
 | `ollama_context.go` | 157 | Ollama context windows from `/api/show`: `max_input_tokens` in `/v1/models` and `GW42_OLLAMA_NUM_CTX`. |
 | `types.go` | 168 | Typed structs for responses Gateway42. authors. |
 | `db.go` | 1203 | Schema, migrations, both connection pools, queries, FTS5 setup and its startup consistency check, retention pruning, and the daily SQLite maintenance sweep. |

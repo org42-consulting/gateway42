@@ -20,6 +20,8 @@ Only these two paths exist under `/v1/`. Anything else returns `404`.
 | `POST` | `/v1/completions` | Legacy completions, passed through; streams get `include_usage` |
 | `POST` | `/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/audio/translations` | Passed through (multipart uploads byte for byte; audio returned as bytes) |
 | `POST` | `/v1/images/generations`, `/v1/moderations` | Passed through |
+| `GET` | `/v1/mcp/tools`, `/v1/mcp/servers` | Backend MCP tools and servers (oMLX), combined across engines |
+| `POST` | `/v1/mcp/execute` | Runs a backend MCP tool on the engine that has it |
 | `GET` | `/v1/models` | List models across configured engines, with `max_input_tokens` when the engine reports a context window |
 
 `OPTIONS` on any `/v1/` path is answered as a CORS preflight.
@@ -97,6 +99,18 @@ OpenAI has no name for is reported as `"stop"`, never `null` or a non-standard s
 `size` (bytes on disk) is a Gateway42 extension, not part of the OpenAI schema; SDKs ignore unknown
 fields. `created` comes from the engine where available and falls back to the current time rather
 than `0`, which some clients render as 1970.
+
+## Backend MCP tools
+
+When an engine exposes MCP tools to its models (oMLX with an MCP configuration), chat completions
+that call them are completed by the gateway: it runs the call through the engine's
+`/v1/mcp/execute`, appends the result and asks the engine again, until the model answers or calls
+one of the client's own tools (`GW42_MCP_MAX_ROUNDS`, default 8). The client receives one
+completion: no tool call for a backend tool, the text of every round, usage summed. A stream keeps
+one `id`, one role chunk and one `finish_reason`, the client's tool calls are numbered from 0, and
+SSE comments keep the connection open while a tool runs. Tools the client offers itself are never
+taken over, even on a name clash. `GW42_MCP=off` disables this and the `/v1/mcp/*` endpoints. See
+the README's *Backend MCP tools* for details.
 
 ## Pass-through endpoints
 

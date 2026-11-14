@@ -284,16 +284,18 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		messages = inlineRemoteImages(r.Context(), messages)
 	}
 	engineReq := buildEngineRequest(selected, data, messages)
+	// Backend MCP tools (see mcp.go): calls for them are executed here.
+	session := newMCPSession(selected, data, user.ID)
 
 	if streaming, _ := data["stream"].(bool); streaming {
-		streamCompletion(w, r, selected, engineReq, user.ID, model, messages)
+		streamCompletion(w, r, selected, engineReq, user.ID, model, messages, session, data)
 		return
 	}
 
 	// Non-streaming. Passing the request context means a client that hangs up
 	// cancels the upstream call, which releases the concurrency slot now
 	// instead of up to upstreamChatTimeout later.
-	result, err := selected.Chat(r.Context(), engineReq)
+	result, rounds, err := chatWithMCP(r.Context(), selected, session, data, messages, engineReq)
 	if err != nil {
 		// Client gone: nothing to write, and this is not an upstream fault —
 		// reporting it as a 502 would misattribute the failure in the metrics.
@@ -319,6 +321,11 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	var payload interface{} = result
 	if selected.Type() == EngineOllama {
 		payload = ollamaToOpenAI(result)
+	}
+	// What the model said before each backend MCP call is part of the
+	// answer the client receives.
+	if len(rounds) > 0 {
+		prependRoundText(result, rounds)
 	}
 	recordCompletionDetail(r, payload)
 
@@ -378,17 +385,23 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		messages = inlineRemoteImages(r.Context(), messages)
 	}
 	engineReq := buildEngineRequest(adapter, data, messages)
+	// Backend MCP tools (see mcp.go): calls for them are executed here, and
+	// shown as mcp_tool_use / mcp_tool_result blocks when the client asks
+	// for Anthropic's MCP blocks.
+	session := newMCPSession(adapter, data, user.ID)
+	showMCP := mcpBlocksRequested(r)
 
 	if streaming, _ := data["stream"].(bool); streaming {
 		// Asking the engine for usage is openAICompatRequest's job now, and it
 		// runs for every non-Ollama adapter — so the Claude Code case (its
 		// context window comes from message_delta.usage, and a stream without
 		// usage would read as zero tokens) is covered from one place.
-		streamMessages(w, r, adapter, engineReq, user.ID, model, messages, thinkingRequested(body))
+		streamMessages(w, r, adapter, engineReq, user.ID, model, messages, thinkingRequested(body),
+			session, data, showMCP)
 		return
 	}
 
-	result, err := adapter.Chat(r.Context(), engineReq)
+	result, rounds, err := chatWithMCP(r.Context(), adapter, session, data, messages, engineReq)
 	if err != nil {
 		if r.Context().Err() != nil {
 			slog.Info("client disconnected before completion", "model", model, "user", user.ID)
@@ -412,6 +425,9 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	if !thinkingRequested(body) {
 		withoutThinking(msg)
 	}
+	if len(rounds) > 0 {
+		msg.Content = append(mcpRoundBlocks(rounds, session, showMCP), msg.Content...)
+	}
 	recordAnthropicDetail(r, msg)
 	logInteraction(user.ID, messages, msg, model)
 	jsonResponse(w, 200, msg)
@@ -422,7 +438,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 // with anthropicStream turning each OpenAI chunk into typed events.
 func streamMessages(w http.ResponseWriter, r *http.Request, adapter Engine,
 	engineReq map[string]interface{}, userID int, model string,
-	messages []map[string]interface{}, thinking bool) {
+	messages []map[string]interface{}, thinking bool, session *mcpSession, data map[string]interface{}, showMCP bool) {
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -444,7 +460,10 @@ func streamMessages(w http.ResponseWriter, r *http.Request, adapter Engine,
 		writeAnthropicEngineFailure(w, err)
 		return
 	}
-	defer stream.Close()
+	// The stream of the current round; each backend MCP round opens a new
+	// one in the same message.
+	current := stream
+	defer func() { _ = current.Close() }()
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("X-Accel-Buffering", "no")
@@ -480,6 +499,7 @@ func streamMessages(w http.ResponseWriter, r *http.Request, adapter Engine,
 
 	tr := newAnthropicStream(model)
 	tr.thinking = thinking
+	tr.mcp = session
 	tr.inputEstimate = estimateTokens(engineReq["messages"], engineReq["tools"])
 	// Anthropic follows message_start with a ping, and keeps pinging while
 	// the model is silent. Local engines can be silent for minutes while
@@ -489,80 +509,138 @@ func streamMessages(w http.ResponseWriter, r *http.Request, adapter Engine,
 		outcome = "client disconnected"
 		return
 	}
+	ping := time.NewTicker(pingInterval)
+	defer ping.Stop()
 
-	// Recv runs on its own goroutine so the loop can ping between chunks.
-	// It also touches the deadline there, on the read, not after the write —
-	// the bound tracks whether the engine is alive, not how fast this client
-	// drains — and every touch stays on that one goroutine. The goroutine
-	// ends when Recv fails, which the deferred stream.Close and
-	// deadline.stop guarantee once this function returns.
+	// relay streams one engine stream into the message. Recv runs on its own
+	// goroutine so the loop can ping between chunks. It also touches the
+	// deadline there, on the read, not after the write — the bound tracks
+	// whether the engine is alive, not how fast this client drains — and
+	// every touch stays on that one goroutine, which ends when Recv fails
+	// (the stream's Close and deadline.stop guarantee it does). relay
+	// reports false when the response is over (an error was sent, or the
+	// client left).
 	type recvResult struct {
 		payload []byte
 		meta    chunkMeta
 		err     error
 	}
-	results := make(chan recvResult)
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
+	relay := func(stream ChatStream) bool {
+		results := make(chan recvResult)
+		done := make(chan struct{})
+		defer close(done)
+		go func() {
+			for {
+				payload, meta, err := stream.Recv()
+				if err == nil {
+					deadline.touch()
+				}
+				select {
+				case results <- recvResult{payload, meta, err}:
+				case <-done:
+					return
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
 		for {
-			payload, meta, err := stream.Recv()
-			if err == nil {
-				deadline.touch()
-			}
+			var res recvResult
 			select {
-			case results <- recvResult{payload, meta, err}:
-			case <-done:
-				return
+			case <-ping.C:
+				if !send(pingEvent) {
+					outcome = "client disconnected"
+					detail.setOutcome(outcome)
+					return false
+				}
+				continue
+			case res = <-results:
 			}
-			if err != nil {
-				return
+			if res.err == io.EOF {
+				return true
 			}
-		}
-	}()
-	ping := time.NewTicker(pingInterval)
-	defer ping.Stop()
-
-	for {
-		var res recvResult
-		select {
-		case <-ping.C:
-			if !send(pingEvent) {
+			if res.err != nil {
+				// Anthropic's in-stream error event: the client surfaces it
+				// instead of treating the truncated message as complete. The
+				// deadline cause replaces the read error when the gateway
+				// capped the stream, so the audit can tell that from a
+				// transport failure.
+				why := res.err
+				if cause := deadline.cause(); cause != nil {
+					why = cause
+				}
+				slog.Error("engine stream read", "err", why, "model", model)
+				send(sseEvent{"error", anthropicError(500, "Stream interrupted", "api_error")})
+				outcome = "stream interrupted"
+				detail.setOutcome(outcome)
+				detail.setUpstreamErr(why)
+				return false
+			}
+			if !send(tr.chunk(res.payload)...) {
+				slog.Info("client disconnected mid-stream", "model", model, "user", userID)
 				outcome = "client disconnected"
 				detail.setOutcome(outcome)
-				return
+				return false
 			}
-			continue
-		case res = <-results:
+			detail.setFirstToken()
+			detail.applyMeta(res.meta)
+			audit.write(res.meta.auditText)
 		}
-		if res.err == io.EOF {
+	}
+
+	for round := 0; ; round++ {
+		if !relay(current) {
+			return
+		}
+		calls, text, clientCalled := tr.takeRound()
+		// Done: no backend MCP call, the client must run its own calls
+		// first (the backend ones are dropped), or the round limit is hit.
+		if len(calls) == 0 || clientCalled || round >= mcpMaxRounds() {
 			break
 		}
-		if res.err != nil {
-			// Anthropic's in-stream error event: the client surfaces it
-			// instead of treating the truncated message as complete. The
-			// deadline cause replaces the read error when the gateway capped
-			// the stream, so the audit can tell that from a transport failure.
-			why := res.err
-			if cause := deadline.cause(); cause != nil {
-				why = cause
+		if !send(tr.nextRound()...) {
+			outcome = "client disconnected"
+			return
+		}
+		// Tools can take a while; keep pinging meanwhile.
+		resCh := make(chan []mcpResult, 1)
+		go func() { resCh <- session.executeAll(deadline.ctx, calls) }()
+		var results []mcpResult
+	wait:
+		for {
+			select {
+			case results = <-resCh:
+				break wait
+			case <-ping.C:
+				if !send(pingEvent) {
+					outcome = "client disconnected"
+					return
+				}
 			}
-			slog.Error("engine stream read", "err", why, "model", model)
-			send(sseEvent{"error", anthropicError(500, "Stream interrupted", "api_error")})
+		}
+		deadline.touch()
+		if showMCP && !send(tr.mcpBlockEvents(calls, results)...) {
+			outcome = "client disconnected"
+			return
+		}
+		messages = appendMCPRound(messages, text, calls, results)
+		engineReq = buildEngineRequest(adapter, data, messages)
+		next, err := adapter.StreamChat(deadline.ctx, engineReq)
+		if err != nil {
+			slog.Error("engine stream (mcp round)", "err", err, "model", model)
+			status, msg, errType := engineFailure(err)
+			send(sseEvent{"error", anthropicError(status, msg, errType)})
 			outcome = "stream interrupted"
 			detail.setOutcome(outcome)
-			detail.setUpstreamErr(why)
+			detail.setUpstreamErr(err)
 			return
 		}
-		if !send(tr.chunk(res.payload)...) {
-			slog.Info("client disconnected mid-stream", "model", model, "user", userID)
-			outcome = "client disconnected"
-			detail.setOutcome(outcome)
-			return
-		}
-		detail.setFirstToken()
-		detail.applyMeta(res.meta)
-		audit.write(res.meta.auditText)
+		_ = current.Close()
+		current = next
+	}
+	if usage := tr.priorUsage.plus(tr.usage); usage.PromptTokens() > 0 || usage.OutputTokens > 0 {
+		detail.setTokens(usage.PromptTokens(), usage.OutputTokens)
 	}
 	send(tr.end()...)
 }
@@ -923,7 +1001,7 @@ func openAICompatRequest(data map[string]interface{}, messages []map[string]inte
 // being duplicated (and drifting) per adapter.
 func streamCompletion(w http.ResponseWriter, r *http.Request, adapter Engine,
 	engineReq map[string]interface{}, userID int, model string,
-	messages []map[string]interface{}) {
+	messages []map[string]interface{}, session *mcpSession, data map[string]interface{}) {
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -955,7 +1033,10 @@ func streamCompletion(w http.ResponseWriter, r *http.Request, adapter Engine,
 		writeOpenAIEngineFailure(w, err)
 		return
 	}
-	defer stream.Close()
+	// The stream of the current round; each backend MCP round opens a new
+	// one in the same response.
+	current := stream
+	defer func() { _ = current.Close() }()
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("X-Accel-Buffering", "no")
@@ -980,55 +1061,140 @@ func streamCompletion(w http.ResponseWriter, r *http.Request, adapter Engine,
 		logInteraction(userID, messages, resp, model)
 	}()
 
-	for {
-		payload, meta, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			// Headers are already out, so the status cannot change. Emitting
-			// an error frame before [DONE] is the only way to tell a client
-			// that the completion it received is truncated.
-			//
-			// The deadline cause replaces the read error when the gateway
-			// itself ended the stream: Recv can only report a cancelled read,
-			// which would hide that this was a timeout rather than a network
-			// failure — the gap that made the old cap uninterpretable in the
-			// request log.
-			why := err
-			if cause := deadline.cause(); cause != nil {
-				why = cause
-			}
-			slog.Error("engine stream read", "err", why, "model", model)
-			if b, mErr := json.Marshal(openaiError("Stream interrupted", "api_error")); mErr == nil {
-				fmt.Fprintf(w, "data: %s\n\n", b)
-			}
-			outcome = "stream interrupted"
-			detail.setUpstreamErr(why)
-			break
-		}
-		// Touched on the read, not after the write: the bound measures whether
-		// the engine is alive, and a client that drains slowly must not get its
-		// own completion killed for reading it carefully.
-		deadline.touch()
+	// With backend MCP tools in play, chunks are rewritten (see
+	// openAIStreamFilter); without, they are relayed exactly as the engine
+	// sent them.
+	var filter *openAIStreamFilter
+	if session != nil {
+		filter = newOpenAIStreamFilter(session)
+	}
+	writeData := func(payload []byte) bool {
 		if _, err := fmt.Fprintf(w, "data: %s\n\n", payload); err != nil {
 			// Client went away mid-stream. Returning unwinds the deferred
 			// Close and Release rather than writing into a dead connection
 			// for the rest of the completion.
 			slog.Info("client disconnected mid-stream", "model", model, "user", userID)
 			outcome = "client disconnected"
-			return
+			return false
 		}
-		detail.setFirstToken()
-		detail.applyMeta(meta)
-		// Recorded after the write succeeds, so the audit holds what reached
-		// the client rather than what the engine produced. The text was
-		// extracted by the adapter while it parsed the frame — no second
-		// unmarshal here.
-		audit.write(meta.auditText)
+		flusher.Flush()
+		return true
+	}
+	writeStreamError := func(msg string) {
+		if b, mErr := json.Marshal(openaiError(msg, "api_error")); mErr == nil {
+			fmt.Fprintf(w, "data: %s\n\n", b)
+		}
+		fmt.Fprint(w, "data: [DONE]\n\n")
 		flusher.Flush()
 	}
 
+	// relay copies one engine stream; false means the response is over.
+	relay := func(stream ChatStream) bool {
+		for {
+			payload, meta, err := stream.Recv()
+			if err == io.EOF {
+				return true
+			}
+			if err != nil {
+				// Headers are already out, so the status cannot change.
+				// Emitting an error frame before [DONE] is the only way to
+				// tell a client that the completion it received is truncated.
+				//
+				// The deadline cause replaces the read error when the gateway
+				// itself ended the stream: Recv can only report a cancelled
+				// read, which would hide that this was a timeout rather than
+				// a network failure.
+				why := err
+				if cause := deadline.cause(); cause != nil {
+					why = cause
+				}
+				slog.Error("engine stream read", "err", why, "model", model)
+				outcome = "stream interrupted"
+				detail.setUpstreamErr(why)
+				writeStreamError("Stream interrupted")
+				return false
+			}
+			// Touched on the read, not after the write: the bound measures
+			// whether the engine is alive, and a client that drains slowly
+			// must not get its own completion killed for reading it carefully.
+			deadline.touch()
+			detail.applyMeta(meta)
+			if filter != nil {
+				if payload = filter.filter(payload); payload == nil {
+					continue
+				}
+			}
+			if !writeData(payload) {
+				return false
+			}
+			detail.setFirstToken()
+			// Recorded after the write succeeds, so the audit holds what
+			// reached the client rather than what the engine produced. The
+			// text was extracted by the adapter while it parsed the frame —
+			// no second unmarshal here.
+			audit.write(meta.auditText)
+		}
+	}
+
+	for round := 0; ; round++ {
+		if !relay(current) {
+			return
+		}
+		if filter == nil {
+			break
+		}
+		calls, text, clientCalled := filter.takeRound()
+		if len(calls) == 0 || clientCalled || round >= mcpMaxRounds() {
+			break
+		}
+		// Tools can take a while; SSE comments keep the connection alive
+		// (OpenAI clients ignore them).
+		resCh := make(chan []mcpResult, 1)
+		go func() { resCh <- session.executeAll(deadline.ctx, calls) }()
+		keepAlive := time.NewTicker(pingInterval)
+		var results []mcpResult
+	wait:
+		for {
+			select {
+			case results = <-resCh:
+				break wait
+			case <-keepAlive.C:
+				if _, err := fmt.Fprint(w, ": running backend MCP tools\n\n"); err != nil {
+					keepAlive.Stop()
+					outcome = "client disconnected"
+					return
+				}
+				flusher.Flush()
+			}
+		}
+		keepAlive.Stop()
+		deadline.touch()
+		messages = appendMCPRound(messages, text, calls, results)
+		engineReq = buildEngineRequest(adapter, data, messages)
+		next, err := adapter.StreamChat(deadline.ctx, engineReq)
+		if err != nil {
+			slog.Error("engine stream (mcp round)", "err", err, "model", model)
+			outcome = "stream interrupted"
+			detail.setUpstreamErr(err)
+			_, msg, _ := engineFailure(err)
+			writeStreamError(msg)
+			return
+		}
+		_ = current.Close()
+		current = next
+		filter.nextRound()
+	}
+
+	if filter != nil {
+		for _, payload := range filter.finalChunks() {
+			if !writeData(payload) {
+				return
+			}
+		}
+		if in, out := filter.tokens(); in > 0 || out > 0 {
+			detail.setTokens(in, out)
+		}
+	}
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
 }

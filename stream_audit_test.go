@@ -43,7 +43,7 @@ func runStream(t *testing.T, w http.ResponseWriter, ctx context.Context, body st
 	drainInteractionLog()
 	eng := &fakeEngine{stream: newPassthroughTestStream(body)}
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx)
-	streamCompletion(w, r, eng, nil, 42, "m", []map[string]interface{}{{"role": "user", "content": "hi"}})
+	streamCompletion(w, r, eng, nil, 42, "m", []map[string]interface{}{{"role": "user", "content": "hi"}}, nil, nil)
 	return drainInteractionLog()
 }
 
