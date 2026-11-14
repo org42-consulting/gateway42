@@ -62,7 +62,16 @@ var controlClient = &http.Client{Transport: sharedTransport, Timeout: 5 * time.S
 // concurrency slot immediately rather than holding it for the rest of this
 // budget. Streaming completions are bounded by silence instead — see
 // streamDeadline — because there a long generation is not a stalled one.
-const upstreamChatTimeout = 120 * time.Second
+//
+// It is GW42_UPSTREAM_TIMEOUT seconds, default 600. The old fixed 120s was
+// about 7k output tokens at local-model speeds, after the prefill of a long
+// prompt — less than a legitimate answer to a large request needs.
+func upstreamChatTimeout() time.Duration {
+	if cfg.UpstreamTimeoutSec > 0 {
+		return time.Duration(cfg.UpstreamTimeoutSec) * time.Second
+	}
+	return 600 * time.Second
+}
 
 // A stream is bounded by inactivity rather than by total duration. Measured on
 // the local engine at ~58 generated tokens/s, 120s of wall clock is only ~6.9k
@@ -985,7 +994,7 @@ func (a *OllamaAdapter) ListModels() ([]map[string]interface{}, error) {
 
 func (a *OllamaAdapter) Chat(ctx context.Context, req map[string]interface{}) (map[string]interface{}, error) {
 	body, _ := json.Marshal(req)
-	ctx, cancel := context.WithTimeout(ctx, upstreamChatTimeout)
+	ctx, cancel := context.WithTimeout(ctx, upstreamChatTimeout())
 	defer cancel()
 
 	var result map[string]interface{}
@@ -1153,7 +1162,7 @@ func (a *OpenAICompatAdapter) ListModels() ([]map[string]interface{}, error) {
 
 func (a *OpenAICompatAdapter) Chat(ctx context.Context, req map[string]interface{}) (map[string]interface{}, error) {
 	body, _ := json.Marshal(req)
-	ctx, cancel := context.WithTimeout(ctx, upstreamChatTimeout)
+	ctx, cancel := context.WithTimeout(ctx, upstreamChatTimeout())
 	defer cancel()
 
 	var result map[string]interface{}

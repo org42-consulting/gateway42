@@ -183,10 +183,10 @@ func TestToolResultImagesFollowToolMessages(t *testing.T) {
 	_, msgs := anthropicToOpenAI(body)
 	got, _ := json.Marshal(msgs)
 	want := `[{"content":"Screenshot taken","role":"tool","tool_call_id":"toolu_1"},` +
-		`{"content":"[The tool returned images; they follow in the next message.]","role":"tool","tool_call_id":"toolu_2"},` +
-		`{"content":[{"text":"[Image output of tool call toolu_1]","type":"text"},` +
+		`{"content":"[The tool returned images or files; they follow in the next message.]","role":"tool","tool_call_id":"toolu_2"},` +
+		`{"content":[{"text":"[Output of tool call toolu_1]","type":"text"},` +
 		`{"image_url":{"url":"data:image/png;base64,iVBOR"},"type":"image_url"},` +
-		`{"text":"[Image output of tool call toolu_2]","type":"text"},` +
+		`{"text":"[Output of tool call toolu_2]","type":"text"},` +
 		`{"image_url":{"url":"data:image/jpeg;base64,/9j/"},"type":"image_url"}],"role":"user"}]`
 	if string(got) != want {
 		t.Fatalf("messages:\n got %s\nwant %s", got, want)
@@ -321,23 +321,32 @@ func TestDocumentBlocksReachTheModel(t *testing.T) {
 	body := decodeJSON(t, `{"model":"m","messages":[{"role":"user","content":[
 		{"type":"document","title":"notes.txt","context":"Meeting notes","source":{"type":"text","media_type":"text/plain","data":"Ship on Friday."}},
 		{"type":"document","source":{"type":"content","content":[{"type":"text","text":"Part one."},{"type":"text","text":"Part two."}]}},
-		{"type":"document","title":"spec.pdf","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0x"}},
+		{"type":"document","title":"spec","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0x"}},
+		{"type":"document","title":"remote.pdf","source":{"type":"url","url":"https://example.com/remote.pdf"}},
 		{"type":"text","text":"Summarise."}
 	]}]}`).(map[string]interface{})
 	_, msgs := anthropicToOpenAI(body)
-	content := sanitizeMessages(msgs)[0]["content"].(string)
+	clean := sanitizeMessages(msgs)
+	got, _ := json.Marshal(clean[0]["content"])
 	for _, want := range []string{
-		"Document: notes.txt\nMeeting notes\n\nShip on Friday.",
-		"Part one.\n\nPart two.",
-		`[Attached application/pdf "spec.pdf" could not be included: this model cannot read that format.]`,
-		"Summarise.",
+		`"text":"Document: notes.txt\nMeeting notes\n\nShip on Friday."`,
+		`"text":"Part one.\n\nPart two."`,
+		// Inline PDFs go to the engine as an OpenAI file part (oMLX converts them).
+		`{"file":{"file_data":"data:application/pdf;base64,JVBERi0x","filename":"spec.pdf"},"type":"file"}`,
+		// URL PDFs cannot be inlined: a note says so.
+		`could not be included: the gateway can pass on PDFs only as inline (base64) data.`,
+		`"text":"Summarise."`,
 	} {
-		if !strings.Contains(content, want) {
-			t.Errorf("content missing %q:\n%s", want, content)
+		if !strings.Contains(string(got), want) {
+			t.Errorf("content missing %s:\n%s", want, got)
 		}
 	}
-	if strings.Contains(content, "JVBERi0x") {
-		t.Errorf("raw PDF bytes reached the prompt")
+
+	// Ollama reads no files: the PDF becomes a note, its bytes never reach the prompt.
+	om := ollamaMessages(clean)
+	text, _ := om[0]["content"].(string)
+	if !strings.Contains(text, `[Attached file "spec.pdf" could not be included`) || strings.Contains(text, "JVBERi0x") {
+		t.Errorf("Ollama content = %q", text)
 	}
 }
 

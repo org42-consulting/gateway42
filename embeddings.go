@@ -40,7 +40,7 @@ func postJSON(ctx context.Context, engineType, url, apiKey string, req map[strin
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(ctx, upstreamChatTimeout)
+	ctx, cancel := context.WithTimeout(ctx, upstreamChatTimeout())
 	defer cancel()
 
 	var result map[string]interface{}

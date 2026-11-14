@@ -91,6 +91,18 @@ func handleListModels(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		reachable++
+		// Ollama's listing has no context length; ask /api/show (cached,
+		// bounded) for this engine's models.
+		var ollamaWindows map[string]int
+		if oa, ok := cachedAdapter(e.ID).(*OllamaAdapter); ok {
+			names := make([]string, 0, len(pd.raw))
+			for _, m := range pd.raw {
+				if n := modelName(m); n != "" {
+					names = append(names, n)
+				}
+			}
+			ollamaWindows = ollamaContextWindows(oa, names, 3*time.Second)
+		}
 		for _, m := range pd.raw {
 			name := modelName(m)
 			if name == "" || seen[name] {
@@ -120,7 +132,7 @@ func handleListModels(w http.ResponseWriter, r *http.Request) {
 				CreatedAt:   time.Unix(int64(created), 0).UTC().Format(time.RFC3339),
 				Size:        int64(toInt(m["size"])),
 
-				MaxInputTokens:      modelContextWindow(m),
+				MaxInputTokens:      max(modelContextWindow(m), ollamaWindows[name]),
 				AnthropicFamilyTier: stringField(m, "anthropic_family_tier"),
 				IsFamilyDefault:     m["is_family_default"] == true,
 			})
@@ -262,6 +274,15 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		selected.Release()
 	}()
 
+	if selected.Type() == EngineOllama {
+		// Ollama returns one choice per request; answering n > 1 with a single
+		// choice would look like success.
+		if n := toInt(data["n"]); n > 1 {
+			writeOpenAIError(w, 400, "n > 1 is not supported by the engine serving this model (Ollama)", "invalid_request_error")
+			return
+		}
+		messages = inlineRemoteImages(r.Context(), messages)
+	}
 	engineReq := buildEngineRequest(selected, data, messages)
 
 	if streaming, _ := data["stream"].(bool); streaming {
@@ -353,6 +374,9 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 
+	if adapter.Type() == EngineOllama {
+		messages = inlineRemoteImages(r.Context(), messages)
+	}
 	engineReq := buildEngineRequest(adapter, data, messages)
 
 	if streaming, _ := data["stream"].(bool); streaming {
@@ -713,17 +737,27 @@ func acquireEngine(w http.ResponseWriter, r *http.Request, model string,
 // only Ollama adapters need it.
 func buildEngineRequest(adapter Engine, data map[string]interface{}, messages []map[string]interface{}) map[string]interface{} {
 	if adapter.Type() == EngineOllama {
-		return openAIToOllama(data, messages)
+		req := openAIToOllama(data, messages)
+		if oa, ok := adapter.(*OllamaAdapter); ok {
+			applyOllamaNumCtx(oa, req)
+		}
+		return req
 	}
 	req := openAICompatRequest(data, messages)
 	// chat_template_kwargs is a local-engine extension (vLLM, oMLX, LM Studio,
 	// llama.cpp); the OpenAI platform rejects unknown parameters, and the
 	// Anthropic translation sends it on every request.
 	if a, ok := adapter.(*OpenAICompatAdapter); ok && isOpenAIPlatform(a.cfg.BaseURL) {
-		delete(req, "chat_template_kwargs")
+		for _, key := range localOnlyParams {
+			delete(req, key)
+		}
 	}
 	return req
 }
+
+// localOnlyParams are local-engine extensions the OpenAI platform rejects as
+// unknown parameters; buildEngineRequest withholds them from api.openai.com.
+var localOnlyParams = []string{"chat_template_kwargs", "top_k", "min_p", "repetition_penalty", "thinking_budget"}
 
 // isOpenAIPlatform reports whether baseURL is OpenAI's own API.
 func isOpenAIPlatform(baseURL string) bool {
@@ -768,7 +802,14 @@ func openAICompatRequest(data map[string]interface{}, messages []map[string]inte
 			// and LM Studio read chat_template_kwargs — the only way to set
 			// e.g. Qwen3's enable_thinking per request. Forwarded only when the
 			// client sends them, so a strict upstream never sees them unasked.
-			"reasoning_effort", "chat_template_kwargs":
+			"reasoning_effort", "chat_template_kwargs",
+			// The rest of OpenAI's chat parameters, including the legacy
+			// function-calling pair, for engines that implement them.
+			"verbosity", "metadata", "store", "modalities", "audio", "prediction",
+			"functions", "function_call", "web_search_options",
+			// Sampler and reasoning extensions local servers (vLLM, oMLX,
+			// llama.cpp, LM Studio) accept; see localOnlyParams.
+			"top_k", "min_p", "repetition_penalty", "thinking_budget":
 			req[key] = data[key]
 		}
 	}
@@ -925,7 +966,7 @@ func sanitizeMessages(messages []interface{}) []map[string]interface{} {
 			"role":    role,
 			"content": sanitizeContent(msg["content"]),
 		}
-		for _, key := range []string{"name", "tool_call_id", "tool_calls"} {
+		for _, key := range []string{"name", "tool_call_id", "tool_calls", "function_call"} {
 			if v, ok := msg[key]; ok && v != nil {
 				clean[key] = v
 			}
@@ -934,7 +975,7 @@ func sanitizeMessages(messages []interface{}) []map[string]interface{} {
 		// OpenAI schema; keep it null there. Anywhere else, absent content
 		// becomes "" — what this function always sent — since strict
 		// upstreams reject a user message whose content is null.
-		if clean["content"] == nil && clean["tool_calls"] == nil {
+		if clean["content"] == nil && clean["tool_calls"] == nil && clean["function_call"] == nil {
 			clean["content"] = ""
 		}
 		out = append(out, clean)
