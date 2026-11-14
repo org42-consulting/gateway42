@@ -178,6 +178,17 @@ type Model struct {
 	DisplayName string `json:"display_name"` // Anthropic
 	CreatedAt   string `json:"created_at"`   // Anthropic: RFC 3339
 	Size        int64  `json:"size,omitempty"`
+	// MaxInputTokens is the model's context window as its engine reports it
+	// (oMLX and vLLM: max_model_len; LM Studio: max_context_length; others:
+	// context_length / context_window). Claude Desktop reads it from
+	// discovery; omitted when the engine does not say.
+	MaxInputTokens int `json:"max_input_tokens,omitempty"`
+	// AnthropicFamilyTier and IsFamilyDefault are relayed when an engine
+	// labels a model with the Claude tier it stands in for (oMLX does for its
+	// Claude Desktop aliases), so the app can pick it for a sub-agent that
+	// asks for "sonnet" or "haiku".
+	AnthropicFamilyTier string `json:"anthropic_family_tier,omitempty"`
+	IsFamilyDefault     bool   `json:"is_family_default,omitempty"`
 }
 
 // ModelList is the /v1/models response body. HasMore, FirstID and LastID are

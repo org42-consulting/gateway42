@@ -64,6 +64,22 @@ func thinkingRequested(body map[string]interface{}) bool {
 	return false
 }
 
+// anthropicEffort maps the request's output_config.effort — the Effort control
+// in Claude Desktop and Claude Code — onto OpenAI's reasoning_effort, which
+// oMLX, vLLM and LM Studio hand to the chat template. "max" has no common
+// OpenAI equivalent above "high", the top value every template accepts.
+// Returns "" when the request sets no effort.
+func anthropicEffort(body map[string]interface{}) string {
+	oc, _ := body["output_config"].(map[string]interface{})
+	switch e, _ := oc["effort"].(string); e {
+	case "low", "medium", "high":
+		return e
+	case "max", "xhigh":
+		return "high"
+	}
+	return ""
+}
+
 // withoutThinking removes thinking blocks from a translated message.
 func withoutThinking(msg *AnthropicMessage) {
 	kept := msg.Content[:0]
@@ -210,6 +226,23 @@ func anthropicToOpenAI(data map[string]interface{}) (map[string]interface{}, []i
 		if tc := anthropicToolChoice(data["tool_choice"]); tc != nil {
 			out["tool_choice"] = tc
 		}
+		if tc, _ := data["tool_choice"].(map[string]interface{}); tc["disable_parallel_tool_use"] == true {
+			out["parallel_tool_calls"] = false
+		}
+	}
+
+	// Thinking is switched on the engine, not only filtered on the way back.
+	// Anthropic's default is no extended thinking, so a request without
+	// "thinking" (or with type "disabled") turns it off; "enabled" and
+	// "adaptive" turn it on. The switch local engines read is the chat
+	// template's enable_thinking (Qwen3, DeepSeek, GLM and others; a template
+	// without the variable ignores it), sent as chat_template_kwargs, which
+	// openAIToOllama turns into Ollama's think:false. Without it a reasoning
+	// model thinks on every turn the client asked it not to — minutes of
+	// tokens on a local model, all thrown away by withoutThinking.
+	out["chat_template_kwargs"] = map[string]interface{}{"enable_thinking": thinkingRequested(data)}
+	if effort := anthropicEffort(data); effort != "" {
+		out["reasoning_effort"] = effort
 	}
 
 	var messages []interface{}

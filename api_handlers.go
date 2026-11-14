@@ -19,6 +19,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -118,6 +119,10 @@ func handleListModels(w http.ResponseWriter, r *http.Request) {
 				DisplayName: name,
 				CreatedAt:   time.Unix(int64(created), 0).UTC().Format(time.RFC3339),
 				Size:        int64(toInt(m["size"])),
+
+				MaxInputTokens:      modelContextWindow(m),
+				AnthropicFamilyTier: stringField(m, "anthropic_family_tier"),
+				IsFamilyDefault:     m["is_family_default"] == true,
 			})
 		}
 	}
@@ -599,6 +604,22 @@ func isContextOverflow(msg string) bool {
 	return false
 }
 
+// modelContextWindow reads a model's context window from an engine's model
+// listing entry, under each name engines use for it; 0 when none is present.
+func modelContextWindow(m map[string]interface{}) int {
+	for _, key := range []string{"max_input_tokens", "max_model_len", "max_context_length", "context_length", "context_window"} {
+		if n := toInt(m[key]); n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+func stringField(m map[string]interface{}, key string) string {
+	s, _ := m[key].(string)
+	return s
+}
+
 // defaultMaxRequestBytes is the GW42_MAX_REQUEST_BYTES default: 32 MiB, the
 // Anthropic Messages API's own request limit. See Config.MaxRequestBytes.
 const defaultMaxRequestBytes = 32 << 20
@@ -613,7 +634,8 @@ func maxRequestBytes() int64 {
 }
 
 // decodeAPIBody reads a bounded JSON object body. The bound is
-// maxRequestBytes; truncateInput then trims each message's text.
+// maxRequestBytes; truncateEngineInput then trims each message's text if
+// GW42_MAX_INPUT_LENGTH is set.
 func decodeAPIBody(w http.ResponseWriter, r *http.Request, writeErr apiErrorWriter) (map[string]interface{}, bool) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes())
 	var data map[string]interface{}
@@ -693,7 +715,20 @@ func buildEngineRequest(adapter Engine, data map[string]interface{}, messages []
 	if adapter.Type() == EngineOllama {
 		return openAIToOllama(data, messages)
 	}
-	return openAICompatRequest(data, messages)
+	req := openAICompatRequest(data, messages)
+	// chat_template_kwargs is a local-engine extension (vLLM, oMLX, LM Studio,
+	// llama.cpp); the OpenAI platform rejects unknown parameters, and the
+	// Anthropic translation sends it on every request.
+	if a, ok := adapter.(*OpenAICompatAdapter); ok && isOpenAIPlatform(a.cfg.BaseURL) {
+		delete(req, "chat_template_kwargs")
+	}
+	return req
+}
+
+// isOpenAIPlatform reports whether baseURL is OpenAI's own API.
+func isOpenAIPlatform(baseURL string) bool {
+	u, err := url.Parse(baseURL)
+	return err == nil && strings.EqualFold(u.Hostname(), "api.openai.com")
 }
 
 // openAICompatRequest builds the body for an OpenAI-compatible engine: the
@@ -907,14 +942,15 @@ func sanitizeMessages(messages []interface{}) []map[string]interface{} {
 	return out
 }
 
-// sanitizeContent truncates the text in a message's content, which is either a
+// sanitizeContent truncates (truncateEngineInput) the text in a message's
+// content, which is either a
 // string or an array of typed parts. Parts are copied, never edited in place,
 // so the caller's decoded request is not modified behind its back. Non-text
 // parts pass through: their size is already bounded by the request body limit.
 func sanitizeContent(content interface{}) interface{} {
 	switch c := content.(type) {
 	case string:
-		return truncateInput(c)
+		return truncateEngineInput(c)
 	case []interface{}:
 		parts := make([]interface{}, 0, len(c))
 		for _, p := range c {
@@ -927,7 +963,7 @@ func sanitizeContent(content interface{}) interface{} {
 				for k, v := range part {
 					cp[k] = v
 				}
-				cp["text"] = truncateInput(text)
+				cp["text"] = truncateEngineInput(text)
 				part = cp
 			}
 			parts = append(parts, part)
