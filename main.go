@@ -1083,6 +1083,9 @@ func setupRouter() *mux.Router {
 	r.HandleFunc("/v1/whoami", handleWhoami).Methods("GET")
 	r.HandleFunc("/v1/chat/completions", handleChatCompletions).Methods("POST")
 	r.HandleFunc("/v1/embeddings", handleEmbeddings).Methods("POST")
+	for _, p := range passthroughPaths {
+		r.HandleFunc(p, handlePassthrough).Methods("POST")
+	}
 
 	// Anthropic Messages API (Claude Code, Anthropic SDKs)
 	r.HandleFunc("/v1/messages", handleMessages).Methods("POST")

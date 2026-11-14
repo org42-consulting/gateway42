@@ -143,6 +143,14 @@ func (d *requestDetail) setUpstreamErr(err error) {
 	d.upstreamErr = truncateTo(err.Error(), 512)
 }
 
+// setTokens records a request's token counts where no typed payload or
+// stream metadata carries them (the pass-through endpoints).
+func (d *requestDetail) setTokens(in, out int) {
+	if d != nil {
+		d.inTokens, d.outTokens = in, out
+	}
+}
+
 func (d *requestDetail) setOutcome(o string) {
 	if d != nil {
 		d.outcome = o

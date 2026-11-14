@@ -49,6 +49,21 @@ var sharedTransport = &http.Transport{
 // be cut off arbitrarily. Use context.WithTimeout for per-call deadlines.
 var sharedClient = &http.Client{Transport: sharedTransport}
 
+// completionClient is for non-streaming engine calls (chat, embeddings, the
+// non-streaming pass-through endpoints). It has no response-header timeout:
+// an engine answering a non-streaming request sends its headers only when the
+// whole answer is ready, so the shared 30s header limit would cut every
+// completion longer than 30s — whatever GW42_UPSTREAM_TIMEOUT says. Those
+// calls are bounded by upstreamChatTimeout's context instead. Streams keep
+// the header limit: an engine starts a stream at once.
+var completionClient = &http.Client{Transport: completionTransport()}
+
+func completionTransport() *http.Transport {
+	t := sharedTransport.Clone()
+	t.ResponseHeaderTimeout = 0
+	return t
+}
+
 // controlClient applies a 5s deadline at the client level. Use for short
 // metadata calls (Status, ListModels, /v1/models on OpenAI-compat) where
 // the entire roundtrip including body read must complete quickly.
@@ -1001,7 +1016,7 @@ func (a *OllamaAdapter) Chat(ctx context.Context, req map[string]interface{}) (m
 	err := observeUpstream(EngineOllama, "chat", func() error {
 		httpReq, _ := http.NewRequestWithContext(ctx, "POST", a.baseURL()+"/api/chat", bytes.NewReader(body))
 		httpReq.Header.Set("Content-Type", "application/json")
-		resp, err := sharedClient.Do(httpReq)
+		resp, err := completionClient.Do(httpReq)
 		if err != nil {
 			return err
 		}
@@ -1172,7 +1187,7 @@ func (a *OpenAICompatAdapter) Chat(ctx context.Context, req map[string]interface
 		if a.cfg.APIKey != "" {
 			httpReq.Header.Set("Authorization", "Bearer "+a.cfg.APIKey)
 		}
-		resp, err := sharedClient.Do(httpReq)
+		resp, err := completionClient.Do(httpReq)
 		if err != nil {
 			return err
 		}

@@ -53,7 +53,7 @@ func postJSON(ctx context.Context, engineType, op, url, apiKey string, req map[s
 		if apiKey != "" {
 			httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 		}
-		resp, err := sharedClient.Do(httpReq)
+		resp, err := completionClient.Do(httpReq)
 		if err != nil {
 			return err
 		}
