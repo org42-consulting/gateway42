@@ -49,6 +49,21 @@ var sharedTransport = &http.Transport{
 // be cut off arbitrarily. Use context.WithTimeout for per-call deadlines.
 var sharedClient = &http.Client{Transport: sharedTransport}
 
+// completionClient is for non-streaming engine calls (chat, embeddings, the
+// non-streaming pass-through endpoints). It has no response-header timeout:
+// an engine answering a non-streaming request sends its headers only when the
+// whole answer is ready, so the shared 30s header limit would cut every
+// completion longer than 30s — whatever GW42_UPSTREAM_TIMEOUT says. Those
+// calls are bounded by upstreamChatTimeout's context instead. Streams keep
+// the header limit: an engine starts a stream at once.
+var completionClient = &http.Client{Transport: completionTransport()}
+
+func completionTransport() *http.Transport {
+	t := sharedTransport.Clone()
+	t.ResponseHeaderTimeout = 0
+	return t
+}
+
 // controlClient applies a 5s deadline at the client level. Use for short
 // metadata calls (Status, ListModels, /v1/models on OpenAI-compat) where
 // the entire roundtrip including body read must complete quickly.
@@ -62,7 +77,16 @@ var controlClient = &http.Client{Transport: sharedTransport, Timeout: 5 * time.S
 // concurrency slot immediately rather than holding it for the rest of this
 // budget. Streaming completions are bounded by silence instead — see
 // streamDeadline — because there a long generation is not a stalled one.
-const upstreamChatTimeout = 120 * time.Second
+//
+// It is GW42_UPSTREAM_TIMEOUT seconds, default 600. The old fixed 120s was
+// about 7k output tokens at local-model speeds, after the prefill of a long
+// prompt — less than a legitimate answer to a large request needs.
+func upstreamChatTimeout() time.Duration {
+	if cfg.UpstreamTimeoutSec > 0 {
+		return time.Duration(cfg.UpstreamTimeoutSec) * time.Second
+	}
+	return 600 * time.Second
+}
 
 // A stream is bounded by inactivity rather than by total duration. Measured on
 // the local engine at ~58 generated tokens/s, 120s of wall clock is only ~6.9k
@@ -985,14 +1009,14 @@ func (a *OllamaAdapter) ListModels() ([]map[string]interface{}, error) {
 
 func (a *OllamaAdapter) Chat(ctx context.Context, req map[string]interface{}) (map[string]interface{}, error) {
 	body, _ := json.Marshal(req)
-	ctx, cancel := context.WithTimeout(ctx, upstreamChatTimeout)
+	ctx, cancel := context.WithTimeout(ctx, upstreamChatTimeout())
 	defer cancel()
 
 	var result map[string]interface{}
 	err := observeUpstream(EngineOllama, "chat", func() error {
 		httpReq, _ := http.NewRequestWithContext(ctx, "POST", a.baseURL()+"/api/chat", bytes.NewReader(body))
 		httpReq.Header.Set("Content-Type", "application/json")
-		resp, err := sharedClient.Do(httpReq)
+		resp, err := completionClient.Do(httpReq)
 		if err != nil {
 			return err
 		}
@@ -1153,7 +1177,7 @@ func (a *OpenAICompatAdapter) ListModels() ([]map[string]interface{}, error) {
 
 func (a *OpenAICompatAdapter) Chat(ctx context.Context, req map[string]interface{}) (map[string]interface{}, error) {
 	body, _ := json.Marshal(req)
-	ctx, cancel := context.WithTimeout(ctx, upstreamChatTimeout)
+	ctx, cancel := context.WithTimeout(ctx, upstreamChatTimeout())
 	defer cancel()
 
 	var result map[string]interface{}
@@ -1163,7 +1187,7 @@ func (a *OpenAICompatAdapter) Chat(ctx context.Context, req map[string]interface
 		if a.cfg.APIKey != "" {
 			httpReq.Header.Set("Authorization", "Bearer "+a.cfg.APIKey)
 		}
-		resp, err := sharedClient.Do(httpReq)
+		resp, err := completionClient.Do(httpReq)
 		if err != nil {
 			return err
 		}

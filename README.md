@@ -231,7 +231,9 @@ Requests with a missing, invalid, or deactivated key are rejected with `401 Unau
 | `/v1/chat/completions` | POST | Chat completion. Accepts OpenAI-format bodies. Set `"stream": true` for SSE streaming. |
 | `/v1/embeddings` | POST | Embeddings. OpenAI-format body (`model`, `input`, `dimensions`, `encoding_format`). OpenAI-compatible engines get it as-is; Ollama gets `/api/embed`, with `base64` encoded by the gateway. Ollama takes text input only, not token arrays. |
 | `/v1/messages` | POST | Anthropic Messages API, translated onto the same engines — see [Claude Code](#claude-code--anthropic-messages-api). |
-| `/v1/messages/count_tokens` | POST | Estimated input token count (≈ 4 bytes per token) in Anthropic format. |
+| `/v1/messages/count_tokens` | POST | Input token count in Anthropic format: exact from engines that implement it (oMLX), otherwise estimated (≈ 4 bytes per token). |
+| `/v1/responses`, `/v1/completions` | POST | Passed through to the engine's own implementation, streaming or not (Ollama: its OpenAI-compatible `/v1` routes). Usage is read from the response for the request log and quota. |
+| `/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/audio/translations`, `/v1/images/generations`, `/v1/moderations` | POST | Passed through as well (JSON or multipart; audio comes back as bytes). An engine without the endpoint answers `404`, which reaches the client. |
 | `/v1/models` | GET | Returns the combined catalogue of every reachable engine. Each entry carries both OpenAI (`object`, `owned_by`) and Anthropic (`type`, `display_name`, `created_at`) fields. Duplicates are collapsed; an engine that is down is skipped rather than failing the listing. |
 | `/v1/whoami` | GET | Reports the identity the caller authenticated as: `name`, `status`, `rate_limit_rpm`, and `key_created_at`. A no-side-effect way for a key holder to verify credentials without reaching the admin UI. It is a `/v1/` route, so it goes through the same rate limiting as the other `/v1` endpoints. |
 | `/health` | GET | Returns `{"status": "ok"}`. No auth required. Use for uptime monitoring. |
@@ -293,7 +295,7 @@ claude
 ```
 
 Not translated: Anthropic server tools (`web_search`, `code_execution`, … — no local engine can run
-them, so they are not offered to the model) and `top_k`. Claude Code relies heavily on tool calling, so use a model
+them, so they are not offered to the model). Claude Code relies heavily on tool calling, so use a model
 that supports it. It also assumes a 200k context window for model IDs it does not recognise; see
 the Claude Code model-config docs to set the real window for your model.
 
@@ -302,8 +304,10 @@ Translated with care:
 - **Images in tool results** (screenshots from computer use and browser tools) travel in a user
   message right after the tool messages, labelled with their tool call, because OpenAI tool messages
   carry text only.
-- **Documents**: plain-text and content documents are inlined with their title and context. PDFs
-  cannot be read by a local engine, so they become a one-line note saying so, not silence.
+- **Documents**: plain-text and content documents are inlined with their title and context. Inline
+  (base64) PDFs, in a message or a tool result, are sent as an OpenAI `file` part, which oMLX turns into
+  text with its MarkItDown integration (enabled by default) and the OpenAI API reads natively. Ollama
+  reads no files, so there a PDF becomes a one-line note; a PDF given by URL or file ID does too.
 - **Thinking**: when the request enables `thinking`, the engine's reasoning (`reasoning_content`,
   `reasoning`, or Ollama's `thinking`) is returned as `thinking` blocks, streamed as
   `thinking_delta`, with an empty signature. Without it, reasoning is dropped as before.
@@ -312,7 +316,17 @@ Translated with care:
   since Anthropic's default is no thinking. Ollama gets `think: false` when thinking is off and
   nothing when it is on, because it rejects `think: true` for models that cannot think.
   `output_config.effort` (the app's Effort control) becomes `reasoning_effort`, with `max` sent as
-  `high`. `chat_template_kwargs` is never sent to `api.openai.com`.
+  `high`, and `thinking.budget_tokens` becomes `thinking_budget` (oMLX). `chat_template_kwargs` and
+  `thinking_budget` are never sent to `api.openai.com`.
+- **Sampling**: `top_k` is forwarded (as an option for Ollama).
+- **Streaming events**: a `ping` follows `message_start` and repeats every 10 s while the engine is
+  silent, so clients and proxies keep a long prefill's connection open. `message_start` carries an
+  estimate of `input_tokens`, which `message_delta` replaces with the engine's count.
+- **Stop sequences**: `stop_reason` is `stop_sequence`, with `stop_sequence` set, when the engine
+  reports which stop string it matched (vLLM's `stop_reason`). OpenAI's `finish_reason` alone cannot
+  tell a stop sequence from a natural end, so engines that do not say report `end_turn`.
+- **Thinking signatures** stay empty: they authenticate reasoning Anthropic's models produced, and
+  there is nothing to sign for a local model's.
 - **Parallel tool use**: `tool_choice.disable_parallel_tool_use` becomes `parallel_tool_calls: false`.
 - **Failover**: `/v1/messages` tries every engine that holds the model, like `/v1/chat/completions`.
 
@@ -432,8 +446,10 @@ A stream is bounded by **silence rather than elapsed time**: it is cut after 60 
 sent nothing, and at 30 minutes however steadily tokens arrived. A completion that keeps producing is
 never cut for running long, which is the part that matters — at the ~58 tokens/s measured on the local
 engine, two minutes is only about 6,900 output tokens, routinely exceeded by an agent prompt on a
-reasoning model. Non-streaming completions keep a single 120 s budget, because a response that sends
-nothing until it is finished offers no other progress signal.
+reasoning model. Non-streaming completions keep a single total budget, `GW42_UPSTREAM_TIMEOUT`
+(600 s by default), because a response that sends nothing until it is finished offers no other
+progress signal; they are not subject to the 30 s response-header limit streams have, since such an
+engine sends its headers only with the finished answer.
 
 Hanging up mid-stream is handled: a client disconnect cancels the upstream call, which releases the
 engine's concurrency slot immediately rather than waiting for the read to finish. A stream the gateway
@@ -586,7 +602,7 @@ All series use the `gw42_` prefix:
 | `gw42_http_requests_total` | counter | `path`, `method`, `status` | Request volume and error rate |
 | `gw42_http_request_duration_seconds` | histogram | `path`, `method` | End-to-end latency, 1 ms–30 min buckets. The upper end reaches the streaming ceiling so a long generation is measurable rather than landing in `+Inf` |
 | `gw42_inflight_requests` | gauge | `path` | Requests in progress right now |
-| `gw42_upstream_duration_seconds` | histogram | `engine`, `op` | Engine latency, 5 ms–120 s buckets. `op` is `chat`, `stream`, `list_models`, or `status`. For `stream` it is the time until the engine accepted the stream (response headers), not the whole generation |
+| `gw42_upstream_duration_seconds` | histogram | `engine`, `op` | Engine latency, 5 ms–120 s buckets. `op` is `chat`, `stream`, `embed`, `count_tokens`, `passthrough`, `list_models`, or `status`. For `stream` it is the time until the engine accepted the stream (response headers), not the whole generation |
 | `gw42_upstream_errors_total` | counter | `engine`, `op` | Engine failures, separated from client errors |
 | `gw42_upstream_busy_total` | counter | `engine` | Requests shed by the concurrency cap |
 | `gw42_rate_limited_total` | counter | — | Requests rejected by the rate limiter |
@@ -893,6 +909,9 @@ All configuration is via environment variables. No variables are strictly requir
 | `GW42_SESSION_KEY` | _(empty)_ | Base secret for signing and encrypting session cookies. Set it to keep sessions valid across restarts — unset, fresh random keys are generated at every boot and all users are logged out on restart. Derivation is `SHA-256(secret + "\|hash")` for the HMAC key and `SHA-256(secret + "\|block")` for the encryption key, so one secret safely yields two independent 32-byte keys. |
 | `MAX_MESSAGE_LENGTH` | `262144` | Maximum bytes stored per prompt or response in the AI interaction log (~256 KB). It does not limit what reaches the model. |
 | `GW42_MAX_INPUT_LENGTH` | `0` | Maximum bytes of text per message sent to an engine; longer text is truncated. `0` sends every message whole, so model input is bounded only by `GW42_MAX_REQUEST_BYTES`. |
+| `GW42_UPSTREAM_TIMEOUT` | `600` | Seconds a single non-streaming engine call may take. Streams are bounded by silence instead (60 s without a byte), up to 30 minutes. |
+| `GW42_OLLAMA_NUM_CTX` | `0` | Context window (`num_ctx`) sent with every Ollama request, clamped to the model's maximum from `/api/show`. `0` leaves it to Ollama (`OLLAMA_CONTEXT_LENGTH` or the Modelfile), which trims longer prompts from the front. Keep it one fixed value: Ollama reloads a model whenever `num_ctx` changes. |
+| `GW42_FETCH_IMAGE_URLS` | `true` | Download `http(s)` images for Ollama, which only takes inline images. Only public addresses are fetched (loopback, private, link-local and CGNAT ranges are refused, also after DNS and redirects), within 15 s and 20 MB, and only image content types. `false` drops URL images for Ollama. |
 | `GW42_MAX_REQUEST_BYTES` | `33554432` | Maximum API request body (32 MiB, the Anthropic API's own limit). Claude Desktop, Cowork and Claude Code resend the whole session, screenshots included, on every turn, so this bounds the usable conversation, not a single message. Larger bodies get `413`. |
 | `LOG_LEVEL` | `INFO` | Log verbosity: `DEBUG`, `INFO`, `WARN` (or `WARNING`), `ERROR`. An unrecognised value falls back to `INFO` with a warning. |
 | `LOG_FILE` | `./logs/gateway.log` | Application log file, written in addition to stderr; the directory is created if needed. Set it empty to log to stderr only. When stderr is already redirected to this same file (as `install.sh` does under launchd) it is written once, not twice. |
@@ -925,7 +944,7 @@ they determine observable behaviour:
 | Upstream response headers | 30 s | An engine that accepts the connection but never answers is failed here. It applies before any body, so it also bounds how long a stream may take to *start*. For a non-streaming completion the headers arrive together with the finished answer, which caps that shape at 30 s of generation regardless of the budget below — the reason streaming is the better default. |
 | Upstream stream idle | 60 s | The silence that marks a stream dead. Every chunk from the engine resets it, so a completion is cut for stalling, never for running long. |
 | Upstream stream ceiling | 30 min | Backstop for an engine that dribbles bytes forever. A stream holds an engine slot for all of it, so this cannot simply be unbounded. |
-| Upstream chat timeout | 120 s | Whole-call budget for a non-streaming completion, which sends nothing until it is finished and so gives no progress signal to bound instead. |
+| Upstream chat timeout | 600 s (`GW42_UPSTREAM_TIMEOUT`) | Whole-call budget for a non-streaming completion, embedding or pass-through call, which sends nothing until it is finished and so gives no progress signal to bound instead. No response-header limit applies to these calls. |
 | Concurrency acquire wait | 250 ms | How long a request waits for an engine slot before `503`. |
 | Shutdown drain | 30 s | In-flight requests finish before the process exits. |
 | Engine probe cache | 10 s | How stale dashboard health and model lists may be. |
@@ -953,6 +972,11 @@ The race detector works without a C toolchain because the SQLite driver is pure 
 | ---- | ------ |
 | `types_test.go` | The wire contract of authored responses — that `finish_reason` is present-and-null rather than absent, that `usage` fields serialise when zero, that `usage` appears only on the final chunk, and that `finish_reason` reports `"length"` for a truncated Ollama reply. |
 | `stream_test.go` | Stream translation: Ollama NDJSON → OpenAI chunks, SSE passthrough unwrapping, terminal-chunk handling. |
+| `prompt_cache_test.go` | Prompt caching for Claude clients: the billing header stripped, upstream prefixes byte-identical across turns, engine cache hits reported as `cache_read_input_tokens`. |
+| `limits_test.go` | `max_tokens` passed through unchanged, nothing invented when absent, the request-body bound, keep-alives holding the stream idle deadline. |
+| `compat_gaps_test.go` | Engine errors passed on with their status (end to end, both APIs), `/v1/messages` failover, tool-result images, reasoning as thinking blocks, documents. |
+| `thinking_context_embeddings_test.go` | The thinking switch sent to engines, effort, context windows in `/v1/models`, and `/v1/embeddings` against fake oMLX- and Ollama-style engines. |
+| `remaining_gaps_test.go` | Ollama option, tool-choice, legacy-function and logprobs mapping; `num_ctx` and context windows from `/api/show`; the image fetcher's address guard and cache; pings, stop sequences and engine-backed `count_tokens`; every pass-through endpoint end to end; the header-limit split for non-streaming calls. |
 | `recovery_test.go` | Panic recovery: the JSON envelope on `/v1/`, plain text on the admin UI, an SSE error frame when the response is already committed mid-stream, and that a committed body is never appended to. Also that the `statusRecorder` wrapper stays transparent about the writer's other interfaces — `Flusher`, `Hijacker` and `io.ReaderFrom` are not promoted through an embedded interface, so each is asserted and delegated to, including that a hijacked response gets no panic body appended to its raw protocol bytes. |
 | `metrics_test.go` | That a recovered panic is counted, with the status the client actually saw; that a mid-stream panic counts as `200` and raises `gw42_panics_total`; that the in-flight gauge unwinds; that one `statusRecorder` is shared; and that a panicked request still produces an audit row. |
 | `tmpl_render_check_test.go` | Every template renders against its real data shape, so a typo in an admin page is caught at test time rather than in the browser. Also checks that an engine's API key never reaches the settings page, that the header bar carries the brand and the logout exactly once with the sidebar keeping navigation and engine status, and that the stylesheet still defines the classes that markup uses. |
@@ -1006,11 +1030,15 @@ Single `package main`, one file per concern:
 | ---- | ----- | -------------- |
 | `main.go` | 1323 | Config, routing table, middleware chain, panic recovery, rate limiting, trusted-proxy client-IP resolution, server lifecycle, graceful shutdown. |
 | `handlers.go` | 1472 | Admin web UI handlers only. |
-| `api_handlers.go` | 857 | The `/v1/*` OpenAI-compatible surface, including `/v1/whoami` and the completion-path quota checks. Separate from the admin UI so a change to one cannot alter the other's contract. |
-| `engine.go` | 1289 | The `Engine` interface and its two adapters, plus the probe cache, stream implementations and the streaming deadline. |
+| `api_handlers.go` | 1131 | The `/v1/*` OpenAI-compatible surface, including `/v1/whoami` and the completion-path quota checks. Separate from the admin UI so a change to one cannot alter the other's contract. |
+| `engine.go` | 1389 | The `Engine` interface and its two adapters, plus the probe cache, stream implementations and the streaming deadline. |
 | `routing.go` | 370 | Model-name → ordered engine lists (primary plus failover targets) and the cached routing index. |
-| `openai.go` | 466 | Request and response translation between OpenAI and Ollama shapes. |
-| `anthropic.go` | 579 | The Anthropic Messages API front-end: both translation directions and the streaming block sequencer. |
+| `openai.go` | 571 | Request and response translation between OpenAI and Ollama shapes. |
+| `anthropic.go` | 950 | The Anthropic Messages API front-end: both translation directions and the streaming block sequencer. |
+| `embeddings.go` | 204 | `/v1/embeddings`: the engines' embedding calls, Ollama's `/api/embed` translation (base64 included) and the handler. |
+| `passthrough.go` | 296 | `/v1/responses`, `/v1/completions`, audio, images and moderations relayed to the engine, with SSE relay and usage capture. |
+| `remote_images.go` | 226 | Fetching `http(s)` images for Ollama behind a public-address-only dialer, with a small cache. |
+| `ollama_context.go` | 157 | Ollama context windows from `/api/show`: `max_input_tokens` in `/v1/models` and `GW42_OLLAMA_NUM_CTX`. |
 | `types.go` | 168 | Typed structs for responses Gateway42. authors. |
 | `db.go` | 1203 | Schema, migrations, both connection pools, queries, FTS5 setup and its startup consistency check, retention pruning, and the daily SQLite maintenance sweep. |
 | `request_detail.go` | 220 | The per-request detail collector handlers fill and the request log reads. |

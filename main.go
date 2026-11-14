@@ -61,6 +61,16 @@ type Config struct {
 	// 0 (the default) means no per-message cap. Separate from MaxMsgLen,
 	// which bounds what the audit log stores. See truncateEngineInput.
 	MaxInputLen int
+	// FetchImageURLs lets the gateway download http(s) images for engines
+	// that only take inline images (Ollama). See remote_images.go.
+	FetchImageURLs bool
+	// OllamaNumCtx, when > 0, is the context window (options.num_ctx) sent
+	// with every Ollama request, clamped to the model's own maximum. 0 leaves
+	// it to Ollama (OLLAMA_CONTEXT_LENGTH or the model's Modelfile).
+	OllamaNumCtx int
+	// UpstreamTimeoutSec bounds a single non-streaming engine call, in
+	// seconds. See upstreamChatTimeout.
+	UpstreamTimeoutSec int
 	// MaxRequestBytes bounds an API request body. It is its own setting, not
 	// a multiple of MaxMsgLen: a Claude Desktop / Cowork / Claude Code request
 	// carries the whole conversation — tool definitions, every earlier turn
@@ -142,6 +152,9 @@ func loadConfig() Config {
 		SessionTTL:          getEnvInt("SESSION_TIMEOUT", 3600),
 		MaxMsgLen:           getEnvInt("MAX_MESSAGE_LENGTH", 262144), // ~256KB
 		MaxInputLen:         getEnvInt("GW42_MAX_INPUT_LENGTH", 0),
+		FetchImageURLs:      getEnv("GW42_FETCH_IMAGE_URLS", "true") != "false",
+		OllamaNumCtx:        getEnvInt("GW42_OLLAMA_NUM_CTX", 0),
+		UpstreamTimeoutSec:  getEnvInt("GW42_UPSTREAM_TIMEOUT", 600),
 		MaxRequestBytes:     getEnvInt("GW42_MAX_REQUEST_BYTES", defaultMaxRequestBytes),
 		LogLevel:            getEnv("LOG_LEVEL", "INFO"),
 		LogFile:             getEnv("LOG_FILE", "./logs/gateway.log"),
@@ -1070,6 +1083,9 @@ func setupRouter() *mux.Router {
 	r.HandleFunc("/v1/whoami", handleWhoami).Methods("GET")
 	r.HandleFunc("/v1/chat/completions", handleChatCompletions).Methods("POST")
 	r.HandleFunc("/v1/embeddings", handleEmbeddings).Methods("POST")
+	for _, p := range passthroughPaths {
+		r.HandleFunc(p, handlePassthrough).Methods("POST")
+	}
 
 	// Anthropic Messages API (Claude Code, Anthropic SDKs)
 	r.HandleFunc("/v1/messages", handleMessages).Methods("POST")

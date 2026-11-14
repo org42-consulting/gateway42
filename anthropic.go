@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"gateway42/internal/wire"
 	"strings"
+	"time"
 )
 
 // ── Wire types ────────────────────────────────────────────────────────────────
@@ -164,7 +165,20 @@ var (
 	stopEndTurn   = "end_turn"
 	stopMaxTokens = "max_tokens"
 	stopToolUse   = "tool_use"
+	// stop_sequence is reported only when the engine says which stop string
+	// it matched; OpenAI's finish_reason "stop" alone cannot tell a stop
+	// sequence from the model finishing on its own.
+	stopStopSequence = "stop_sequence"
 )
+
+// stopSequence returns the matched stop sequence when the engine named one
+// for a "stop" finish, else nil.
+func stopSequence(finish, matched string) *string {
+	if finish != "stop" || matched == "" {
+		return nil
+	}
+	return &matched
+}
 
 // anthropicError builds an Anthropic-shaped error. The type names overlap
 // OpenAI's for the cases the gateway produces, with two exceptions mapped by
@@ -201,8 +215,10 @@ func randomHex(n int) string {
 // sanitised) so the caller runs them through the same sanitizeMessages as the
 // OpenAI path.
 //
-// Parameters with no OpenAI equivalent — top_k, metadata, thinking — are
-// dropped: an engine that cannot honour them would only reject the request.
+// Parameters with no OpenAI equivalent — metadata, container, mcp_servers —
+// are dropped: an engine that cannot honour them would only reject the
+// request. top_k is forwarded, since local engines take it (Ollama as an
+// option).
 //
 // cache_control is dropped too, but caching is not: oMLX, vLLM, llama.cpp,
 // LM Studio and Ollama all reuse the KV cache for the longest prompt prefix
@@ -213,7 +229,7 @@ func randomHex(n int) string {
 // clients put at the top of the prompt that changes on every request.
 func anthropicToOpenAI(data map[string]interface{}) (map[string]interface{}, []interface{}) {
 	out := map[string]interface{}{"model": data["model"]}
-	for _, key := range []string{"max_tokens", "temperature", "top_p", "stream"} {
+	for _, key := range []string{"max_tokens", "temperature", "top_p", "top_k", "stream"} {
 		if v, ok := data[key]; ok {
 			out[key] = v
 		}
@@ -241,6 +257,11 @@ func anthropicToOpenAI(data map[string]interface{}) (map[string]interface{}, []i
 	// model thinks on every turn the client asked it not to — minutes of
 	// tokens on a local model, all thrown away by withoutThinking.
 	out["chat_template_kwargs"] = map[string]interface{}{"enable_thinking": thinkingRequested(data)}
+	// budget_tokens caps the thinking. oMLX reads it as thinking_budget; an
+	// engine without a budget ignores the field.
+	if t, _ := data["thinking"].(map[string]interface{}); thinkingRequested(data) && toInt(t["budget_tokens"]) > 0 {
+		out["thinking_budget"] = toInt(t["budget_tokens"])
+	}
 	if effort := anthropicEffort(data); effort != "" {
 		out["reasoning_effort"] = effort
 	}
@@ -307,7 +328,10 @@ func anthropicMessageToOpenAI(msg map[string]interface{}) []interface{} {
 				},
 			})
 		case "document":
-			if text := documentText(block); text != "" {
+			if fp := documentFilePart(block); fp != nil {
+				hasImage = true // array content, as for images
+				parts = append(parts, fp)
+			} else if text := documentText(block); text != "" {
 				parts = append(parts, map[string]interface{}{"type": "text", "text": text})
 			}
 		case "tool_result":
@@ -317,15 +341,15 @@ func anthropicMessageToOpenAI(msg map[string]interface{}) []interface{} {
 			// the user turn that follows the tool messages, labelled with the
 			// call they belong to. Dropping them, as before, left the model
 			// blind to what the tool showed.
-			images := imageParts(block["content"])
-			if len(images) > 0 {
+			media := mediaParts(block["content"])
+			if len(media) > 0 {
 				hasImage = true
 				parts = append(parts, map[string]interface{}{
-					"type": "text", "text": fmt.Sprintf("[Image output of tool call %v]", block["tool_use_id"]),
+					"type": "text", "text": fmt.Sprintf("[Output of tool call %v]", block["tool_use_id"]),
 				})
-				parts = append(parts, images...)
+				parts = append(parts, media...)
 				if content == "" {
-					content = "[The tool returned images; they follow in the next message.]"
+					content = "[The tool returned images or files; they follow in the next message.]"
 				}
 			}
 			if isErr, _ := block["is_error"].(bool); isErr {
@@ -428,23 +452,56 @@ func blocksText(v interface{}) string {
 	return ""
 }
 
-// imageParts collects the image blocks of a block list (a tool_result's
-// content) as OpenAI image_url parts. A string or text-only list has none.
-func imageParts(v interface{}) []interface{} {
+// mediaParts collects the image and PDF blocks of a block list (a
+// tool_result's content) as OpenAI image_url and file parts. A string or
+// text-only list has none.
+func mediaParts(v interface{}) []interface{} {
 	blocks, _ := v.([]interface{})
 	var parts []interface{}
 	for _, b := range blocks {
 		block, ok := b.(map[string]interface{})
-		if !ok || block["type"] != "image" {
+		if !ok {
 			continue
 		}
-		if url := imageDataURL(block["source"]); url != "" {
-			parts = append(parts, map[string]interface{}{
-				"type": "image_url", "image_url": map[string]interface{}{"url": url},
-			})
+		switch block["type"] {
+		case "image":
+			if url := imageDataURL(block["source"]); url != "" {
+				parts = append(parts, map[string]interface{}{
+					"type": "image_url", "image_url": map[string]interface{}{"url": url},
+				})
+			}
+		case "document":
+			if fp := documentFilePart(block); fp != nil {
+				parts = append(parts, fp)
+			}
 		}
 	}
 	return parts
+}
+
+// documentFilePart turns a base64 PDF document into OpenAI's file content
+// part ({"type":"file","file":{"filename","file_data"}}), which oMLX converts
+// to text itself (its MarkItDown integration) and the OpenAI platform reads
+// natively. Engines that take no files get a note instead — Ollama via
+// flattenContent. nil for any other document.
+func documentFilePart(block map[string]interface{}) map[string]interface{} {
+	src, _ := block["source"].(map[string]interface{})
+	mt, _ := src["media_type"].(string)
+	data, _ := src["data"].(string)
+	if src["type"] != "base64" || mt != "application/pdf" || data == "" {
+		return nil
+	}
+	name, _ := block["title"].(string)
+	if name == "" {
+		name = "document"
+	}
+	// The engine picks a converter by extension.
+	if !strings.HasSuffix(strings.ToLower(name), ".pdf") {
+		name += ".pdf"
+	}
+	return map[string]interface{}{"type": "file", "file": map[string]interface{}{
+		"filename": name, "file_data": "data:application/pdf;base64," + data,
+	}}
 }
 
 // documentText renders an Anthropic document block as text the model reads
@@ -464,6 +521,11 @@ func documentText(block map[string]interface{}) string {
 		body, _ = src["data"].(string)
 	case "content":
 		body = blocksText(src["content"])
+	case "base64":
+		if documentFilePart(block) != nil {
+			return "" // sent as a file part, see documentFilePart
+		}
+		fallthrough
 	default:
 		name := title
 		if name == "" {
@@ -477,7 +539,7 @@ func documentText(block map[string]interface{}) string {
 		if mt == "" {
 			mt = "document"
 		}
-		return fmt.Sprintf("[Attached %s %q%s could not be included: this model cannot read that format.]", mt, name, where)
+		return fmt.Sprintf("[Attached %s %q%s could not be included: the gateway can pass on PDFs only as inline (base64) data.]", mt, name, where)
 	}
 	if body == "" {
 		return ""
@@ -654,6 +716,9 @@ func openAIToAnthropic(payload interface{}, model string) (*AnthropicMessage, er
 		finish = *choice.FinishReason
 	}
 	msg.StopReason = stopReasonFromFinish(finish)
+	if seq, _ := choice.StopReason.(string); stopSequence(finish, seq) != nil {
+		msg.StopReason, msg.StopSequence = &stopStopSequence, stopSequence(finish, seq)
+	}
 	// Some engines finish with "stop" even after calling tools; the client
 	// must still be told to run them.
 	if len(choice.Message.ToolCalls) > 0 {
@@ -695,8 +760,22 @@ type anthropicStream struct {
 	sawTool    bool
 
 	finish string
-	usage  AnthropicUsage
+	// stopSeq is the stop sequence the engine reports having matched (vLLM's
+	// choice.stop_reason); "" when it did not say.
+	stopSeq string
+	usage   AnthropicUsage
+	// inputEstimate is message_start's input_tokens: Anthropic reports the
+	// prompt size up front, an engine only at the end. message_delta carries
+	// the engine's count, which replaces it.
+	inputEstimate int
 }
+
+// pingEvent is Anthropic's keep-alive event; pingInterval its cadence while
+// the engine is silent (a var so tests need not wait).
+var (
+	pingEvent    = sseEvent{"ping", map[string]interface{}{"type": "ping"}}
+	pingInterval = 10 * time.Second
+)
 
 func newAnthropicStream(model string) *anthropicStream {
 	return &anthropicStream{id: newMessageID(), model: model, blockIndex: -1}
@@ -711,6 +790,7 @@ func (s *anthropicStream) start() sseEvent {
 		"message": AnthropicMessage{
 			ID: s.id, Type: "message", Role: "assistant", Model: s.model,
 			Content: []AnthropicContentBlock{},
+			Usage:   AnthropicUsage{InputTokens: s.inputEstimate},
 		},
 	}}
 }
@@ -733,6 +813,9 @@ type streamChunk struct {
 			} `json:"tool_calls"`
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
+		// StopReason is vLLM's extension: the stop string (or token id)
+		// that ended the completion.
+		StopReason interface{} `json:"stop_reason"`
 	} `json:"choices"`
 	Usage *wire.Usage `json:"usage"`
 }
@@ -812,6 +895,9 @@ func (s *anthropicStream) chunk(payload []byte) []sseEvent {
 		if ch.FinishReason != nil {
 			s.finish = *ch.FinishReason
 		}
+		if seq, ok := ch.StopReason.(string); ok && seq != "" {
+			s.stopSeq = seq
+		}
 	}
 	return events
 }
@@ -829,14 +915,17 @@ func (s *anthropicStream) closeBlock() []sseEvent {
 // end closes the open block and emits message_delta and message_stop.
 func (s *anthropicStream) end() []sseEvent {
 	events := s.closeBlock()
-	stop := stopReasonFromFinish(s.finish)
+	stop, seq := stopReasonFromFinish(s.finish), stopSequence(s.finish, s.stopSeq)
+	if seq != nil {
+		stop = &stopStopSequence
+	}
 	if s.sawTool {
-		stop = &stopToolUse
+		stop, seq = &stopToolUse, nil
 	}
 	return append(events,
 		sseEvent{"message_delta", map[string]interface{}{
 			"type":  "message_delta",
-			"delta": map[string]interface{}{"stop_reason": stop, "stop_sequence": nil},
+			"delta": map[string]interface{}{"stop_reason": stop, "stop_sequence": seq},
 			"usage": s.usage,
 		}},
 		sseEvent{"message_stop", map[string]interface{}{"type": "message_stop"}},

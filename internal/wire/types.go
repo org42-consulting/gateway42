@@ -112,16 +112,29 @@ func (u Usage) CachedTokens() int {
 // completion is still going) from a string. Encoding it as "" would tell a
 // client the stream ended for an unknown reason.
 type Choice struct {
-	Index        int     `json:"index"`
-	Message      Message `json:"message"`
-	FinishReason *string `json:"finish_reason"`
+	Index        int       `json:"index"`
+	Message      Message   `json:"message"`
+	Logprobs     *Logprobs `json:"logprobs,omitempty"`
+	FinishReason *string   `json:"finish_reason"`
+	// StopReason is vLLM's extension naming the stop string (or token id)
+	// that ended the completion. Only read; omitted from bodies the gateway
+	// writes.
+	StopReason interface{} `json:"stop_reason,omitempty"`
+}
+
+// Logprobs is a choice's per-token log probabilities. Content holds OpenAI's
+// token objects ({token, logprob, bytes, top_logprobs}), which is also the
+// shape Ollama reports them in, so they are carried as decoded.
+type Logprobs struct {
+	Content []interface{} `json:"content"`
 }
 
 // ChunkChoice is one completion alternative in a streaming chunk.
 type ChunkChoice struct {
-	Index        int     `json:"index"`
-	Delta        Delta   `json:"delta"`
-	FinishReason *string `json:"finish_reason"`
+	Index        int       `json:"index"`
+	Delta        Delta     `json:"delta"`
+	Logprobs     *Logprobs `json:"logprobs,omitempty"`
+	FinishReason *string   `json:"finish_reason"`
 }
 
 // ChatCompletion is a non-streaming response body.

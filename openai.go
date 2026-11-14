@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"gateway42/internal/wire"
 	"strconv"
 	"strings"
@@ -34,6 +35,11 @@ func openAIToOllama(data map[string]interface{}, messages []map[string]interface
 		"max_tokens":        "num_predict",
 		"presence_penalty":  "presence_penalty",
 		"frequency_penalty": "frequency_penalty",
+		// Sampler extensions local OpenAI-compatible servers accept, under
+		// Ollama's option names.
+		"top_k":              "top_k",
+		"min_p":              "min_p",
+		"repetition_penalty": "repeat_penalty",
 	}
 	for openaiKey, ollamaKey := range paramMap {
 		if v, ok := data[openaiKey]; ok {
@@ -84,11 +90,30 @@ func openAIToOllama(data map[string]interface{}, messages []map[string]interface
 		req["options"] = options
 	}
 
-	// Ollama takes OpenAI's tool schema as-is. It has no tool_choice, so the
-	// one value that can be honoured is "none": withhold the tools entirely.
-	if tools, ok := data["tools"].([]interface{}); ok && len(tools) > 0 {
-		if choice, _ := data["tool_choice"].(string); choice != "none" {
+	// Ollama takes OpenAI's tool schema as-is but has no tool_choice. Two
+	// values can still be honoured by choosing which tools to offer: "none"
+	// withholds them all, and a named function offers only that one, so the
+	// model cannot call any other. "required" cannot be enforced and offers
+	// them all, like "auto".
+	if tools, toolChoice := ollamaTools(data); len(tools) > 0 {
+		switch choice := toolChoice.(type) {
+		case string:
+			if choice != "none" {
+				req["tools"] = tools
+			}
+		case map[string]interface{}:
+			fn, _ := choice["function"].(map[string]interface{})
+			req["tools"] = toolsNamed(tools, fn["name"])
+		default:
 			req["tools"] = tools
+		}
+	}
+	// Ollama reports logprobs in OpenAI's per-token shape; see
+	// ollamaToOpenAI for the response side.
+	if lp, _ := data["logprobs"].(bool); lp {
+		req["logprobs"] = true
+		if n, ok := data["top_logprobs"]; ok {
+			req["top_logprobs"] = n
 		}
 	}
 	if format := ollamaFormat(data["response_format"]); format != nil {
@@ -103,6 +128,54 @@ func openAIToOllama(data map[string]interface{}, messages []map[string]interface
 		req["think"] = false
 	}
 	return req
+}
+
+// ollamaLogprobs lifts Ollama's top-level logprobs list (present when the
+// request asked for logprobs) into an OpenAI choice's logprobs; nil otherwise.
+func ollamaLogprobs(ollama map[string]interface{}) *wire.Logprobs {
+	lp, _ := ollama["logprobs"].([]interface{})
+	if len(lp) == 0 {
+		return nil
+	}
+	return &wire.Logprobs{Content: lp}
+}
+
+// ollamaTools returns the request's tools and tool_choice. When the client
+// used OpenAI's legacy function-calling fields instead — "functions" and
+// "function_call" — they are converted to their tools equivalents, since
+// Ollama only knows tools. The request itself is not modified.
+func ollamaTools(data map[string]interface{}) ([]interface{}, interface{}) {
+	if tools, ok := data["tools"].([]interface{}); ok && len(tools) > 0 {
+		return tools, data["tool_choice"]
+	}
+	fns, _ := data["functions"].([]interface{})
+	if len(fns) == 0 {
+		return nil, nil
+	}
+	tools := make([]interface{}, 0, len(fns))
+	for _, f := range fns {
+		tools = append(tools, map[string]interface{}{"type": "function", "function": f})
+	}
+	var choice interface{}
+	switch fc := data["function_call"].(type) {
+	case string: // "none" | "auto"
+		choice = fc
+	case map[string]interface{}: // {"name": …}
+		choice = map[string]interface{}{"type": "function", "function": fc}
+	}
+	return tools, choice
+}
+
+// toolsNamed keeps only the tool whose function is called name.
+func toolsNamed(tools []interface{}, name interface{}) []interface{} {
+	var out []interface{}
+	for _, t := range tools {
+		tm, _ := t.(map[string]interface{})
+		if fn, _ := tm["function"].(map[string]interface{}); fn["name"] == name {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 // ollamaFormat maps OpenAI's response_format onto Ollama's format field:
@@ -154,7 +227,12 @@ func ollamaMessages(messages []map[string]interface{}) []map[string]interface{} 
 			om["images"] = images
 		}
 
-		if calls, ok := m["tool_calls"].([]interface{}); ok && len(calls) > 0 {
+		calls, _ := m["tool_calls"].([]interface{})
+		// A legacy assistant function_call is the one-call form of tool_calls.
+		if fc, ok := m["function_call"].(map[string]interface{}); ok && len(calls) == 0 {
+			calls = []interface{}{map[string]interface{}{"type": "function", "function": fc}}
+		}
+		if len(calls) > 0 {
 			ollamaCalls := make([]map[string]interface{}, 0, len(calls))
 			for _, c := range calls {
 				call, _ := c.(map[string]interface{})
@@ -173,7 +251,11 @@ func ollamaMessages(messages []map[string]interface{}) []map[string]interface{} 
 			om["tool_calls"] = ollamaCalls
 		}
 
-		if m["role"] == "tool" {
+		// A legacy "function" message is a tool result named by its function.
+		if m["role"] == "function" {
+			om["role"] = "tool"
+		}
+		if m["role"] == "tool" || m["role"] == "function" {
 			name, _ := m["name"].(string)
 			if name == "" {
 				id, _ := m["tool_call_id"].(string)
@@ -205,6 +287,14 @@ func flattenContent(content interface{}) (string, []string) {
 					text.WriteString("\n")
 				}
 				text.WriteString(s)
+			case "file":
+				// Ollama reads no files; say so in the prompt rather than drop it.
+				f, _ := part["file"].(map[string]interface{})
+				name, _ := f["filename"].(string)
+				if text.Len() > 0 {
+					text.WriteString("\n")
+				}
+				fmt.Fprintf(&text, "[Attached file %q could not be included: this model's engine cannot read files.]", name)
 			case "image_url":
 				iu, _ := part["image_url"].(map[string]interface{})
 				u, _ := iu["url"].(string)
@@ -350,6 +440,7 @@ func ollamaToOpenAI(ollama map[string]interface{}) *wire.ChatCompletion {
 		Choices: []wire.Choice{{
 			Index:        0,
 			Message:      wire.Message{Role: role, Content: content, ReasoningContent: thinking, ToolCalls: toolCalls},
+			Logprobs:     ollamaLogprobs(ollama),
 			FinishReason: finishReason,
 		}},
 		Usage: wire.Usage{
@@ -409,6 +500,7 @@ func formatStreamChunk(chunk map[string]interface{}, completionID string, isFirs
 		Choices: []wire.ChunkChoice{{
 			Index:        0,
 			Delta:        delta,
+			Logprobs:     ollamaLogprobs(chunk),
 			FinishReason: finishReason,
 		}},
 	}

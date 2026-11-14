@@ -16,6 +16,10 @@ Only these two paths exist under `/v1/`. Anything else returns `404`.
 | ------ | ---- | ------- |
 | `POST` | `/v1/chat/completions` | Chat completion, streaming or not |
 | `POST` | `/v1/embeddings` | Embeddings; Ollama engines are translated to `/api/embed` |
+| `POST` | `/v1/responses` | Responses API, passed through to the engine (streaming or not) |
+| `POST` | `/v1/completions` | Legacy completions, passed through; streams get `include_usage` |
+| `POST` | `/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/audio/translations` | Passed through (multipart uploads byte for byte; audio returned as bytes) |
+| `POST` | `/v1/images/generations`, `/v1/moderations` | Passed through |
 | `GET` | `/v1/models` | List models across configured engines, with `max_input_tokens` when the engine reports a context window |
 
 `OPTIONS` on any `/v1/` path is answered as a CORS preflight.
@@ -94,6 +98,20 @@ OpenAI has no name for is reported as `"stop"`, never `null` or a non-standard s
 fields. `created` comes from the engine where available and falls back to the current time rather
 than `0`, which some clients render as 1970.
 
+## Pass-through endpoints
+
+`/v1/responses`, `/v1/completions`, `/v1/audio/*`, `/v1/images/generations` and `/v1/moderations` are
+relayed to the engine's own implementation rather than translated: oMLX, vLLM, LM Studio and Ollama
+(on its OpenAI-compatible `/v1` routes) implement most of them, and a translation onto chat
+completions would lose what makes each one different. The request is routed by its `model` (a
+multipart field for audio uploads; optional for moderations, which then use the default engine)
+with the usual admission and failover. Server-sent events are relayed line for line, flushed at each
+event, with the stream bounded by silence; other responses are relayed with their content type.
+Usage found in the response (`usage`, or a Responses API `response.completed` event) is recorded
+for the request log and quota, and a streaming `/v1/completions` request is given
+`stream_options.include_usage` so it can be. An engine without the endpoint answers `404`, which the
+client receives with the engine's reason.
+
 ## Embeddings
 
 `POST /v1/embeddings` takes OpenAI's body: `model`, `input` (a string, a list of strings, or token
@@ -137,8 +155,13 @@ For OpenAI-compatible engines the request is forwarded through an allow-list tha
 tool-calling and structured-output fields (`tools`, `tool_choice`, `parallel_tool_calls`,
 `response_format`, `logit_bias`, `logprobs`, `top_logprobs`, `n`, `user`, `service_tier`,
 `max_completion_tokens`, `provider_options`) and the reasoning controls (`reasoning_effort`, and
-`chat_template_kwargs`, which vLLM, oMLX and LM Studio read, for example Qwen3's `enable_thinking`) — whether they work depends on the upstream engine, not
-on Gateway42. Anything outside that list is dropped. `stream` is always forwarded as a boolean, `false`
+`chat_template_kwargs`, which vLLM, oMLX and LM Studio read, for example Qwen3's `enable_thinking`),
+OpenAI's other chat parameters (`verbosity`, `metadata`, `store`, `modalities`, `audio`, `prediction`,
+`web_search_options`, and the legacy `functions` / `function_call`), and the sampler extensions local
+servers accept (`top_k`, `min_p`, `repetition_penalty`, `thinking_budget`) — whether they work depends
+on the upstream engine, not on Gateway42. The local-only ones (`chat_template_kwargs`, `top_k`,
+`min_p`, `repetition_penalty`, `thinking_budget`) are withheld from `api.openai.com`, which rejects
+unknown parameters. Anything outside that list is dropped. `stream` is always forwarded as a boolean, `false`
 when the client omitted it, never `null`.
 
 `stream_options` is the one field the gateway rewrites rather than forwards. On a stream it is added
@@ -163,17 +186,26 @@ For Ollama engines, parameters are instead mapped into Ollama's `options` object
 | `stop` | `stop` | A bare string is wrapped into a list |
 | `frequency_penalty` | `frequency_penalty` | Direct — Ollama takes this parameter under its own name |
 | `presence_penalty` | `presence_penalty` | Direct — Ollama takes this parameter under its own name |
-| `tools` | `tools` | Same schema. `tool_choice: "none"` withholds them; other values are ignored |
+| `top_k` / `min_p` | `top_k` / `min_p` | Direct |
+| `repetition_penalty` | `repeat_penalty` | Renamed |
+| `tools` | `tools` | Same schema. Ollama has no `tool_choice`: `"none"` withholds the tools, a named function offers only that tool, `"required"` and `"auto"` offer them all |
+| `functions` / `function_call` | `tools` | The legacy function-calling fields become tools; a history's `function_call` turns and `function` results become tool calls and tool results. Replies use `tool_calls` |
+| `logprobs` / `top_logprobs` | `logprobs` / `top_logprobs` | Returned as the choice's `logprobs.content`, streaming or not |
+| `n` | — | Ollama returns one choice; `n > 1` is rejected with `400` rather than answered with one |
+| `logit_bias`, `parallel_tool_calls` | — | Not supported by Ollama; ignored |
+| — | `options.num_ctx` | Set from `GW42_OLLAMA_NUM_CTX` when configured, clamped to the model's maximum |
 | `response_format` | `format` | `json_object` → `"json"`; `json_schema` → the schema object |
 
 Tool calls from an Ollama engine are returned in OpenAI shape — string `arguments`, a minted `id`
 per call, a streaming `index`, and `finish_reason: "tool_calls"` — and the message history of a tool
 loop is translated back (a tool result's `tool_call_id` becomes Ollama's `tool_name`). Array content
-is split into text and `images`; only inline `data:` image URLs survive, as the gateway does not
-fetch remote ones.
+is split into text and `images`. `http(s)` image URLs are fetched by the gateway and inlined (see
+`GW42_FETCH_IMAGE_URLS`: public addresses only, 15 s, 20 MB, image types only, cached for 30
+minutes because a conversation resends its images every turn); one that cannot be fetched becomes a
+text note. A `file` part (a PDF) becomes a note too, as Ollama reads no files.
 
 On both paths, messages keep `tool_calls`, `tool_call_id` and `name`, and array content is
-preserved with each text part truncated to `MAX_MESSAGE_LENGTH`. Anything not in the table above is
+preserved, with each text part truncated to `GW42_MAX_INPUT_LENGTH` when that is set. Anything not in the table above is
 dropped rather than rejected on the Ollama path.
 
 ## Authentication
@@ -244,8 +276,10 @@ A stream is bounded by silence, not by how long it takes: it is closed after 60 
 sent nothing, or after 30 minutes in total. A completion that keeps producing tokens is not cut for
 running long, so a long agent turn on a reasoning model arrives complete rather than truncated. A
 non-streaming completion is different — it sends nothing until it is finished, so it keeps a single
-120 s budget, and in practice the 30 s response-header limit is the tighter of the two. Streaming is
-therefore the better default for anything that may generate at length.
+total budget, `GW42_UPSTREAM_TIMEOUT` (600 s by default), without the 30 s response-header limit that
+applies to streams. Streaming is still the better default for anything that may generate at length:
+the client sees progress, and a stalled engine is detected after 60 s of silence instead of at the
+end of the budget.
 
 ## Usage Examples
 

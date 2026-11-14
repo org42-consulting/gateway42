@@ -91,6 +91,18 @@ func handleListModels(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		reachable++
+		// Ollama's listing has no context length; ask /api/show (cached,
+		// bounded) for this engine's models.
+		var ollamaWindows map[string]int
+		if oa, ok := cachedAdapter(e.ID).(*OllamaAdapter); ok {
+			names := make([]string, 0, len(pd.raw))
+			for _, m := range pd.raw {
+				if n := modelName(m); n != "" {
+					names = append(names, n)
+				}
+			}
+			ollamaWindows = ollamaContextWindows(oa, names, 3*time.Second)
+		}
 		for _, m := range pd.raw {
 			name := modelName(m)
 			if name == "" || seen[name] {
@@ -120,7 +132,7 @@ func handleListModels(w http.ResponseWriter, r *http.Request) {
 				CreatedAt:   time.Unix(int64(created), 0).UTC().Format(time.RFC3339),
 				Size:        int64(toInt(m["size"])),
 
-				MaxInputTokens:      modelContextWindow(m),
+				MaxInputTokens:      max(modelContextWindow(m), ollamaWindows[name]),
 				AnthropicFamilyTier: stringField(m, "anthropic_family_tier"),
 				IsFamilyDefault:     m["is_family_default"] == true,
 			})
@@ -262,6 +274,15 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		selected.Release()
 	}()
 
+	if selected.Type() == EngineOllama {
+		// Ollama returns one choice per request; answering n > 1 with a single
+		// choice would look like success.
+		if n := toInt(data["n"]); n > 1 {
+			writeOpenAIError(w, 400, "n > 1 is not supported by the engine serving this model (Ollama)", "invalid_request_error")
+			return
+		}
+		messages = inlineRemoteImages(r.Context(), messages)
+	}
 	engineReq := buildEngineRequest(selected, data, messages)
 
 	if streaming, _ := data["stream"].(bool); streaming {
@@ -353,6 +374,9 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 
+	if adapter.Type() == EngineOllama {
+		messages = inlineRemoteImages(r.Context(), messages)
+	}
 	engineReq := buildEngineRequest(adapter, data, messages)
 
 	if streaming, _ := data["stream"].(bool); streaming {
@@ -456,21 +480,70 @@ func streamMessages(w http.ResponseWriter, r *http.Request, adapter Engine,
 
 	tr := newAnthropicStream(model)
 	tr.thinking = thinking
-	if !send(tr.start()) {
+	tr.inputEstimate = estimateTokens(engineReq["messages"], engineReq["tools"])
+	// Anthropic follows message_start with a ping, and keeps pinging while
+	// the model is silent. Local engines can be silent for minutes while
+	// they prefill a long prompt; without pings a client (or a proxy in
+	// between) may give up on a connection that shows no sign of life.
+	if !send(tr.start(), pingEvent) {
 		outcome = "client disconnected"
 		return
 	}
+
+	// Recv runs on its own goroutine so the loop can ping between chunks.
+	// It also touches the deadline there, on the read, not after the write —
+	// the bound tracks whether the engine is alive, not how fast this client
+	// drains — and every touch stays on that one goroutine. The goroutine
+	// ends when Recv fails, which the deferred stream.Close and
+	// deadline.stop guarantee once this function returns.
+	type recvResult struct {
+		payload []byte
+		meta    chunkMeta
+		err     error
+	}
+	results := make(chan recvResult)
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		for {
+			payload, meta, err := stream.Recv()
+			if err == nil {
+				deadline.touch()
+			}
+			select {
+			case results <- recvResult{payload, meta, err}:
+			case <-done:
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	ping := time.NewTicker(pingInterval)
+	defer ping.Stop()
+
 	for {
-		payload, meta, err := stream.Recv()
-		if err == io.EOF {
+		var res recvResult
+		select {
+		case <-ping.C:
+			if !send(pingEvent) {
+				outcome = "client disconnected"
+				detail.setOutcome(outcome)
+				return
+			}
+			continue
+		case res = <-results:
+		}
+		if res.err == io.EOF {
 			break
 		}
-		if err != nil {
+		if res.err != nil {
 			// Anthropic's in-stream error event: the client surfaces it
 			// instead of treating the truncated message as complete. The
 			// deadline cause replaces the read error when the gateway capped
 			// the stream, so the audit can tell that from a transport failure.
-			why := err
+			why := res.err
 			if cause := deadline.cause(); cause != nil {
 				why = cause
 			}
@@ -481,40 +554,78 @@ func streamMessages(w http.ResponseWriter, r *http.Request, adapter Engine,
 			detail.setUpstreamErr(why)
 			return
 		}
-		// Touched on the read, not after the write — the bound tracks whether
-		// the engine is alive, not how fast this client drains.
-		deadline.touch()
-		if !send(tr.chunk(payload)...) {
+		if !send(tr.chunk(res.payload)...) {
 			slog.Info("client disconnected mid-stream", "model", model, "user", userID)
 			outcome = "client disconnected"
 			detail.setOutcome(outcome)
 			return
 		}
 		detail.setFirstToken()
-		detail.applyMeta(meta)
-		audit.write(meta.auditText)
+		detail.applyMeta(res.meta)
+		audit.write(res.meta.auditText)
 	}
 	send(tr.end()...)
 }
 
-// handleCountTokens serves POST /v1/messages/count_tokens with an estimate;
-// see estimateTokens for why an estimate is enough.
+// handleCountTokens serves POST /v1/messages/count_tokens.
+//
+// The count comes from the engine when it can give one: oMLX (and other
+// servers that implement Anthropic's API) answer /v1/messages/count_tokens
+// with their own tokenizer. Otherwise — Ollama, an engine without the
+// endpoint, or any failure within the time budget — it is estimateTokens'
+// estimate, which errs on the high side, the safe direction for the
+// compaction decision clients use it for. No concurrency slot is taken:
+// counting is cheap and must not queue behind generations.
 func handleCountTokens(w http.ResponseWriter, r *http.Request) {
 	user := userFromContext(r)
 	if user == nil {
 		writeAnthropicError(w, 401, "Invalid API key", "authentication_error")
 		return
 	}
-	// Rate limited like the completion endpoints by rateLimitMiddleware: no
-	// engine is involved, but each call still decodes and re-encodes a body
-	// of up to maxRequestBytes.
+	// Rate limited like the completion endpoints by rateLimitMiddleware.
 	body, ok := decodeAPIBody(w, r, writeAnthropicError)
 	if !ok {
+		return
+	}
+	model, _ := body["model"].(string)
+	if n, ok := engineTokenCount(r.Context(), model, body); ok {
+		jsonResponse(w, 200, map[string]int{"input_tokens": n})
 		return
 	}
 	jsonResponse(w, 200, map[string]int{
 		"input_tokens": estimateTokens(body["system"], body["messages"], body["tools"]),
 	})
+}
+
+// engineTokenCount asks the first OpenAI-compatible engine holding model to
+// count the request's tokens. The billing header is stripped first, as for a
+// completion, so the count is of the prompt the engine will actually see.
+func engineTokenCount(ctx context.Context, model string, body map[string]interface{}) (int, bool) {
+	var adapter *OpenAICompatAdapter
+	for _, e := range routeModelOrdered(model) {
+		if a, ok := e.(*OpenAICompatAdapter); ok {
+			adapter = a
+			break
+		}
+	}
+	if adapter == nil {
+		return 0, false
+	}
+	req := make(map[string]interface{}, len(body))
+	for k, v := range body {
+		req[k] = v
+	}
+	if sys, ok := body["system"]; ok {
+		req["system"] = systemPrompt(sys)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	result, err := postJSON(ctx, EngineOpenAICompat, "count_tokens", adapter.upstream("/v1/messages/count_tokens"), adapter.cfg.APIKey, req)
+	if err != nil {
+		return 0, false
+	}
+	n := toInt(result["input_tokens"])
+	return n, n > 0
 }
 
 // ─────────────────────────────── Shared admission ─────────────────────────────
@@ -713,17 +824,27 @@ func acquireEngine(w http.ResponseWriter, r *http.Request, model string,
 // only Ollama adapters need it.
 func buildEngineRequest(adapter Engine, data map[string]interface{}, messages []map[string]interface{}) map[string]interface{} {
 	if adapter.Type() == EngineOllama {
-		return openAIToOllama(data, messages)
+		req := openAIToOllama(data, messages)
+		if oa, ok := adapter.(*OllamaAdapter); ok {
+			applyOllamaNumCtx(oa, req)
+		}
+		return req
 	}
 	req := openAICompatRequest(data, messages)
 	// chat_template_kwargs is a local-engine extension (vLLM, oMLX, LM Studio,
 	// llama.cpp); the OpenAI platform rejects unknown parameters, and the
 	// Anthropic translation sends it on every request.
 	if a, ok := adapter.(*OpenAICompatAdapter); ok && isOpenAIPlatform(a.cfg.BaseURL) {
-		delete(req, "chat_template_kwargs")
+		for _, key := range localOnlyParams {
+			delete(req, key)
+		}
 	}
 	return req
 }
+
+// localOnlyParams are local-engine extensions the OpenAI platform rejects as
+// unknown parameters; buildEngineRequest withholds them from api.openai.com.
+var localOnlyParams = []string{"chat_template_kwargs", "top_k", "min_p", "repetition_penalty", "thinking_budget"}
 
 // isOpenAIPlatform reports whether baseURL is OpenAI's own API.
 func isOpenAIPlatform(baseURL string) bool {
@@ -768,7 +889,14 @@ func openAICompatRequest(data map[string]interface{}, messages []map[string]inte
 			// and LM Studio read chat_template_kwargs — the only way to set
 			// e.g. Qwen3's enable_thinking per request. Forwarded only when the
 			// client sends them, so a strict upstream never sees them unasked.
-			"reasoning_effort", "chat_template_kwargs":
+			"reasoning_effort", "chat_template_kwargs",
+			// The rest of OpenAI's chat parameters, including the legacy
+			// function-calling pair, for engines that implement them.
+			"verbosity", "metadata", "store", "modalities", "audio", "prediction",
+			"functions", "function_call", "web_search_options",
+			// Sampler and reasoning extensions local servers (vLLM, oMLX,
+			// llama.cpp, LM Studio) accept; see localOnlyParams.
+			"top_k", "min_p", "repetition_penalty", "thinking_budget":
 			req[key] = data[key]
 		}
 	}
@@ -925,7 +1053,7 @@ func sanitizeMessages(messages []interface{}) []map[string]interface{} {
 			"role":    role,
 			"content": sanitizeContent(msg["content"]),
 		}
-		for _, key := range []string{"name", "tool_call_id", "tool_calls"} {
+		for _, key := range []string{"name", "tool_call_id", "tool_calls", "function_call"} {
 			if v, ok := msg[key]; ok && v != nil {
 				clean[key] = v
 			}
@@ -934,7 +1062,7 @@ func sanitizeMessages(messages []interface{}) []map[string]interface{} {
 		// OpenAI schema; keep it null there. Anywhere else, absent content
 		// becomes "" — what this function always sent — since strict
 		// upstreams reject a user message whose content is null.
-		if clean["content"] == nil && clean["tool_calls"] == nil {
+		if clean["content"] == nil && clean["tool_calls"] == nil && clean["function_call"] == nil {
 			clean["content"] = ""
 		}
 		out = append(out, clean)
