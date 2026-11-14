@@ -255,7 +255,7 @@ func runPacedStream(t *testing.T, chunks int, step time.Duration, hang bool) (*h
 	d, r := newRequestDetail(r)
 	w := httptest.NewRecorder()
 	streamCompletion(w, r, &streamEngine{stream: s}, nil, 7, "paced-model",
-		[]map[string]interface{}{{"role": "user", "content": "hi"}})
+		[]map[string]interface{}{{"role": "user", "content": "hi"}}, nil, nil)
 	return w, d, s
 }
 
@@ -346,7 +346,7 @@ func TestClientDisconnectIsNotRecordedAsTimeout(t *testing.T) {
 	d, r := newRequestDetail(r)
 	w := &failingWriter{ResponseRecorder: httptest.NewRecorder()}
 	streamCompletion(w, r, &streamEngine{stream: s}, nil, 7, "paced-model",
-		[]map[string]interface{}{{"role": "user", "content": "hi"}})
+		[]map[string]interface{}{{"role": "user", "content": "hi"}}, nil, nil)
 
 	if d.outcome != "client disconnected" {
 		t.Errorf("outcome = %q, want \"client disconnected\"", d.outcome)

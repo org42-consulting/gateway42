@@ -455,7 +455,7 @@ func TestStreamPingsWhileEngineIsSilent(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
 	engineReq := map[string]interface{}{"messages": []interface{}{map[string]interface{}{"role": "user", "content": strings.Repeat("x", 400)}}}
-	streamMessages(rec, r, eng, engineReq, 1, "m", nil, false)
+	streamMessages(rec, r, eng, engineReq, 1, "m", nil, false, nil, nil, false)
 	out := rec.Body.String()
 
 	if n := strings.Count(out, "event: ping"); n < 3 {
