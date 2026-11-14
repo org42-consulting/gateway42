@@ -198,7 +198,7 @@ Errors use the OpenAI error envelope:
 | `400` | `invalid_request_error` | Body is not valid JSON, or `messages` is absent |
 | `401` | `authentication_error` | Missing, malformed, unknown, or disabled API key |
 | `404` | `invalid_request_error` | The requested `model` is not available on any configured engine |
-| `413` | `invalid_request_error` | Body exceeds 8 × `MAX_MESSAGE_LENGTH` |
+| `413` | `invalid_request_error` | Body exceeds `GW42_MAX_REQUEST_BYTES` (default 32 MiB) |
 | `429` | `rate_limit_error` | Per-user token bucket empty |
 | `502` | `api_error` | No engines configured, or the engine was unreachable |
 | `503` | `api_error` | Engine at `GW42_UPSTREAM_CONCURRENCY` in-flight requests; sent with `Retry-After: 2` |
