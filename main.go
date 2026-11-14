@@ -52,11 +52,19 @@ var staticFS embed.FS
 
 // Config holds the application configuration
 type Config struct {
-	DBPath              string
-	AdminPassword       string
-	DefaultRL           int
-	SessionTTL          int
-	MaxMsgLen           int
+	DBPath        string
+	AdminPassword string
+	DefaultRL     int
+	SessionTTL    int
+	MaxMsgLen     int
+	// MaxRequestBytes bounds an API request body. It is its own setting, not
+	// a multiple of MaxMsgLen: a Claude Desktop / Cowork / Claude Code request
+	// carries the whole conversation — tool definitions, every earlier turn
+	// and base64 screenshots — so a long session outgrows any per-message
+	// figure, and the old 8 × MaxMsgLen (2 MiB) answered 413 well inside the
+	// model's context window. The default matches the Anthropic API's own
+	// 32 MB request limit, the size these clients are built to stay under.
+	MaxRequestBytes     int
 	LogLevel            string
 	LogFile             string
 	Port                string
@@ -129,6 +137,7 @@ func loadConfig() Config {
 		DefaultRL:           getEnvInt("DEFAULT_RATE_LIMIT", 10),
 		SessionTTL:          getEnvInt("SESSION_TIMEOUT", 3600),
 		MaxMsgLen:           getEnvInt("MAX_MESSAGE_LENGTH", 262144), // ~256KB
+		MaxRequestBytes:     getEnvInt("GW42_MAX_REQUEST_BYTES", defaultMaxRequestBytes),
 		LogLevel:            getEnv("LOG_LEVEL", "INFO"),
 		LogFile:             getEnv("LOG_FILE", "./logs/gateway.log"),
 		Port:                getEnv("PORT", "7000"),

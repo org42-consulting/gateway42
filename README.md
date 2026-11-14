@@ -292,10 +292,45 @@ claude
 ```
 
 Not translated: Anthropic server tools (`web_search`, `code_execution`, … — no local engine can run
-them, so they are not offered to the model), extended `thinking`, `top_k` and prompt caching
-(`cache_control` is accepted and ignored). Claude Code relies heavily on tool calling, so use a model
+them, so they are not offered to the model) and `top_k`. Claude Code relies heavily on tool calling, so use a model
 that supports it. It also assumes a 200k context window for model IDs it does not recognise; see
 the Claude Code model-config docs to set the real window for your model.
+
+Translated with care:
+
+- **Images in tool results** (screenshots from computer use and browser tools) travel in a user
+  message right after the tool messages, labelled with their tool call, because OpenAI tool messages
+  carry text only.
+- **Documents**: plain-text and content documents are inlined with their title and context. PDFs
+  cannot be read by a local engine, so they become a one-line note saying so, not silence.
+- **Thinking**: when the request enables `thinking`, the engine's reasoning (`reasoning_content`,
+  `reasoning`, or Ollama's `thinking`) is returned as `thinking` blocks, streamed as
+  `thinking_delta`, with an empty signature. Without it, reasoning is dropped as before.
+  Thinking blocks sent back in history are not forwarded.
+- **Failover**: `/v1/messages` tries every engine that holds the model, like `/v1/chat/completions`.
+
+#### Prompt caching (Claude Desktop, Cowork, Claude Code)
+
+Local engines (oMLX, vLLM, llama.cpp, LM Studio, Ollama) have no `cache_control` markers; they reuse
+the KV cache for the longest prompt prefix they have already seen. Gateway42 keeps that working:
+
+- **Stable prefix.** The `x-anthropic-billing-header: …; cch=…;` line that Claude clients put at
+  the top of the system prompt changes on every request. Forwarded, it would make every turn miss
+  the cache at the very first token and reprocess the whole conversation. Gateway42 drops it. The
+  rest of the translation is deterministic, so tools, system prompt and earlier turns reach the
+  engine byte-identical from turn to turn. `cache_control` itself is accepted and not forwarded.
+- **Cache usage reported.** An engine's `usage.prompt_tokens_details.cached_tokens` becomes
+  `cache_read_input_tokens`, with `input_tokens` holding only the tokens the engine had to process,
+  and every response carries the `cache_creation` object Claude Desktop reads. To check caching,
+  look for `cache_read_input_tokens` well above zero after a session's first request. Ollama does
+  not report cache hits, so with Ollama it stays 0 even when the cache is used. The request log and
+  the quota still count the whole prompt.
+
+To use Gateway42 with Claude Desktop / Cowork, set `inferenceProvider` to `gateway`,
+`inferenceGatewayBaseUrl` to the gateway's URL, `inferenceGatewayApiKey` to a Gateway42 key (either
+auth scheme works) and list the local model IDs in `inferenceModels`. Model auto-discovery only
+shows Claude model IDs, so local models must be listed explicitly; set `behavesAs` on an entry to
+choose the context window the app assumes.
 
 ### Parameters
 
@@ -411,12 +446,13 @@ Errors use the OpenAI error envelope, so SDK error handling works unchanged:
 | `400` | `invalid_request_error` | Body is not valid JSON, or `messages` is missing |
 | `401` | `authentication_error` | Missing, invalid, or deactivated API key |
 | `404` | `invalid_request_error` | The requested model is not available on any reachable engine — including, on `/v1/chat/completions`, when no engine is reachable at all |
-| `413` | `invalid_request_error` | Request body too large (over 8 × `MAX_MESSAGE_LENGTH`) |
+| `413` | `invalid_request_error` | Request body too large (over `GW42_MAX_REQUEST_BYTES`) |
 | `429` | `rate_limit_error` | Per-minute rate limit exceeded, or daily token quota exhausted — wait before retrying |
-| `502` | `api_error` | Gateway42. could not reach the engine; also "no engines configured" on `/v1/models` and `/v1/messages` |
+| `502` | `api_error` | Gateway42. could not reach the engine, or the engine failed (5xx) or rejected the gateway's own engine credentials (401/403); also "no engines configured" on `/v1/models` and `/v1/messages` |
 | `503` | `api_error` | Engine is at its concurrency cap — retry after the `Retry-After` interval |
 | `500` | `api_error` | Internal server error, including a recovered panic. |
 
+When the engine itself rejects a request, its verdict is passed on with the engine's own message instead of a 502: 400 and 422 become `400 invalid_request_error` (for example a prompt longer than the model's context window), and 404, 413 and 429 keep their status. On `/v1/messages` a context-window overflow is worded `prompt is too long: …`, the phrase Claude Code, Claude Desktop and Cowork match to compact the conversation and retry.
 A panic inside a handler is recovered and reported rather than dropping the connection. How it is
 reported depends on how far the response had already got:
 
@@ -626,7 +662,7 @@ exported from that page.
 | Admin forms | CSRF token required on every state-changing POST; session cookie is `SameSite=Lax` and AES-encrypted as well as signed, so its contents (CSRF token, flash messages) are not readable client-side. |
 | Engine credentials | Upstream API keys are stored in the database and never rendered back into the settings form. Editing an engine with the key field left blank keeps the stored key. |
 | Transport | HTTPS when `TLS_CERT` and `TLS_KEY` are both set. |
-| Input bounds | Request bodies capped at 8 × `MAX_MESSAGE_LENGTH`; each logged prompt and response truncated to `MAX_MESSAGE_LENGTH`, on a rune boundary so truncation cannot split a multi-byte character. |
+| Input bounds | Request bodies capped at `GW42_MAX_REQUEST_BYTES`; the text of each message sent to an engine, and each logged prompt and response, truncated to `MAX_MESSAGE_LENGTH`, on a rune boundary so truncation cannot split a multi-byte character. |
 | Log retention | Prompts and responses are deleted after `GW42_LOG_RETENTION_DAYS`, so stored user content has a bounded lifetime. |
 | Panics | Recovered per request and returned as `500`; one bad request cannot take down the gateway. |
 
@@ -848,7 +884,8 @@ All configuration is via environment variables. No variables are strictly requir
 | `DEFAULT_RATE_LIMIT` | `10` | Default requests-per-minute for newly registered users. |
 | `SESSION_TIMEOUT` | `3600` | Admin session lifetime in seconds. |
 | `GW42_SESSION_KEY` | _(empty)_ | Base secret for signing and encrypting session cookies. Set it to keep sessions valid across restarts — unset, fresh random keys are generated at every boot and all users are logged out on restart. Derivation is `SHA-256(secret + "\|hash")` for the HMAC key and `SHA-256(secret + "\|block")` for the encryption key, so one secret safely yields two independent 32-byte keys. |
-| `MAX_MESSAGE_LENGTH` | `262144` | Maximum characters stored per prompt or response in the AI interaction log (~256 KB). |
+| `MAX_MESSAGE_LENGTH` | `262144` | Maximum bytes of text per message (~256 KB). Longer message text is truncated before it reaches the engine, and each prompt and response stored in the AI interaction log is capped at the same size. Raise it if clients send single messages larger than this, such as large tool results or pasted documents. |
+| `GW42_MAX_REQUEST_BYTES` | `33554432` | Maximum API request body (32 MiB, the Anthropic API's own limit). Claude Desktop, Cowork and Claude Code resend the whole session, screenshots included, on every turn, so this bounds the usable conversation, not a single message. Larger bodies get `413`. |
 | `LOG_LEVEL` | `INFO` | Log verbosity: `DEBUG`, `INFO`, `WARN` (or `WARNING`), `ERROR`. An unrecognised value falls back to `INFO` with a warning. |
 | `LOG_FILE` | `./logs/gateway.log` | Application log file, written in addition to stderr; the directory is created if needed. Set it empty to log to stderr only. When stderr is already redirected to this same file (as `install.sh` does under launchd) it is written once, not twice. |
 | `TLS_CERT` | _(empty)_ | Path to TLS certificate file. When set with `TLS_KEY`, enables HTTPS. |

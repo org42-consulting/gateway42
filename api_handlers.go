@@ -277,7 +277,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		slog.Error("engine request", "err", err)
 		detailFromContext(r).setUpstreamErr(err)
-		jsonResponse(w, 502, openaiError("Could not reach engine", "api_error"))
+		writeOpenAIEngineFailure(w, err)
 		return
 	}
 
@@ -355,7 +355,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		// runs for every non-Ollama adapter — so the Claude Code case (its
 		// context window comes from message_delta.usage, and a stream without
 		// usage would read as zero tokens) is covered from one place.
-		streamMessages(w, r, adapter, engineReq, user.ID, model, messages)
+		streamMessages(w, r, adapter, engineReq, user.ID, model, messages, thinkingRequested(body))
 		return
 	}
 
@@ -367,7 +367,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 		slog.Error("engine request", "err", err)
 		detailFromContext(r).setUpstreamErr(err)
-		writeAnthropicError(w, 502, "Could not reach engine", "api_error")
+		writeAnthropicEngineFailure(w, err)
 		return
 	}
 	var payload interface{} = result
@@ -380,6 +380,9 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, 502, "Unexpected engine response", "api_error")
 		return
 	}
+	if !thinkingRequested(body) {
+		withoutThinking(msg)
+	}
 	recordAnthropicDetail(r, msg)
 	logInteraction(user.ID, messages, msg, model)
 	jsonResponse(w, 200, msg)
@@ -390,7 +393,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 // with anthropicStream turning each OpenAI chunk into typed events.
 func streamMessages(w http.ResponseWriter, r *http.Request, adapter Engine,
 	engineReq map[string]interface{}, userID int, model string,
-	messages []map[string]interface{}) {
+	messages []map[string]interface{}, thinking bool) {
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -409,7 +412,7 @@ func streamMessages(w http.ResponseWriter, r *http.Request, adapter Engine,
 		}
 		slog.Error("engine stream", "err", err, "model", model)
 		detailFromContext(r).setUpstreamErr(err)
-		writeAnthropicError(w, 502, "Could not reach engine", "api_error")
+		writeAnthropicEngineFailure(w, err)
 		return
 	}
 	defer stream.Close()
@@ -447,6 +450,7 @@ func streamMessages(w http.ResponseWriter, r *http.Request, adapter Engine,
 	detail.setStreamed()
 
 	tr := newAnthropicStream(model)
+	tr.thinking = thinking
 	if !send(tr.start()) {
 		outcome = "client disconnected"
 		return
@@ -498,7 +502,7 @@ func handleCountTokens(w http.ResponseWriter, r *http.Request) {
 	}
 	// Rate limited like the completion endpoints by rateLimitMiddleware: no
 	// engine is involved, but each call still decodes and re-encodes a body
-	// of up to 8× MaxMsgLen.
+	// of up to maxRequestBytes.
 	body, ok := decodeAPIBody(w, r, writeAnthropicError)
 	if !ok {
 		return
@@ -523,12 +527,95 @@ func writeAnthropicError(w http.ResponseWriter, status int, message, errType str
 	jsonResponse(w, status, anthropicError(status, message, errType))
 }
 
-// decodeAPIBody reads a bounded JSON object body.
+// engineFailure decides how a failed engine call reaches the client.
 //
-// The bound is ~8× MaxMsgLen so a multi-turn conversation of bounded-length
-// messages still fits; truncateInput then trims each field.
+// An engine that refused the request (upstreamStatusError) passes its
+// verdict on when the verdict is about the request: 400 and 422 as 400, plus
+// 404, 413 and 429, each with the engine's own reason. Everything else — an
+// unreachable engine, a 5xx, or a 401/403 that means the gateway's engine
+// credentials are wrong, not the caller's — stays the 502 it always was, so
+// no engine-side secret or misconfiguration detail leaks to API users.
+func engineFailure(err error) (status int, message, errType string) {
+	var ue *upstreamStatusError
+	if errors.As(err, &ue) {
+		msg := ue.Message
+		switch ue.Status {
+		case 400, 422:
+			if msg == "" {
+				msg = "The engine rejected the request"
+			}
+			return 400, msg, "invalid_request_error"
+		case 404:
+			if msg == "" {
+				msg = "The engine does not serve this model"
+			}
+			return 404, msg, "invalid_request_error"
+		case 413:
+			if msg == "" {
+				msg = "Request too large for the engine"
+			}
+			return 413, msg, "invalid_request_error"
+		case 429:
+			if msg == "" {
+				msg = "The engine is rate limiting requests"
+			}
+			return 429, msg, "rate_limit_error"
+		}
+	}
+	return 502, "Could not reach engine", "api_error"
+}
+
+func writeOpenAIEngineFailure(w http.ResponseWriter, err error) {
+	status, msg, errType := engineFailure(err)
+	writeOpenAIError(w, status, msg, errType)
+}
+
+// writeAnthropicEngineFailure is engineFailure in Anthropic's envelope, with
+// one translation: a context-window overflow is worded the way Anthropic's API
+// words it ("prompt is too long: …"), because that phrase is what Claude Code,
+// Claude Desktop and Cowork match to compact the conversation and retry
+// rather than show the user an error. oMLX already says it that way; vLLM,
+// llama.cpp and LM Studio describe it in their own words.
+func writeAnthropicEngineFailure(w http.ResponseWriter, err error) {
+	status, msg, errType := engineFailure(err)
+	if status == 400 && isContextOverflow(msg) && !strings.HasPrefix(strings.ToLower(msg), "prompt is too long") {
+		msg = "prompt is too long: " + msg
+	}
+	writeAnthropicError(w, status, msg, errType)
+}
+
+// isContextOverflow recognises the engines' ways of saying the prompt does
+// not fit the model's context window.
+func isContextOverflow(msg string) bool {
+	m := strings.ToLower(msg)
+	for _, s := range []string{
+		"prompt is too long", "context length", "context window", "context_length_exceeded",
+		"maximum context", "exceeds the context", "exceed_context_size", "too many tokens",
+	} {
+		if strings.Contains(m, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// defaultMaxRequestBytes is the GW42_MAX_REQUEST_BYTES default: 32 MiB, the
+// Anthropic Messages API's own request limit. See Config.MaxRequestBytes.
+const defaultMaxRequestBytes = 32 << 20
+
+// maxRequestBytes is the configured body bound, or the default when the
+// setting is unset or not positive (a zero Config, as in tests, included).
+func maxRequestBytes() int64 {
+	if cfg.MaxRequestBytes > 0 {
+		return int64(cfg.MaxRequestBytes)
+	}
+	return defaultMaxRequestBytes
+}
+
+// decodeAPIBody reads a bounded JSON object body. The bound is
+// maxRequestBytes; truncateInput then trims each message's text.
 func decodeAPIBody(w http.ResponseWriter, r *http.Request, writeErr apiErrorWriter) (map[string]interface{}, bool) {
-	r.Body = http.MaxBytesReader(w, r.Body, int64(cfg.MaxMsgLen)*8)
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes())
 	var data map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&data); err != nil || data == nil {
 		var mbe *http.MaxBytesError
@@ -545,35 +632,52 @@ func decodeAPIBody(w http.ResponseWriter, r *http.Request, writeErr apiErrorWrit
 // acquireEngine routes model to an engine and takes one of its concurrency
 // slots. On success the caller must defer release; on failure the error has
 // already been written.
+//
+// It fails over like handleChatCompletions: every engine that holds the
+// model is tried in priority order, so a busy primary falls through to the
+// next one instead of the client seeing a 503. Only when no engine reports
+// the model does selectEngine decide, keeping its answers for those cases —
+// the default engine for an empty model name or when no probe succeeded, a
+// 404 for a model the probed fleet does not have, a 502 when nothing is
+// configured.
 func acquireEngine(w http.ResponseWriter, r *http.Request, model string,
 	writeErr apiErrorWriter) (adapter Engine, release func(), ok bool) {
 
-	// Route on the requested model rather than always taking the first engine,
-	// so a multi-engine deployment reaches whichever host actually holds it.
-	adapter, rerr := selectEngine(model)
-	switch rerr {
-	case routeNoEngines:
-		writeErr(w, 502, "No engines configured", "api_error")
-		return nil, nil, false
-	case routeModelNotFound:
-		writeErr(w, 404,
-			fmt.Sprintf("Model '%s' is not available on any configured engine", model),
-			"invalid_request_error")
-		return nil, nil, false
+	candidates := routeModelOrdered(model)
+	if len(candidates) == 0 {
+		fallback, rerr := selectEngine(model)
+		switch rerr {
+		case routeNoEngines:
+			writeErr(w, 502, "No engines configured", "api_error")
+			return nil, nil, false
+		case routeModelNotFound:
+			writeErr(w, 404,
+				fmt.Sprintf("Model '%s' is not available on any configured engine", model),
+				"invalid_request_error")
+			return nil, nil, false
+		}
+		candidates = []Engine{fallback}
 	}
-	detailFromContext(r).setRouted(adapter.Name(), adapter.Type(), model)
-	// Cap upstream concurrency. Wait up to 250ms for a slot before giving
-	// up — long enough to absorb a momentary spike, short enough that
-	// clients see a clear backpressure signal.
-	acqCtx, acqCancel := context.WithTimeout(r.Context(), 250*time.Millisecond)
-	gotSlot := adapter.TryAcquire(acqCtx)
-	acqCancel()
-	if !gotSlot {
-		metricUpstreamBusy.WithLabelValues(adapter.Type()).Inc()
+	// Cap upstream concurrency. Wait up to 250ms per engine for a slot —
+	// long enough to absorb a momentary spike, short enough that clients see
+	// a clear backpressure signal.
+	for _, eng := range candidates {
+		acqCtx, acqCancel := context.WithTimeout(r.Context(), 250*time.Millisecond)
+		gotSlot := eng.TryAcquire(acqCtx)
+		acqCancel()
+		if gotSlot {
+			adapter = eng
+			break
+		}
+		metricUpstreamBusy.WithLabelValues(eng.Type()).Inc()
+	}
+	if adapter == nil {
+		detailFromContext(r).setRouted(candidates[0].Name(), candidates[0].Type(), model)
 		w.Header().Set("Retry-After", "2")
 		writeErr(w, 503, "Engine busy, please retry", "api_error")
 		return nil, nil, false
 	}
+	detailFromContext(r).setRouted(adapter.Name(), adapter.Type(), model)
 	// Saturation per engine, where the busy counter only shows that *some*
 	// engine of a type refused. Cardinality is bounded by the engine count.
 	metricEngineInflight.WithLabelValues(adapter.Name()).Inc()
@@ -624,7 +728,12 @@ func openAICompatRequest(data map[string]interface{}, messages []map[string]inte
 			"max_completion_tokens", "frequency_penalty", "presence_penalty", "stop",
 			"provider_options", "response_format", "service_tier", "logit_bias", "tools",
 			"tool_choice", "logprobs", "top_logprobs", "parallel_tool_calls",
-			"user", "n":
+			"user", "n",
+			// Reasoning controls. reasoning_effort is OpenAI's own; vLLM, oMLX
+			// and LM Studio read chat_template_kwargs — the only way to set
+			// e.g. Qwen3's enable_thinking per request. Forwarded only when the
+			// client sends them, so a strict upstream never sees them unasked.
+			"reasoning_effort", "chat_template_kwargs":
 			req[key] = data[key]
 		}
 	}
@@ -680,7 +789,7 @@ func streamCompletion(w http.ResponseWriter, r *http.Request, adapter Engine,
 		}
 		slog.Error("engine stream", "err", err, "model", model)
 		detailFromContext(r).setUpstreamErr(err)
-		jsonResponse(w, 502, openaiError("Could not reach engine", "api_error"))
+		writeOpenAIEngineFailure(w, err)
 		return
 	}
 	defer stream.Close()

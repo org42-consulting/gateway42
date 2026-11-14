@@ -315,10 +315,10 @@ func enginesForModel(idx *routeIndex, modelName string) []Engine {
 // nothing to do with the model name, so we fall back to the default engine and
 // let the upstream failure surface as a 502.
 //
-// This is the single-engine path, still used by the Anthropic routes
-// (handleMessages / handleCountTokens via acquireEngine). The OpenAI chat
-// route (handleChatCompletions) uses routeModelOrdered instead, so a busy or
-// down primary can fall through to the next engine holding the model.
+// Both completion routes route with routeModelOrdered, so a busy primary
+// falls through to the next engine holding the model. acquireEngine (the
+// Anthropic route) consults this single-engine path only when that list is
+// empty, for its default-engine, 404 and 502 answers.
 func selectEngine(model string) (Engine, routeErr) {
 	if len(cachedEngines()) == 0 {
 		return nil, routeNoEngines

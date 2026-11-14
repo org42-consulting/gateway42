@@ -111,7 +111,41 @@ func newStreamDeadline(parent context.Context, idle, overall time.Duration) *str
 		d.max = time.Now().Add(overall)
 	}
 	d.timer = time.AfterFunc(d.until(), d.fired)
+	// The adapters find touch in the context and call it for every byte the
+	// engine sends, not only for frames the handler sees. Engines keep a
+	// connection alive during a long prefill with SSE comments (oMLX sends
+	// ": keep-alive" every 10s) that the frame parsers rightly skip; touching
+	// only per frame read those as silence, so a prompt that took more than
+	// streamIdle to prefill — a long Claude Code / Cowork session on a local
+	// model — was cut off before the first token.
+	d.ctx = context.WithValue(ctx, streamActivityKey{}, d.touch)
 	return d
+}
+
+type streamActivityKey struct{}
+
+// touchOnRead wraps an upstream body so each read that returns data records
+// progress on the streamDeadline carried by ctx, if any. Reads happen on the
+// goroutine that calls Recv, the same one that touches the deadline per frame.
+func touchOnRead(ctx context.Context, r io.Reader) io.Reader {
+	touch, ok := ctx.Value(streamActivityKey{}).(func())
+	if !ok {
+		return r
+	}
+	return activityReader{r: r, touch: touch}
+}
+
+type activityReader struct {
+	r     io.Reader
+	touch func()
+}
+
+func (a activityReader) Read(p []byte) (int, error) {
+	n, err := a.r.Read(p)
+	if n > 0 {
+		a.touch()
+	}
+	return n, err
 }
 
 // fired runs on the timer goroutine. It can only have been armed for the sooner
@@ -964,7 +998,7 @@ func (a *OllamaAdapter) Chat(ctx context.Context, req map[string]interface{}) (m
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != 200 {
-			return fmt.Errorf("ollama returned %d", resp.StatusCode)
+			return newUpstreamStatusError(resp)
 		}
 		return json.NewDecoder(resp.Body).Decode(&result)
 	})
@@ -993,7 +1027,7 @@ func (a *OllamaAdapter) StreamChat(ctx context.Context, req map[string]interface
 	}
 	return &ollamaStream{
 		body:         stream,
-		scanner:      newStreamScanner(stream),
+		scanner:      newStreamScanner(touchOnRead(ctx, stream)),
 		completionID: newCompletionID(),
 		isFirst:      true,
 	}, nil
@@ -1019,8 +1053,8 @@ func openUpstreamStream(engineType string, httpReq *http.Request) (io.ReadCloser
 		// and must not close it. The close error is dropped on purpose: we are
 		// already returning the failure the caller needs to see, and replacing
 		// it with a close error would hide the status code.
+		var err error = newUpstreamStatusError(resp)
 		_ = resp.Body.Close()
-		err := fmt.Errorf("engine returned %d", resp.StatusCode)
 		recordUpstream(engineType, "stream", start, err)
 		return nil, err
 	}
@@ -1135,7 +1169,7 @@ func (a *OpenAICompatAdapter) Chat(ctx context.Context, req map[string]interface
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != 200 {
-			return fmt.Errorf("engine returned %d", resp.StatusCode)
+			return newUpstreamStatusError(resp)
 		}
 		return json.NewDecoder(resp.Body).Decode(&result)
 	})
@@ -1165,7 +1199,7 @@ func (a *OpenAICompatAdapter) StreamChat(ctx context.Context, req map[string]int
 	if err != nil {
 		return nil, err
 	}
-	return &passthroughStream{body: stream, scanner: newStreamScanner(stream)}, nil
+	return &passthroughStream{body: stream, scanner: newStreamScanner(touchOnRead(ctx, stream))}, nil
 }
 
 // ── Ollama-only helpers (search, pull, delete) ────────────────────────────────
@@ -1255,27 +1289,41 @@ func statusErr(resp *http.Response, up *bool) error {
 // an error with a page of HTML would push the cookie past the ~4KB browsers
 // accept — turning a readable error into a failed session save.
 func upstreamErrDetail(body io.Reader) string {
+	if msg := upstreamErrMessage(body); msg != "" {
+		return ": " + msg
+	}
+	return ""
+}
+
+// upstreamErrMessage is upstreamErrDetail's reason without the ": " prefix:
+// the engine's own error message, one line, at most 200 runes, or "".
+func upstreamErrMessage(body io.Reader) string {
 	raw, err := io.ReadAll(io.LimitReader(body, 2048))
 	if err != nil || len(raw) == 0 {
 		return ""
 	}
 	// Ollama puts the reason in a JSON "error" string; OpenAI-compatible
-	// engines nest it as error.message. Anything that matches neither is
-	// shown as-is, so an unexpected upstream is still diagnosable.
+	// engines nest it as error.message; FastAPI-based engines (vLLM's and
+	// oMLX's bare HTTPExceptions) use a "detail" string. Anything that
+	// matches none is shown as-is, so an unexpected upstream is still
+	// diagnosable.
 	var payload struct {
-		Error json.RawMessage `json:"error"`
+		Error  json.RawMessage `json:"error"`
+		Detail json.RawMessage `json:"detail"`
 	}
 	msg := string(raw)
-	if json.Unmarshal(raw, &payload) == nil && len(payload.Error) > 0 {
+	if json.Unmarshal(raw, &payload) == nil {
 		var flat string
 		var nested struct {
 			Message string `json:"message"`
 		}
 		switch {
-		case json.Unmarshal(payload.Error, &flat) == nil && flat != "":
+		case len(payload.Error) > 0 && json.Unmarshal(payload.Error, &flat) == nil && flat != "":
 			msg = flat
-		case json.Unmarshal(payload.Error, &nested) == nil && nested.Message != "":
+		case len(payload.Error) > 0 && json.Unmarshal(payload.Error, &nested) == nil && nested.Message != "":
 			msg = nested.Message
+		case len(payload.Detail) > 0 && json.Unmarshal(payload.Detail, &flat) == nil && flat != "":
+			msg = flat
 		}
 	}
 	// Collapse to a single line: this ends up in a one-line flash.
@@ -1286,5 +1334,32 @@ func upstreamErrDetail(body io.Reader) string {
 	if r := []rune(msg); len(r) > 200 {
 		msg = string(r[:200]) + "…"
 	}
-	return ": " + msg
+	return msg
+}
+
+// upstreamStatusError is an engine that was reached and refused: a non-200
+// answer to a completion request. It is kept distinct from a transport error
+// because the two must reach the client differently. An engine that cannot
+// be reached is the gateway's problem (502, retryable); an engine that
+// rejects the request — the prompt exceeds its context window, a tool schema
+// it cannot compile — is the client's, and only a 4xx with the engine's
+// reason lets the client act on it (Claude Code compacts on "prompt is too
+// long"; every SDK retries a 5xx, which would just send the same doomed
+// request three times).
+type upstreamStatusError struct {
+	Status  int
+	Message string // the engine's reason, possibly ""
+}
+
+func (e *upstreamStatusError) Error() string {
+	if e.Message == "" {
+		return fmt.Sprintf("engine returned %d", e.Status)
+	}
+	return fmt.Sprintf("engine returned %d: %s", e.Status, e.Message)
+}
+
+// newUpstreamStatusError reads the reason from a non-200 response. The caller
+// still owns and closes the body.
+func newUpstreamStatusError(resp *http.Response) *upstreamStatusError {
+	return &upstreamStatusError{Status: resp.StatusCode, Message: upstreamErrMessage(resp.Body)}
 }

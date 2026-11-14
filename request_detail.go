@@ -202,7 +202,9 @@ func recordAnthropicDetail(r *http.Request, msg *AnthropicMessage) {
 	if msg.Model != "" {
 		d.modelServed = msg.Model
 	}
-	d.inTokens, d.outTokens = msg.Usage.InputTokens, msg.Usage.OutputTokens
+	// The whole prompt, cached share included: the log and the quota count
+	// what the request consumed, as on the OpenAI path.
+	d.inTokens, d.outTokens = msg.Usage.PromptTokens(), msg.Usage.OutputTokens
 	if msg.StopReason != nil {
 		d.stopReason = *msg.StopReason
 	}
