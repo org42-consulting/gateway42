@@ -124,7 +124,8 @@ engine is reachable at all.
 For OpenAI-compatible engines the request is forwarded through an allow-list that includes the
 tool-calling and structured-output fields (`tools`, `tool_choice`, `parallel_tool_calls`,
 `response_format`, `logit_bias`, `logprobs`, `top_logprobs`, `n`, `user`, `service_tier`,
-`max_completion_tokens`, `provider_options`) — whether they work depends on the upstream engine, not
+`max_completion_tokens`, `provider_options`) and the reasoning controls (`reasoning_effort`, and
+`chat_template_kwargs`, which vLLM, oMLX and LM Studio read, for example Qwen3's `enable_thinking`) — whether they work depends on the upstream engine, not
 on Gateway42. Anything outside that list is dropped. `stream` is always forwarded as a boolean, `false`
 when the client omitted it, never `null`.
 
@@ -133,6 +134,9 @@ if absent, and `include_usage` is forced on if the client left it out or set it 
 asked for usage is an engine that reports it, and a completion the gateway cannot measure is an audit
 hole rather than a free request. Your own sub-fields ride along untouched. On a non-stream it is
 dropped, because the field describes a stream that is not happening.
+
+Reasoning from an Ollama thinking model (`message.thinking`) is returned as `reasoning_content`,
+the field OpenAI-compatible reasoning engines use; replies without reasoning are unchanged.
 
 For Ollama engines, parameters are instead mapped into Ollama's `options` object:
 
@@ -200,7 +204,8 @@ Errors use the OpenAI error envelope:
 | `404` | `invalid_request_error` | The requested `model` is not available on any configured engine |
 | `413` | `invalid_request_error` | Body exceeds `GW42_MAX_REQUEST_BYTES` (default 32 MiB) |
 | `429` | `rate_limit_error` | Per-user token bucket empty |
-| `502` | `api_error` | No engines configured, or the engine was unreachable |
+| `400` / `404` / `413` / `429` | as the engine said | The engine rejected the request (`422` is reported as `400`); the message is the engine's own, for example a context-window overflow |
+| `502` | `api_error` | No engines configured, the engine was unreachable or failed (5xx), or it rejected the gateway's engine credentials (401/403) |
 | `503` | `api_error` | Engine at `GW42_UPSTREAM_CONCURRENCY` in-flight requests; sent with `Retry-After: 2` |
 
 Note that `503` is returned rather than queueing the request — the gateway sheds load instead of

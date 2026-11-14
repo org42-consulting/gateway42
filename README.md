@@ -292,10 +292,22 @@ claude
 ```
 
 Not translated: Anthropic server tools (`web_search`, `code_execution`, … — no local engine can run
-them, so they are not offered to the model), extended `thinking` and `top_k`. Claude Code relies
-heavily on tool calling, so use a model that supports it. It also assumes a 200k context window for
-model IDs it does not recognise; see the Claude Code model-config docs to set the real window for
-your model.
+them, so they are not offered to the model) and `top_k`. Claude Code relies heavily on tool calling, so use a model
+that supports it. It also assumes a 200k context window for model IDs it does not recognise; see
+the Claude Code model-config docs to set the real window for your model.
+
+Translated with care:
+
+- **Images in tool results** (screenshots from computer use and browser tools) travel in a user
+  message right after the tool messages, labelled with their tool call, because OpenAI tool messages
+  carry text only.
+- **Documents**: plain-text and content documents are inlined with their title and context. PDFs
+  cannot be read by a local engine, so they become a one-line note saying so, not silence.
+- **Thinking**: when the request enables `thinking`, the engine's reasoning (`reasoning_content`,
+  `reasoning`, or Ollama's `thinking`) is returned as `thinking` blocks, streamed as
+  `thinking_delta`, with an empty signature. Without it, reasoning is dropped as before.
+  Thinking blocks sent back in history are not forwarded.
+- **Failover**: `/v1/messages` tries every engine that holds the model, like `/v1/chat/completions`.
 
 #### Prompt caching (Claude Desktop, Cowork, Claude Code)
 
@@ -436,10 +448,11 @@ Errors use the OpenAI error envelope, so SDK error handling works unchanged:
 | `404` | `invalid_request_error` | The requested model is not available on any reachable engine — including, on `/v1/chat/completions`, when no engine is reachable at all |
 | `413` | `invalid_request_error` | Request body too large (over `GW42_MAX_REQUEST_BYTES`) |
 | `429` | `rate_limit_error` | Per-minute rate limit exceeded, or daily token quota exhausted — wait before retrying |
-| `502` | `api_error` | Gateway42. could not reach the engine; also "no engines configured" on `/v1/models` and `/v1/messages` |
+| `502` | `api_error` | Gateway42. could not reach the engine, or the engine failed (5xx) or rejected the gateway's own engine credentials (401/403); also "no engines configured" on `/v1/models` and `/v1/messages` |
 | `503` | `api_error` | Engine is at its concurrency cap — retry after the `Retry-After` interval |
 | `500` | `api_error` | Internal server error, including a recovered panic. |
 
+When the engine itself rejects a request, its verdict is passed on with the engine's own message instead of a 502: 400 and 422 become `400 invalid_request_error` (for example a prompt longer than the model's context window), and 404, 413 and 429 keep their status. On `/v1/messages` a context-window overflow is worded `prompt is too long: …`, the phrase Claude Code, Claude Desktop and Cowork match to compact the conversation and retry.
 A panic inside a handler is recovered and reported rather than dropping the connection. How it is
 reported depends on how far the response had already got:
 

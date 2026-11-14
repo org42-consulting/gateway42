@@ -998,7 +998,7 @@ func (a *OllamaAdapter) Chat(ctx context.Context, req map[string]interface{}) (m
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != 200 {
-			return fmt.Errorf("ollama returned %d", resp.StatusCode)
+			return newUpstreamStatusError(resp)
 		}
 		return json.NewDecoder(resp.Body).Decode(&result)
 	})
@@ -1053,8 +1053,8 @@ func openUpstreamStream(engineType string, httpReq *http.Request) (io.ReadCloser
 		// and must not close it. The close error is dropped on purpose: we are
 		// already returning the failure the caller needs to see, and replacing
 		// it with a close error would hide the status code.
+		var err error = newUpstreamStatusError(resp)
 		_ = resp.Body.Close()
-		err := fmt.Errorf("engine returned %d", resp.StatusCode)
 		recordUpstream(engineType, "stream", start, err)
 		return nil, err
 	}
@@ -1169,7 +1169,7 @@ func (a *OpenAICompatAdapter) Chat(ctx context.Context, req map[string]interface
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != 200 {
-			return fmt.Errorf("engine returned %d", resp.StatusCode)
+			return newUpstreamStatusError(resp)
 		}
 		return json.NewDecoder(resp.Body).Decode(&result)
 	})
@@ -1289,27 +1289,41 @@ func statusErr(resp *http.Response, up *bool) error {
 // an error with a page of HTML would push the cookie past the ~4KB browsers
 // accept — turning a readable error into a failed session save.
 func upstreamErrDetail(body io.Reader) string {
+	if msg := upstreamErrMessage(body); msg != "" {
+		return ": " + msg
+	}
+	return ""
+}
+
+// upstreamErrMessage is upstreamErrDetail's reason without the ": " prefix:
+// the engine's own error message, one line, at most 200 runes, or "".
+func upstreamErrMessage(body io.Reader) string {
 	raw, err := io.ReadAll(io.LimitReader(body, 2048))
 	if err != nil || len(raw) == 0 {
 		return ""
 	}
 	// Ollama puts the reason in a JSON "error" string; OpenAI-compatible
-	// engines nest it as error.message. Anything that matches neither is
-	// shown as-is, so an unexpected upstream is still diagnosable.
+	// engines nest it as error.message; FastAPI-based engines (vLLM's and
+	// oMLX's bare HTTPExceptions) use a "detail" string. Anything that
+	// matches none is shown as-is, so an unexpected upstream is still
+	// diagnosable.
 	var payload struct {
-		Error json.RawMessage `json:"error"`
+		Error  json.RawMessage `json:"error"`
+		Detail json.RawMessage `json:"detail"`
 	}
 	msg := string(raw)
-	if json.Unmarshal(raw, &payload) == nil && len(payload.Error) > 0 {
+	if json.Unmarshal(raw, &payload) == nil {
 		var flat string
 		var nested struct {
 			Message string `json:"message"`
 		}
 		switch {
-		case json.Unmarshal(payload.Error, &flat) == nil && flat != "":
+		case len(payload.Error) > 0 && json.Unmarshal(payload.Error, &flat) == nil && flat != "":
 			msg = flat
-		case json.Unmarshal(payload.Error, &nested) == nil && nested.Message != "":
+		case len(payload.Error) > 0 && json.Unmarshal(payload.Error, &nested) == nil && nested.Message != "":
 			msg = nested.Message
+		case len(payload.Detail) > 0 && json.Unmarshal(payload.Detail, &flat) == nil && flat != "":
+			msg = flat
 		}
 	}
 	// Collapse to a single line: this ends up in a one-line flash.
@@ -1320,5 +1334,32 @@ func upstreamErrDetail(body io.Reader) string {
 	if r := []rune(msg); len(r) > 200 {
 		msg = string(r[:200]) + "…"
 	}
-	return ": " + msg
+	return msg
+}
+
+// upstreamStatusError is an engine that was reached and refused: a non-200
+// answer to a completion request. It is kept distinct from a transport error
+// because the two must reach the client differently. An engine that cannot
+// be reached is the gateway's problem (502, retryable); an engine that
+// rejects the request — the prompt exceeds its context window, a tool schema
+// it cannot compile — is the client's, and only a 4xx with the engine's
+// reason lets the client act on it (Claude Code compacts on "prompt is too
+// long"; every SDK retries a 5xx, which would just send the same doomed
+// request three times).
+type upstreamStatusError struct {
+	Status  int
+	Message string // the engine's reason, possibly ""
+}
+
+func (e *upstreamStatusError) Error() string {
+	if e.Message == "" {
+		return fmt.Sprintf("engine returned %d", e.Status)
+	}
+	return fmt.Sprintf("engine returned %d: %s", e.Status, e.Message)
+}
+
+// newUpstreamStatusError reads the reason from a non-200 response. The caller
+// still owns and closes the body.
+func newUpstreamStatusError(resp *http.Response) *upstreamStatusError {
+	return &upstreamStatusError{Status: resp.StatusCode, Message: upstreamErrMessage(resp.Body)}
 }

@@ -23,9 +23,25 @@ package wire
 
 // Message is one turn in a completed (non-streaming) response.
 type Message struct {
-	Role      string     `json:"role"`
-	Content   string     `json:"content"`
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	Role    string `json:"role"`
+	Content string `json:"content"`
+	// ReasoningContent is the model's reasoning, kept apart from the answer:
+	// the de-facto field (DeepSeek, oMLX, older vLLM) for what Ollama calls
+	// "thinking". Reasoning is newer vLLM's name for the same thing; it is
+	// only ever read, never authored. Both omitempty, so a reply without
+	// reasoning is the same body it always was.
+	ReasoningContent string     `json:"reasoning_content,omitempty"`
+	Reasoning        string     `json:"reasoning,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
+}
+
+// ReasoningText is the message's reasoning under whichever name the engine
+// used for it.
+func (m Message) ReasoningText() string {
+	if m.ReasoningContent != "" {
+		return m.ReasoningContent
+	}
+	return m.Reasoning
 }
 
 // Delta is the incremental payload in a streaming chunk. Every field is
@@ -33,9 +49,10 @@ type Message struct {
 // tool calls, and the terminating chunk carries none — which is why this
 // cannot reuse Message, whose role and content are always emitted.
 type Delta struct {
-	Role      string           `json:"role,omitempty"`
-	Content   string           `json:"content,omitempty"`
-	ToolCalls []StreamToolCall `json:"tool_calls,omitempty"`
+	Role             string           `json:"role,omitempty"`
+	Content          string           `json:"content,omitempty"`
+	ReasoningContent string           `json:"reasoning_content,omitempty"` // see Message
+	ToolCalls        []StreamToolCall `json:"tool_calls,omitempty"`
 }
 
 // ToolCall is a function call the model asked the client to make.

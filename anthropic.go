@@ -17,6 +17,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"gateway42/internal/wire"
 	"strings"
 )
@@ -27,12 +28,51 @@ import (
 // Text; tool_use blocks use ID, Name and Input. Text has no omitempty because
 // an empty text block must still carry "text":"" — content_block_start opens
 // every text block that way, and SDKs read the key unconditionally.
+//
+// Thinking blocks use Thinking and Signature, pointers for the same reason:
+// content_block_start opens one as {"thinking":"","signature":""}. The
+// signature stays empty — it authenticates reasoning Anthropic generated,
+// and a local engine's reasoning has nothing to sign. Clients send it back
+// with the block, and the request translation drops both again.
 type AnthropicContentBlock struct {
-	Type  string          `json:"type"`
-	Text  *string         `json:"text,omitempty"`
-	ID    string          `json:"id,omitempty"`
-	Name  string          `json:"name,omitempty"`
-	Input json.RawMessage `json:"input,omitempty"`
+	Type      string          `json:"type"`
+	Text      *string         `json:"text,omitempty"`
+	Thinking  *string         `json:"thinking,omitempty"`
+	Signature *string         `json:"signature,omitempty"`
+	ID        string          `json:"id,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	Input     json.RawMessage `json:"input,omitempty"`
+}
+
+// thinkingBlock is a thinking content block holding text.
+func thinkingBlock(text string) AnthropicContentBlock {
+	empty := ""
+	return AnthropicContentBlock{Type: "thinking", Thinking: &text, Signature: &empty}
+}
+
+// thinkingRequested reports whether a /v1/messages request asked for the
+// model's reasoning ("thinking": {"type": "enabled" | "adaptive"}). Only then
+// is an engine's reasoning returned as thinking blocks: a client that did not
+// ask may not expect them, and dropping reasoning is what the gateway always
+// did for such clients.
+func thinkingRequested(body map[string]interface{}) bool {
+	t, _ := body["thinking"].(map[string]interface{})
+	switch t["type"] {
+	case "enabled", "adaptive":
+		return true
+	}
+	return false
+}
+
+// withoutThinking removes thinking blocks from a translated message.
+func withoutThinking(msg *AnthropicMessage) {
+	kept := msg.Content[:0]
+	for _, b := range msg.Content {
+		if b.Type != "thinking" {
+			kept = append(kept, b)
+		}
+	}
+	msg.Content = kept
 }
 
 // AnthropicUsage reports token accounting. Every field is always emitted,
@@ -119,6 +159,10 @@ func anthropicError(status int, message, errType string) *AnthropicErrorResponse
 	switch status {
 	case 404:
 		errType = "not_found_error"
+	case 413:
+		errType = "request_too_large"
+	case 429:
+		errType = "rate_limit_error"
 	case 503, 529:
 		errType = "overloaded_error"
 	}
@@ -229,8 +273,28 @@ func anthropicMessageToOpenAI(msg map[string]interface{}) []interface{} {
 					"arguments": string(args),
 				},
 			})
+		case "document":
+			if text := documentText(block); text != "" {
+				parts = append(parts, map[string]interface{}{"type": "text", "text": text})
+			}
 		case "tool_result":
 			content := blocksText(block["content"])
+			// OpenAI tool messages carry text only, so a tool's images — the
+			// screenshots computer use and browser tools return — travel in
+			// the user turn that follows the tool messages, labelled with the
+			// call they belong to. Dropping them, as before, left the model
+			// blind to what the tool showed.
+			images := imageParts(block["content"])
+			if len(images) > 0 {
+				hasImage = true
+				parts = append(parts, map[string]interface{}{
+					"type": "text", "text": fmt.Sprintf("[Image output of tool call %v]", block["tool_use_id"]),
+				})
+				parts = append(parts, images...)
+				if content == "" {
+					content = "[The tool returned images; they follow in the next message.]"
+				}
+			}
 			if isErr, _ := block["is_error"].(bool); isErr {
 				content = "Error: " + content
 			}
@@ -310,15 +374,92 @@ func blocksText(v interface{}) string {
 	case []interface{}:
 		var texts []string
 		for _, b := range c {
-			if block, ok := b.(map[string]interface{}); ok && block["type"] == "text" {
-				if t, _ := block["text"].(string); t != "" {
-					texts = append(texts, t)
-				}
+			block, ok := b.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			var t string
+			switch block["type"] {
+			case "text":
+				t, _ = block["text"].(string)
+			case "document":
+				// Tools may return documents too (search and file tools).
+				t = documentText(block)
+			}
+			if t != "" {
+				texts = append(texts, t)
 			}
 		}
 		return strings.Join(texts, "\n\n")
 	}
 	return ""
+}
+
+// imageParts collects the image blocks of a block list (a tool_result's
+// content) as OpenAI image_url parts. A string or text-only list has none.
+func imageParts(v interface{}) []interface{} {
+	blocks, _ := v.([]interface{})
+	var parts []interface{}
+	for _, b := range blocks {
+		block, ok := b.(map[string]interface{})
+		if !ok || block["type"] != "image" {
+			continue
+		}
+		if url := imageDataURL(block["source"]); url != "" {
+			parts = append(parts, map[string]interface{}{
+				"type": "image_url", "image_url": map[string]interface{}{"url": url},
+			})
+		}
+	}
+	return parts
+}
+
+// documentText renders an Anthropic document block as text the model reads
+// in place of the document, headed by its title and context when given.
+//
+// Plain-text and content-block documents are inlined whole. A PDF (base64,
+// URL or Files API reference) cannot be: no local engine reads PDFs, and the
+// gateway has no PDF parser. It becomes a one-line note instead of vanishing,
+// so the model knows a document was attached and can say it cannot read it
+// rather than answer as if nothing had been sent.
+func documentText(block map[string]interface{}) string {
+	src, _ := block["source"].(map[string]interface{})
+	title, _ := block["title"].(string)
+	var body string
+	switch src["type"] {
+	case "text":
+		body, _ = src["data"].(string)
+	case "content":
+		body = blocksText(src["content"])
+	default:
+		name := title
+		if name == "" {
+			name = "untitled"
+		}
+		where := ""
+		if u, _ := src["url"].(string); u != "" {
+			where = " at " + u
+		}
+		mt, _ := src["media_type"].(string)
+		if mt == "" {
+			mt = "document"
+		}
+		return fmt.Sprintf("[Attached %s %q%s could not be included: this model cannot read that format.]", mt, name, where)
+	}
+	if body == "" {
+		return ""
+	}
+	var head []string
+	if title != "" {
+		head = append(head, "Document: "+title)
+	}
+	if ctx, _ := block["context"].(string); ctx != "" {
+		head = append(head, ctx)
+	}
+	if len(head) == 0 {
+		return body
+	}
+	return strings.Join(head, "\n") + "\n\n" + body
 }
 
 func joinTextParts(parts []interface{}) string {
@@ -458,6 +599,11 @@ func openAIToAnthropic(payload interface{}, model string) (*AnthropicMessage, er
 		return msg, nil
 	}
 	choice := cc.Choices[0]
+	// Reasoning comes first, as Anthropic orders a thinking block before the
+	// answer. The handler removes it when the request did not ask for it.
+	if r := choice.Message.ReasoningText(); r != "" {
+		msg.Content = append(msg.Content, thinkingBlock(r))
+	}
 	if text := choice.Message.Content; text != "" {
 		msg.Content = append(msg.Content, AnthropicContentBlock{Type: "text", Text: &text})
 	}
@@ -504,7 +650,12 @@ type anthropicStream struct {
 	model string
 
 	started bool
-	// open is the kind of the open block: "" (none), "text" or "tool".
+	// thinking: forward the engine's reasoning as thinking blocks; set when
+	// the request asked for thinking (thinkingRequested), else it is dropped.
+	thinking bool
+
+	// open is the kind of the open block: "" (none), "thinking", "text" or
+	// "tool".
 	open       string
 	blockIndex int // index of the open block; -1 before the first
 	toolIndex  int // OpenAI index of the open tool call
@@ -535,8 +686,11 @@ func (s *anthropicStream) start() sseEvent {
 type streamChunk struct {
 	Choices []struct {
 		Delta struct {
-			Content   string `json:"content"`
-			ToolCalls []struct {
+			Content string `json:"content"`
+			// The engine's reasoning, under either name (see wire.Message).
+			ReasoningContent string `json:"reasoning_content"`
+			Reasoning        string `json:"reasoning"`
+			ToolCalls        []struct {
 				Index    int    `json:"index"`
 				ID       string `json:"id"`
 				Function struct {
@@ -562,6 +716,25 @@ func (s *anthropicStream) chunk(payload []byte) []sseEvent {
 		s.usage = anthropicUsage(*c.Usage)
 	}
 	for _, ch := range c.Choices {
+		reasoning := ch.Delta.ReasoningContent
+		if reasoning == "" {
+			reasoning = ch.Delta.Reasoning
+		}
+		if reasoning != "" && s.thinking {
+			if s.open != "thinking" {
+				events = append(events, s.closeBlock()...)
+				s.blockIndex++
+				s.open = "thinking"
+				events = append(events, sseEvent{"content_block_start", map[string]interface{}{
+					"type": "content_block_start", "index": s.blockIndex,
+					"content_block": thinkingBlock(""),
+				}})
+			}
+			events = append(events, sseEvent{"content_block_delta", map[string]interface{}{
+				"type": "content_block_delta", "index": s.blockIndex,
+				"delta": map[string]interface{}{"type": "thinking_delta", "thinking": reasoning},
+			}})
+		}
 		if ch.Delta.Content != "" {
 			if s.open != "text" {
 				events = append(events, s.closeBlock()...)

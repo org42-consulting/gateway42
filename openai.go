@@ -318,6 +318,9 @@ func ollamaToOpenAI(ollama map[string]interface{}) *wire.ChatCompletion {
 		role = "assistant"
 	}
 	content, _ := msg["content"].(string)
+	// Ollama returns a thinking model's reasoning as message.thinking; the
+	// OpenAI-side name for it is reasoning_content.
+	thinking, _ := msg["thinking"].(string)
 
 	promptTokens := toInt(ollama["prompt_eval_count"])
 	completionTokens := toInt(ollama["eval_count"])
@@ -338,7 +341,7 @@ func ollamaToOpenAI(ollama map[string]interface{}) *wire.ChatCompletion {
 		Model:   modelName,
 		Choices: []wire.Choice{{
 			Index:        0,
-			Message:      wire.Message{Role: role, Content: content, ToolCalls: toolCalls},
+			Message:      wire.Message{Role: role, Content: content, ReasoningContent: thinking, ToolCalls: toolCalls},
 			FinishReason: finishReason,
 		}},
 		Usage: wire.Usage{
@@ -361,16 +364,17 @@ func formatStreamChunk(chunk map[string]interface{}, completionID string, isFirs
 	done, _ := chunk["done"].(bool)
 	msg, _ := chunk["message"].(map[string]interface{})
 	content, _ := msg["content"].(string)
+	thinking, _ := msg["thinking"].(string) // see ollamaToOpenAI
 
 	var delta wire.Delta
 	switch {
 	case isFirst:
-		delta = wire.Delta{Role: "assistant", Content: content}
+		delta = wire.Delta{Role: "assistant", Content: content, ReasoningContent: thinking}
 	case done:
 		// Terminating chunk: finish_reason carries the signal, not the delta.
 		delta = wire.Delta{}
 	default:
-		delta = wire.Delta{Content: content}
+		delta = wire.Delta{Content: content, ReasoningContent: thinking}
 	}
 
 	// Ollama emits each tool call whole, in one line, so each becomes one
